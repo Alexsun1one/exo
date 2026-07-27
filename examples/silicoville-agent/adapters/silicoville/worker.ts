@@ -72,10 +72,15 @@ function diffSummary(prev: Snapshot, next: Snapshot): string | null {
 }
 
 let last: Snapshot | null = null;
+// Debounce errors too: an identical failure is reported only once until a
+// successful tick resets it (after recovery the same error may be reported
+// again).
+let lastErrorReported: string | null = null;
 
 async function tick() {
   try {
     const r = await client.observe("me");
+    lastErrorReported = null;
     const snap = snapOf(r);
     if (last === null) {
       last = snap;
@@ -98,10 +103,11 @@ async function tick() {
       });
     }
   } catch (e) {
-    writeWorkerEvent({
-      type: "error",
-      message: `silicoville poll failed: ${String(e)}`,
-    });
+    const message = `silicoville poll failed: ${String(e)}`;
+    if (message !== lastErrorReported) {
+      lastErrorReported = message;
+      writeWorkerEvent({ type: "error", message });
+    }
   }
 }
 
