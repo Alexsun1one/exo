@@ -28,10 +28,6 @@ impl BasicObjectStore {
         })
     }
 
-    pub(crate) fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
-    }
-
     pub(crate) async fn put_json<T: Serialize>(
         &self,
         key: impl AsRef<Path>,
@@ -50,18 +46,23 @@ impl BasicObjectStore {
     }
 
     pub(crate) async fn get_json<T: DeserializeOwned>(&self, key: impl AsRef<Path>) -> Result<T> {
+        let key = key.as_ref();
         let bytes = self.get_bytes(key).await?;
-        serde_json::from_slice(&bytes).map_err(Into::into)
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to decode JSON {}", key.display()))
     }
 
     pub(crate) async fn get_json_if_exists<T: DeserializeOwned>(
         &self,
         key: impl AsRef<Path>,
     ) -> Result<Option<T>> {
+        let key = key.as_ref();
         let Some(bytes) = self.get_bytes_if_exists(key).await? else {
             return Ok(None);
         };
-        serde_json::from_slice(&bytes).map(Some).map_err(Into::into)
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .with_context(|| format!("failed to decode JSON {}", key.display()))
     }
 
     pub(crate) async fn get_bytes(&self, key: impl AsRef<Path>) -> Result<Vec<u8>> {
@@ -104,6 +105,17 @@ impl BasicObjectStore {
             .await?;
         keys.sort();
         Ok(keys)
+    }
+
+    /// Delete the object at exactly `key`, tolerating absence. Unlike
+    /// `delete_prefix`, this works for a single object: `list`-based prefix
+    /// deletion never matches an object at exactly the prefix path.
+    pub(crate) async fn delete_key_if_exists(&self, key: impl AsRef<Path>) -> Result<()> {
+        match self.store.delete(&object_path(key.as_ref())?).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub(crate) async fn delete_prefix(&self, prefix: impl AsRef<Path>) -> Result<()> {

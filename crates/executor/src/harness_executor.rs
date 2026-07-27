@@ -34,6 +34,7 @@ pub(crate) trait HarnessExecutor: Send + Sync + Clone + 'static {
 
     async fn prepare_conversation(
         &self,
+        _agent: &dyn AgentHandle,
         _conversation: &dyn ConversationHandle,
         _agent_config: &AgentConfig,
         _conversation_config: &ConversationConfig,
@@ -43,7 +44,7 @@ pub(crate) trait HarnessExecutor: Send + Sync + Clone + 'static {
 
     fn prepare_request(&self, request: &SendRequest) -> Result<Self::Prepared>;
 
-    async fn run_turn(
+    async fn execute_turn(
         &self,
         agent: &dyn AgentHandle,
         conversation: &dyn ConversationHandle,
@@ -54,53 +55,6 @@ pub(crate) trait HarnessExecutor: Send + Sync + Clone + 'static {
         stream_mode: ExecutorStreamMode<'_>,
         turn_trace: Option<&dyn TurnExecutionTrace>,
     ) -> Result<()>;
-
-    async fn execute_turn(
-        &self,
-        agent: &dyn AgentHandle,
-        conversation: &dyn ConversationHandle,
-        turn: Arc<dyn TurnHandle>,
-        agent_config: &AgentConfig,
-        conversation_config: &ConversationConfig,
-        prepared: &Self::Prepared,
-        turn_trace: Option<&dyn TurnExecutionTrace>,
-    ) -> Result<()> {
-        self.run_turn(
-            agent,
-            conversation,
-            turn,
-            agent_config,
-            conversation_config,
-            prepared,
-            ExecutorStreamMode::Disabled,
-            turn_trace,
-        )
-        .await
-    }
-
-    async fn execute_turn_stream(
-        &self,
-        agent: &dyn AgentHandle,
-        conversation: &dyn ConversationHandle,
-        turn: Arc<dyn TurnHandle>,
-        agent_config: &AgentConfig,
-        conversation_config: &ConversationConfig,
-        prepared: &Self::Prepared,
-        event_tx: &mpsc::UnboundedSender<Result<ExecutionStreamEvent>>,
-        turn_trace: Option<&dyn TurnExecutionTrace>,
-    ) -> Result<()> {
-        self.run_turn(
-            agent,
-            conversation,
-            turn,
-            agent_config,
-            conversation_config,
-            prepared,
-            ExecutorStreamMode::Enabled(event_tx),
-            turn_trace,
-        )
-        .await
-    }
 }
 
 pub(crate) struct ExecutorHarnessRuntime<E> {
@@ -207,7 +161,12 @@ where
         )?;
         apply_conversation_model_override(&mut agent_config, model_override);
         self.executor
-            .prepare_conversation(conversation.as_ref(), &agent_config, &conversation_config)
+            .prepare_conversation(
+                agent.as_ref(),
+                conversation.as_ref(),
+                &agent_config,
+                &conversation_config,
+            )
             .await?;
         let prepared = self.executor.prepare_request(&request)?;
         let turn = conversation
@@ -238,6 +197,7 @@ where
                             &agent_config,
                             &conversation_config,
                             &prepared,
+                            ExecutorStreamMode::Disabled,
                             turn_trace,
                         )
                         .await
@@ -260,7 +220,12 @@ where
         )?;
         apply_conversation_model_override(&mut agent_config, model_override);
         self.executor
-            .prepare_conversation(conversation.as_ref(), &agent_config, &conversation_config)
+            .prepare_conversation(
+                agent.as_ref(),
+                conversation.as_ref(),
+                &agent_config,
+                &conversation_config,
+            )
             .await?;
         let prepared = self.executor.prepare_request(&request)?;
         let turn = conversation
@@ -284,14 +249,14 @@ where
             move |turn_trace, event_tx| {
                 Box::pin(async move {
                     executor
-                        .execute_turn_stream(
+                        .execute_turn(
                             run_agent.as_ref(),
                             run_conversation.as_ref(),
                             Arc::clone(&run_turn),
                             &agent_config,
                             &conversation_config,
                             &prepared,
-                            event_tx,
+                            ExecutorStreamMode::Enabled(event_tx),
                             turn_trace,
                         )
                         .await

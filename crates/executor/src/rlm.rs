@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -11,8 +10,8 @@ use crate::{
 };
 use anyhow::{Context as AnyhowContext, anyhow, bail};
 use exoharness::{
-    AgentHandle, BasicExoHarness, ConversationHandle, EventData, EventId, ExoHarness,
-    FileSystemMountMode, Result, ToolCallId, ToolRequest, ToolResult, TurnHandle,
+    AgentHandle, BasicExoHarness, BasicExoHarnessConfig, ConversationHandle, EventData, EventId,
+    ExoHarness, FileSystemMountMode, Result, ToolCallId, ToolRequest, ToolResult, TurnHandle,
 };
 use lingua::Message;
 use lingua::universal::{ToolContentPart, ToolResultContentPart};
@@ -413,7 +412,7 @@ where
         Ok(messages_to_transcript(&request.input))
     }
 
-    async fn run_turn(
+    async fn execute_turn(
         &self,
         _agent: &dyn AgentHandle,
         conversation: &dyn ConversationHandle,
@@ -537,6 +536,7 @@ async fn append_final_answer(
     turn.add_events(vec![EventData::Messages {
         messages: vec![assistant_message(final_answer)],
         response_id,
+        usage: None,
     }])
     .await?;
     append_custom_event(
@@ -634,9 +634,9 @@ Make sure to explicitly look through the entire context in the REPL before answe
 When you are done, prefer setting `globalThis.Final` in the REPL to the final answer. You may also reply with `FINAL(<answer>)` or `FINAL_VAR(<javascript_variable_name>)` if needed.\n\
 Think step by step carefully, plan, and execute immediately. Do not just say what you will do. Prefer code, variables, and recursive subqueries over long prose.\n",
     );
-    if config.enable_networking || !config.mounts.is_empty() {
+    if !config.mounts.is_empty() {
         prompt.push_str(
-            "\nConversation shell/network settings do not apply inside this JS REPL. If you need shell or filesystem access, this harness cannot provide it.\n",
+            "\nConversation filesystem mounts do not apply inside this JS REPL. If you need shell or filesystem access, this harness cannot provide it.\n",
         );
     }
     prompt
@@ -675,13 +675,11 @@ Prompt metadata:\n\
 - preview: {preview:?}\n\
 - js repl: persistent `context` plus JSON-compatible globals on `globalThis`\n\
 - history api: `getMessages(role = null)` returning `{{ index, role, content }}[]`\n\
-- conversation networking enabled: {networking}\n\
 \nFilesystem mounts:\n{mounts}\n\n\
 The prompt string in `context` is the external environment. It is formatted as a flattened transcript with blocks like `USER:\\n...`, `ASSISTANT:\\n...`, and `TOOL:\\n...`, separated by blank lines. Solve the latest request by inspecting and manipulating `context` directly. If you need precise message-level access, use `getMessages(...)` and then slice/filter/search in plain JavaScript. If you need intermediate state, create variables on `globalThis` and reuse them across `repl_execute` calls.",
         query = query_text,
         context_chars = context_text.chars().count(),
         preview = clamp_preview(context_text, RLM_CONTEXT_PREVIEW_CHARS),
-        networking = config.enable_networking,
         mounts = mounts,
     )
 }
@@ -772,19 +770,29 @@ impl<M> RlmHarness<M> {
 }
 
 impl RlmHarness<RouterModelClient> {
-    pub async fn from_root(
-        root: impl AsRef<Path>,
+    pub fn from_exoharness(
+        exoharness: Arc<dyn ExoHarness>,
         runtime_config: Option<BraintrustRuntimeConfig>,
         env: HashMap<String, String>,
-    ) -> Result<Self> {
-        let root = root.as_ref();
-        let exoharness = Arc::new(BasicExoHarness::new(root.join("exoharness")).await?);
+    ) -> Self {
         let model = Arc::new(RouterModelClient::new(env));
         let runtime = ExecutorHarnessRuntime::new(RlmExecutor::new(model), runtime_config);
 
-        Ok(Self {
+        Self {
             inner: SharedHarness::new(exoharness, runtime),
-        })
+        }
+    }
+
+    pub async fn from_config(
+        exo_config: BasicExoHarnessConfig,
+        runtime_config: Option<BraintrustRuntimeConfig>,
+        env: HashMap<String, String>,
+    ) -> Result<Self> {
+        Ok(Self::from_exoharness(
+            Arc::new(BasicExoHarness::new(exo_config).await?),
+            runtime_config,
+            env,
+        ))
     }
 }
 

@@ -7,31 +7,33 @@ use crate::{
 use anyhow::anyhow;
 use async_trait::async_trait;
 use exoharness::{
-    BasicExoHarness, Binding, EventData, EventQuery, EventQueryDirection, ExoHarness,
-    FileSystemMount, FileSystemMountMode, PutSecretRequest, Result, Secret, ToolRequest, Uuid7,
+    BasicExoHarness, Binding, EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness,
+    FileSystemMount, FileSystemMountMode, PutSecretRequest, Result, SandboxProvider, Secret,
+    ToolRequest, Uuid7,
 };
 use lingua::universal::{AssistantContent, UserContent};
-use lingua::{Message, UniversalStreamChunk};
+use lingua::{Message, UniversalStreamChunk, UniversalUsage};
 use serde_json::{Map, Value};
 use tempfile::TempDir;
 
+use crate::test_support::local_test_config;
 use crate::{
     BasicHarness, BasicToolRuntime, ConversationModelConfig, CreateAgentRequest,
-    CreateConversationRequest, Harness,
+    CreateConversationRequest, Harness, harness_tool::ensure_shell_sandbox,
 };
 
 #[tokio::test(flavor = "current_thread")]
 async fn creates_agents_and_conversations_with_persisted_config() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness = Arc::new(
-        BasicExoHarness::new_with_local_process_sandbox(tempdir.path().join("exoharness"))
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
             .await
             .expect("basic exoharness should initialize"),
     ) as Arc<dyn ExoHarness>;
     let harness = BasicHarness::new(
         exoharness,
         Arc::new(FakeModelClient::default()),
-        Arc::new(BasicToolRuntime::default()),
+        Arc::new(BasicToolRuntime),
     );
     register_test_models(harness.exoharness_handle().as_ref()).await;
 
@@ -41,7 +43,9 @@ async fn creates_agents_and_conversations_with_persisted_config() {
             name: Some("Demo".to_string()),
             harness: crate::AgentHarnessKind::Basic,
             typescript: None,
-            sandbox_image: None,
+            enable_agent_tool_creation: true,
+            sandbox_image: Some("agent-image".to_string()),
+            sandbox_provider: SandboxProvider::Docker,
             enable_networking: false,
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
@@ -54,6 +58,7 @@ async fn creates_agents_and_conversations_with_persisted_config() {
         .create_conversation(CreateConversationRequest {
             slug: Some("session".to_string()),
             name: Some("Session".to_string()),
+            ..Default::default()
         })
         .await
         .expect("conversation should be created");
@@ -74,13 +79,21 @@ async fn creates_agents_and_conversations_with_persisted_config() {
         stored_agent.config().await.expect("agent config").model,
         "gpt-5.4"
     );
+    let stored_conversation_config = stored_conversation
+        .config()
+        .await
+        .expect("conversation config");
     assert_eq!(
-        stored_conversation
-            .config()
-            .await
-            .expect("conversation config")
-            .shell_program,
+        stored_conversation_config.shell_program,
         Some("/bin/bash".to_string())
+    );
+    assert_eq!(
+        stored_conversation_config.sandbox_image,
+        Some("agent-image".to_string())
+    );
+    assert_eq!(
+        stored_conversation_config.sandbox_provider,
+        Some(SandboxProvider::Docker)
     );
     assert_eq!(conversation.record().slug, "session");
 }
@@ -89,19 +102,23 @@ async fn creates_agents_and_conversations_with_persisted_config() {
 async fn send_persists_messages_through_harness() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness = Arc::new(
-        BasicExoHarness::new_with_local_process_sandbox(tempdir.path().join("exoharness"))
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
             .await
             .expect("basic exoharness should initialize"),
     ) as Arc<dyn ExoHarness>;
     let harness = BasicHarness::new(
         exoharness,
         Arc::new(FakeModelClient::new(vec![ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("pong")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         }])),
-        Arc::new(BasicToolRuntime::default()),
+        Arc::new(BasicToolRuntime),
     );
     register_test_models(harness.exoharness_handle().as_ref()).await;
 
@@ -111,7 +128,9 @@ async fn send_persists_messages_through_harness() {
             name: None,
             harness: crate::AgentHarnessKind::Basic,
             typescript: None,
+            enable_agent_tool_creation: true,
             sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
             enable_networking: false,
             model: "gpt-5.4".to_string(),
             max_output_tokens: None,
@@ -137,25 +156,437 @@ async fn send_persists_messages_through_harness() {
     assert_eq!(messages.len(), 2);
     assert!(matches!(messages[0], Message::User { .. }));
     assert!(matches!(messages[1], Message::Assistant { .. }));
+
+    let sandbox_events = conversation
+        .exoharness_handle()
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Asc),
+            limit: None,
+            session_id: None,
+            turn_id: None,
+            types: Some(vec![EventKind::SANDBOX_CREATED]),
+        }))
+        .await
+        .expect("sandbox events should load")
+        .events;
+    assert!(
+        sandbox_events.is_empty(),
+        "plain chat should not provision a sandbox"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn usage_record_is_persisted_with_computed_cost() {
+    // Use an inline LiteLLM-schema fixture so the assertion is hermetic
+    // and doesn't depend on whatever rates the upstream JSON happens to
+    // ship today.
+    const PRICING_FIXTURE: &str = r#"{
+        "claude-sonnet-4-6": {
+            "litellm_provider": "anthropic",
+            "mode": "chat",
+            "input_cost_per_token": 3e-06,
+            "output_cost_per_token": 1.5e-05,
+            "cache_read_input_token_cost": 3e-07,
+            "cache_creation_input_token_cost": 3.75e-06
+        }
+    }"#;
+    let pricing =
+        Arc::new(cost::PricingTable::from_json_str(PRICING_FIXTURE).expect("fixture should parse"));
+
+    let tempdir = TempDir::new().expect("tempdir should exist");
+    let exoharness = Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
+            .await
+            .expect("basic exoharness should initialize"),
+    ) as Arc<dyn ExoHarness>;
+    let harness = BasicHarness::with_pricing_table(
+        Arc::clone(&exoharness),
+        Arc::new(FakeModelClient::new(vec![ModelResponse {
+            provider_cost_usd: None,
+            response_id: Some(Uuid7::now()),
+            messages: vec![assistant_message("pong")],
+            tool_calls: Vec::new(),
+            usage: Some(UniversalUsage {
+                prompt_tokens: Some(1_000),
+                completion_tokens: Some(500),
+                prompt_cached_tokens: None,
+                prompt_cache_creation_tokens: None,
+                completion_reasoning_tokens: None,
+                ..Default::default()
+            }),
+            model: Some("claude-sonnet-4-6".to_string()),
+            ttft: None,
+            duration: None,
+        }])),
+        Arc::new(BasicToolRuntime),
+        pricing,
+    );
+
+    let secret_id = exoharness
+        .put_secret(PutSecretRequest {
+            name: "cost-test-key".to_string(),
+            secret: Secret::Key {
+                value: "test-key".to_string(),
+            },
+        })
+        .await
+        .expect("test secret should register");
+    exoharness
+        .put_binding(Binding::Llm {
+            name: "claude-sonnet-4-6".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            base_url: None,
+            secret_id: Some(secret_id),
+        })
+        .await
+        .expect("binding should register");
+
+    let agent = harness
+        .create_agent(CreateAgentRequest {
+            slug: "cost-demo".to_string(),
+            name: None,
+            harness: crate::AgentHarnessKind::Basic,
+            typescript: None,
+            enable_agent_tool_creation: true,
+            sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
+            enable_networking: false,
+            model: "claude-sonnet-4-6".to_string(),
+            max_output_tokens: None,
+            max_tool_round_trips: Some(2),
+            braintrust: None,
+        })
+        .await
+        .expect("agent should be created");
+    let conversation = agent
+        .create_conversation(CreateConversationRequest::default())
+        .await
+        .expect("conversation should be created");
+
+    conversation
+        .send(SendRequest {
+            input: vec![user_message("ping")],
+            session_id: None,
+        })
+        .await
+        .expect("send should succeed");
+
+    let events = conversation
+        .exoharness_handle()
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Asc),
+            limit: None,
+            session_id: None,
+            turn_id: None,
+            types: None,
+        }))
+        .await
+        .expect("get events should succeed")
+        .events;
+
+    let assistant_usage = events
+        .iter()
+        .find_map(|event| match &event.data {
+            EventData::Messages {
+                messages,
+                usage: Some(usage),
+                ..
+            } if messages
+                .iter()
+                .any(|m| matches!(m, Message::Assistant { .. })) =>
+            {
+                Some(usage)
+            }
+            _ => None,
+        })
+        .expect("assistant message event should carry a UsageRecord");
+
+    assert_eq!(assistant_usage.model, "claude-sonnet-4-6");
+    assert_eq!(assistant_usage.prompt_tokens, Some(1_000));
+    assert_eq!(assistant_usage.completion_tokens, Some(500));
+    // 1000 prompt @ $3/M + 500 completion @ $15/M = $0.003 + $0.0075 = $0.0105
+    let cost = assistant_usage.cost_usd.expect("cost should be computed");
+    assert!(
+        (cost - 0.0105).abs() < 1e-9,
+        "expected cost ~0.0105, got {cost}"
+    );
+    // Non-streaming path measures total duration.
+    assert!(
+        assistant_usage.duration_ms.is_some(),
+        "duration should be recorded"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn usage_record_with_anthropic_cache_hits() {
+    // Anthropic accounting is additive: prompt_tokens is the fresh slice,
+    // and cache_read / cache_creation are billed separately on top. The
+    // pricing math is unit-tested in exoharness::pricing; this test is the
+    // end-to-end proof that cached counts (a) reach the persisted
+    // UsageRecord and (b) hit the discounted cache-read rate when
+    // compute_cost_usd is invoked through the executor.
+    const PRICING_FIXTURE: &str = r#"{
+        "claude-sonnet-4-6": {
+            "litellm_provider": "anthropic",
+            "mode": "chat",
+            "input_cost_per_token": 3e-06,
+            "output_cost_per_token": 1.5e-05,
+            "cache_read_input_token_cost": 3e-07,
+            "cache_creation_input_token_cost": 3.75e-06
+        }
+    }"#;
+    let pricing =
+        Arc::new(cost::PricingTable::from_json_str(PRICING_FIXTURE).expect("fixture should parse"));
+
+    let tempdir = TempDir::new().expect("tempdir should exist");
+    let exoharness = Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
+            .await
+            .expect("basic exoharness should initialize"),
+    ) as Arc<dyn ExoHarness>;
+    let harness = BasicHarness::with_pricing_table(
+        Arc::clone(&exoharness),
+        Arc::new(FakeModelClient::new(vec![ModelResponse {
+            provider_cost_usd: None,
+            response_id: Some(Uuid7::now()),
+            messages: vec![assistant_message("pong")],
+            tool_calls: Vec::new(),
+            usage: Some(UniversalUsage {
+                prompt_tokens: Some(500),
+                completion_tokens: Some(200),
+                prompt_cached_tokens: Some(10_000),
+                prompt_cache_creation_tokens: Some(2_000),
+                completion_reasoning_tokens: None,
+                ..Default::default()
+            }),
+            model: Some("claude-sonnet-4-6".to_string()),
+            ttft: None,
+            duration: None,
+        }])),
+        Arc::new(BasicToolRuntime),
+        pricing,
+    );
+
+    let secret_id = exoharness
+        .put_secret(PutSecretRequest {
+            name: "anthropic-cache-key".to_string(),
+            secret: Secret::Key {
+                value: "test-key".to_string(),
+            },
+        })
+        .await
+        .expect("test secret should register");
+    exoharness
+        .put_binding(Binding::Llm {
+            name: "claude-sonnet-4-6".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
+            base_url: None,
+            secret_id: Some(secret_id),
+        })
+        .await
+        .expect("binding should register");
+
+    let agent = harness
+        .create_agent(CreateAgentRequest {
+            slug: "anthropic-cache".to_string(),
+            name: None,
+            harness: crate::AgentHarnessKind::Basic,
+            typescript: None,
+            enable_agent_tool_creation: true,
+            sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
+            enable_networking: false,
+            model: "claude-sonnet-4-6".to_string(),
+            max_output_tokens: None,
+            max_tool_round_trips: Some(2),
+            braintrust: None,
+        })
+        .await
+        .expect("agent should be created");
+    let conversation = agent
+        .create_conversation(CreateConversationRequest::default())
+        .await
+        .expect("conversation should be created");
+
+    conversation
+        .send(SendRequest {
+            input: vec![user_message("ping")],
+            session_id: None,
+        })
+        .await
+        .expect("send should succeed");
+
+    let usage = assistant_usage_record(&conversation).await;
+
+    assert_eq!(usage.model, "claude-sonnet-4-6");
+    assert_eq!(usage.prompt_tokens, Some(500));
+    assert_eq!(usage.completion_tokens, Some(200));
+    assert_eq!(usage.prompt_cached_tokens, Some(10_000));
+    assert_eq!(usage.prompt_cache_creation_tokens, Some(2_000));
+    // Anthropic-style additive:
+    //   500    fresh prompt    @ $3/M     = 0.0015
+    //   10000  cache read      @ $0.30/M  = 0.003
+    //   2000   cache creation  @ $3.75/M  = 0.0075
+    //   200    completion      @ $15/M    = 0.003
+    // total = 0.015
+    let cost = usage.cost_usd.expect("cost should be computed");
+    assert!(
+        (cost - 0.015).abs() < 1e-9,
+        "expected cost ~0.015, got {cost}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn usage_record_with_openai_inclusive_accounting() {
+    // OpenAI accounting is inclusive: prompt_tokens is the *total* input
+    // including any cache hits, so the executor must subtract
+    // prompt_cached_tokens before billing the fresh-input rate. Getting
+    // this wrong silently double-bills cached tokens. This test pins the
+    // behavior at the conversation-log level — the same accounting that
+    // pricing.rs exercises in isolation now also has to survive the round
+    // trip through ModelResponse → UsageRecord → persisted event.
+    const PRICING_FIXTURE: &str = r#"{
+        "gpt-4o-mini": {
+            "litellm_provider": "openai",
+            "mode": "chat",
+            "input_cost_per_token": 1.5e-07,
+            "output_cost_per_token": 6e-07,
+            "cache_read_input_token_cost": 7.5e-08
+        }
+    }"#;
+    let pricing =
+        Arc::new(cost::PricingTable::from_json_str(PRICING_FIXTURE).expect("fixture should parse"));
+
+    let tempdir = TempDir::new().expect("tempdir should exist");
+    let exoharness = Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
+            .await
+            .expect("basic exoharness should initialize"),
+    ) as Arc<dyn ExoHarness>;
+    let harness = BasicHarness::with_pricing_table(
+        Arc::clone(&exoharness),
+        Arc::new(FakeModelClient::new(vec![ModelResponse {
+            provider_cost_usd: None,
+            response_id: Some(Uuid7::now()),
+            messages: vec![assistant_message("pong")],
+            tool_calls: Vec::new(),
+            usage: Some(UniversalUsage {
+                // prompt_tokens here *includes* the 500 cached — OpenAI
+                // convention.
+                prompt_tokens: Some(2_000),
+                completion_tokens: Some(1_000),
+                prompt_cached_tokens: Some(500),
+                prompt_cache_creation_tokens: None,
+                completion_reasoning_tokens: None,
+                ..Default::default()
+            }),
+            model: Some("gpt-4o-mini".to_string()),
+            ttft: None,
+            duration: None,
+        }])),
+        Arc::new(BasicToolRuntime),
+        pricing,
+    );
+
+    let secret_id = exoharness
+        .put_secret(PutSecretRequest {
+            name: "openai-cache-key".to_string(),
+            secret: Secret::Key {
+                value: "test-key".to_string(),
+            },
+        })
+        .await
+        .expect("test secret should register");
+    exoharness
+        .put_binding(Binding::Llm {
+            name: "gpt-4o-mini".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            base_url: None,
+            secret_id: Some(secret_id),
+        })
+        .await
+        .expect("binding should register");
+
+    let agent = harness
+        .create_agent(CreateAgentRequest {
+            slug: "openai-cache".to_string(),
+            name: None,
+            harness: crate::AgentHarnessKind::Basic,
+            typescript: None,
+            enable_agent_tool_creation: true,
+            sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
+            enable_networking: false,
+            model: "gpt-4o-mini".to_string(),
+            max_output_tokens: None,
+            max_tool_round_trips: Some(2),
+            braintrust: None,
+        })
+        .await
+        .expect("agent should be created");
+    let conversation = agent
+        .create_conversation(CreateConversationRequest::default())
+        .await
+        .expect("conversation should be created");
+
+    conversation
+        .send(SendRequest {
+            input: vec![user_message("ping")],
+            session_id: None,
+        })
+        .await
+        .expect("send should succeed");
+
+    let usage = assistant_usage_record(&conversation).await;
+
+    assert_eq!(usage.model, "gpt-4o-mini");
+    // Raw counts are preserved as the provider reported them — the
+    // inclusive convention only matters for the cost computation, not for
+    // the stored tokens.
+    assert_eq!(usage.prompt_tokens, Some(2_000));
+    assert_eq!(usage.completion_tokens, Some(1_000));
+    assert_eq!(usage.prompt_cached_tokens, Some(500));
+    // OpenAI-style inclusive:
+    //   non_cached = 2000 - 500       = 1500
+    //   1500   fresh prompt @ $0.15/M = 0.000225
+    //   500    cache read   @ $0.075/M = 0.0000375
+    //   1000   completion   @ $0.60/M = 0.0006
+    // total = 0.0008625
+    // If the executor mistakenly used the Anthropic-style additive
+    // formula here, it would bill all 2000 prompt tokens at the fresh
+    // rate and the total would be 0.0009375 — ~9% high — so this
+    // assertion catches the provider-classification bug the PR
+    // description calls out.
+    let cost = usage.cost_usd.expect("cost should be computed");
+    assert!(
+        (cost - 0.0008625).abs() < 1e-9,
+        "expected cost ~0.0008625, got {cost}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn close_session_appends_session_ended_event() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness: Arc<dyn ExoHarness> = Arc::new(
-        BasicExoHarness::new_with_local_process_sandbox(tempdir.path().join("exoharness"))
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
             .await
             .expect("basic exoharness should initialize"),
     );
     let harness = BasicHarness::new(
         Arc::clone(&exoharness),
         Arc::new(FakeModelClient::new(vec![ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("pong")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         }])),
-        Arc::new(BasicToolRuntime::default()),
+        Arc::new(BasicToolRuntime),
     );
     register_test_models(harness.exoharness_handle().as_ref()).await;
 
@@ -165,7 +596,9 @@ async fn close_session_appends_session_ended_event() {
             name: None,
             harness: crate::AgentHarnessKind::Basic,
             typescript: None,
+            enable_agent_tool_creation: true,
             sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
             enable_networking: false,
             model: "gpt-5.4".to_string(),
             max_output_tokens: None,
@@ -217,29 +650,33 @@ async fn close_session_appends_session_ended_event() {
 async fn updating_agent_config_refreshes_executor_cache() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness = Arc::new(
-        BasicExoHarness::new_with_local_process_sandbox(tempdir.path().join("exoharness"))
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
             .await
             .expect("basic exoharness should initialize"),
     );
     let model = Arc::new(FakeModelClient::new(vec![
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("pong-1")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("pong-2")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
     ]));
-    let harness = BasicHarness::new(
-        exoharness,
-        Arc::clone(&model),
-        Arc::new(BasicToolRuntime::default()),
-    );
+    let harness = BasicHarness::new(exoharness, Arc::clone(&model), Arc::new(BasicToolRuntime));
     register_test_models(harness.exoharness_handle().as_ref()).await;
 
     let agent = harness
@@ -248,7 +685,9 @@ async fn updating_agent_config_refreshes_executor_cache() {
             name: Some("Demo".to_string()),
             harness: crate::AgentHarnessKind::Basic,
             typescript: None,
+            enable_agent_tool_creation: true,
             sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
             enable_networking: false,
             model: "gpt-5.4".to_string(),
             max_output_tokens: None,
@@ -295,12 +734,13 @@ async fn updating_agent_config_refreshes_executor_cache() {
 async fn send_executes_shell_tool_when_enabled() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness = Arc::new(
-        BasicExoHarness::new_with_local_process_sandbox(tempdir.path().join("exoharness"))
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
             .await
             .expect("basic exoharness should initialize"),
     );
     let model = Arc::new(FakeModelClient::new(vec![
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: Vec::new(),
             tool_calls: vec![PendingToolCall {
@@ -311,12 +751,19 @@ async fn send_executes_shell_tool_when_enabled() {
                 },
             }],
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("done")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
     ]));
     let harness = BasicHarness::new(exoharness, Arc::clone(&model), Arc::new(BasicToolRuntime));
@@ -328,7 +775,9 @@ async fn send_executes_shell_tool_when_enabled() {
             name: Some("Demo".to_string()),
             harness: crate::AgentHarnessKind::Basic,
             typescript: None,
-            sandbox_image: None,
+            enable_agent_tool_creation: true,
+            sandbox_image: Some("agent-image".to_string()),
+            sandbox_provider: SandboxProvider::LocalProcess,
             enable_networking: true,
             model: "gpt-5.4".to_string(),
             max_output_tokens: None,
@@ -347,6 +796,8 @@ async fn send_executes_shell_tool_when_enabled() {
         .await
         .expect("conversation config should load");
     conversation_config.shell_program = Some("/bin/sh".to_string());
+    conversation_config.sandbox_image = Some("conversation-image".to_string());
+    conversation_config.sandbox_provider = Some(SandboxProvider::LocalProcess);
     conversation
         .put_config(conversation_config)
         .await
@@ -381,7 +832,7 @@ async fn send_executes_shell_tool_when_enabled() {
             limit: None,
             session_id: None,
             turn_id: None,
-            types: Some(vec!["sandbox_created".to_string()]),
+            types: Some(vec![EventKind::SANDBOX_CREATED]),
         }))
         .await
         .expect("sandbox events should load")
@@ -389,9 +840,11 @@ async fn send_executes_shell_tool_when_enabled() {
     assert!(matches!(
         &sandbox_events[0].data,
         EventData::SandboxCreated {
+            provider: SandboxProvider::LocalProcess,
+            image,
             enable_networking: true,
             ..
-        }
+        } if image == "conversation-image"
     ));
 }
 
@@ -399,14 +852,14 @@ async fn send_executes_shell_tool_when_enabled() {
 async fn harness_exposes_raw_exoharness_handles() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness = Arc::new(
-        BasicExoHarness::new_with_local_process_sandbox(tempdir.path().join("exoharness"))
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
             .await
             .expect("basic exoharness should initialize"),
     );
     let harness = BasicHarness::new(
         exoharness,
         Arc::new(FakeModelClient::default()),
-        Arc::new(BasicToolRuntime::default()),
+        Arc::new(BasicToolRuntime),
     );
     register_test_models(harness.exoharness_handle().as_ref()).await;
 
@@ -416,7 +869,9 @@ async fn harness_exposes_raw_exoharness_handles() {
             name: Some("Demo".to_string()),
             harness: crate::AgentHarnessKind::Basic,
             typescript: None,
+            enable_agent_tool_creation: true,
             sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
             enable_networking: false,
             model: "gpt-5.4".to_string(),
             max_output_tokens: None,
@@ -442,9 +897,10 @@ async fn harness_exposes_raw_exoharness_handles() {
     assert_eq!(
         agent
             .exoharness_handle()
-            .list_conversations()
+            .list_conversations(exoharness::ListConversationsRequest::default())
             .await
             .expect("list conversations through agent handle")
+            .conversations
             .len(),
         1
     );
@@ -462,28 +918,68 @@ async fn harness_exposes_raw_exoharness_handles() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn updating_mounts_recreates_shell_sandbox() {
+async fn updating_mounts_recreates_conversation_sandbox() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let mount_dir = tempdir.path().join("mount");
     std::fs::create_dir_all(&mount_dir).expect("mount dir should exist");
 
     let exoharness = Arc::new(
-        BasicExoHarness::new_with_local_process_sandbox(tempdir.path().join("exoharness"))
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
             .await
             .expect("basic exoharness should initialize"),
     );
     let model = Arc::new(FakeModelClient::new(vec![
         ModelResponse {
+            provider_cost_usd: None,
+            response_id: Some(Uuid7::now()),
+            messages: Vec::new(),
+            tool_calls: vec![PendingToolCall {
+                tool_call_id: "call-1".to_string(),
+                request: ToolRequest {
+                    function_name: "shell".to_string(),
+                    arguments: shell_command_arguments("printf first"),
+                },
+            }],
+            usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
+        },
+        ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("done-1")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
         ModelResponse {
+            provider_cost_usd: None,
+            response_id: Some(Uuid7::now()),
+            messages: Vec::new(),
+            tool_calls: vec![PendingToolCall {
+                tool_call_id: "call-2".to_string(),
+                request: ToolRequest {
+                    function_name: "shell".to_string(),
+                    arguments: shell_command_arguments("printf second"),
+                },
+            }],
+            usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
+        },
+        ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("done-2")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
     ]));
     let harness = BasicHarness::new(exoharness, model, Arc::new(BasicToolRuntime));
@@ -495,7 +991,9 @@ async fn updating_mounts_recreates_shell_sandbox() {
             name: Some("Demo".to_string()),
             harness: crate::AgentHarnessKind::Basic,
             typescript: None,
+            enable_agent_tool_creation: true,
             sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
             enable_networking: false,
             model: "gpt-5.4".to_string(),
             max_output_tokens: None,
@@ -535,7 +1033,7 @@ async fn updating_mounts_recreates_shell_sandbox() {
             limit: None,
             session_id: None,
             turn_id: None,
-            types: Some(vec!["sandbox_created".to_string()]),
+            types: Some(vec![EventKind::SANDBOX_CREATED]),
         }))
         .await
         .expect("get sandbox events")
@@ -577,7 +1075,7 @@ async fn updating_mounts_recreates_shell_sandbox() {
             limit: None,
             session_id: None,
             turn_id: None,
-            types: Some(vec!["sandbox_created".to_string()]),
+            types: Some(vec![EventKind::SANDBOX_CREATED]),
         }))
         .await
         .expect("get sandbox events after mount change")
@@ -586,38 +1084,141 @@ async fn updating_mounts_recreates_shell_sandbox() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn updating_sandbox_image_recreates_shell_sandbox_without_shell_program() {
+    let tempdir = TempDir::new().expect("tempdir should exist");
+    let exoharness = Arc::new(
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
+            .await
+            .expect("basic exoharness should initialize"),
+    );
+    let harness = BasicHarness::new(
+        exoharness,
+        Arc::new(FakeModelClient::default()),
+        Arc::new(BasicToolRuntime),
+    );
+
+    let agent = harness
+        .create_agent(CreateAgentRequest {
+            slug: "demo".to_string(),
+            name: Some("Demo".to_string()),
+            harness: crate::AgentHarnessKind::Basic,
+            typescript: None,
+            enable_agent_tool_creation: true,
+            sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
+            enable_networking: false,
+            model: "gpt-5.4".to_string(),
+            max_output_tokens: None,
+            max_tool_round_trips: Some(1),
+            braintrust: None,
+        })
+        .await
+        .expect("agent should be created");
+    let conversation = agent
+        .create_conversation(CreateConversationRequest::default())
+        .await
+        .expect("conversation should be created");
+    let agent_config = agent.config().await.expect("agent config should load");
+
+    let mut conversation_config = conversation
+        .config()
+        .await
+        .expect("conversation config should load");
+    conversation_config.shell_program = None;
+    conversation_config.sandbox_image = Some("first-image".to_string());
+    conversation
+        .put_config(conversation_config.clone())
+        .await
+        .expect("conversation config should update");
+
+    let first_sandbox_id = ensure_shell_sandbox(
+        conversation.exoharness_handle().as_ref(),
+        &agent_config,
+        &conversation_config,
+    )
+    .await
+    .expect("first sandbox should be created");
+
+    conversation_config.sandbox_image = Some("second-image".to_string());
+    conversation
+        .put_config(conversation_config.clone())
+        .await
+        .expect("conversation config should update again");
+
+    let second_sandbox_id = ensure_shell_sandbox(
+        conversation.exoharness_handle().as_ref(),
+        &agent_config,
+        &conversation_config,
+    )
+    .await
+    .expect("second sandbox should be created");
+
+    assert_ne!(first_sandbox_id, second_sandbox_id);
+    let sandbox_events = conversation
+        .exoharness_handle()
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Asc),
+            limit: None,
+            session_id: None,
+            turn_id: None,
+            types: Some(vec![EventKind::SANDBOX_CREATED]),
+        }))
+        .await
+        .expect("get sandbox events")
+        .events;
+    assert_eq!(sandbox_events.len(), 2);
+    assert!(matches!(
+        &sandbox_events[0].data,
+        EventData::SandboxCreated { image, .. } if image == "first-image"
+    ));
+    assert!(matches!(
+        &sandbox_events[1].data,
+        EventData::SandboxCreated { image, .. } if image == "second-image"
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn conversation_model_override_changes_effective_model() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness: Arc<dyn ExoHarness> = Arc::new(
-        BasicExoHarness::new_with_local_process_sandbox(tempdir.path().join("exoharness"))
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
             .await
             .expect("basic exoharness should initialize"),
     );
     let model = Arc::new(FakeModelClient::new(vec![
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("first")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("second")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("third")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
     ]));
-    let harness = BasicHarness::new(
-        exoharness,
-        Arc::clone(&model),
-        Arc::new(BasicToolRuntime::default()),
-    );
+    let harness = BasicHarness::new(exoharness, Arc::clone(&model), Arc::new(BasicToolRuntime));
     register_test_models(harness.exoharness_handle().as_ref()).await;
 
     let agent = harness
@@ -626,7 +1227,9 @@ async fn conversation_model_override_changes_effective_model() {
             name: None,
             harness: crate::AgentHarnessKind::Basic,
             typescript: None,
+            enable_agent_tool_creation: true,
             sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
             enable_networking: false,
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
@@ -762,6 +1365,45 @@ fn assistant_message(text: &str) -> Message {
         content: AssistantContent::String(text.to_string()),
         id: None,
     }
+}
+
+/// Fetch the UsageRecord attached to the first Messages event that
+/// contains an assistant message. Mirrors the pattern in
+/// `usage_record_is_persisted_with_computed_cost` so the new tests stay
+/// readable.
+async fn assistant_usage_record(
+    conversation: &Arc<dyn crate::HarnessConversation>,
+) -> exoharness::UsageRecord {
+    let events = conversation
+        .exoharness_handle()
+        .get_events(Some(EventQuery {
+            cursor: None,
+            direction: Some(EventQueryDirection::Asc),
+            limit: None,
+            session_id: None,
+            turn_id: None,
+            types: None,
+        }))
+        .await
+        .expect("get events should succeed")
+        .events;
+
+    events
+        .into_iter()
+        .find_map(|event| match event.data {
+            EventData::Messages {
+                messages,
+                usage: Some(usage),
+                ..
+            } if messages
+                .iter()
+                .any(|m| matches!(m, Message::Assistant { .. })) =>
+            {
+                Some(*usage)
+            }
+            _ => None,
+        })
+        .expect("assistant message event should carry a UsageRecord")
 }
 
 fn shell_command_arguments(command: &str) -> Map<String, Value> {

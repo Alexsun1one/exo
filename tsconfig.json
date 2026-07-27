@@ -12,9 +12,11 @@
     "paths": {
       "*": ["./*"],
       "@exo/harness": ["./typescript/harness/index.ts"],
+      "@exo/harness/tool": ["./typescript/harness/tool.ts"],
       "@exo/model-runtime/responses": [
         "./typescript/model-runtime/responses.ts"
       ],
+      "@exo/model-runtime/cost": ["./typescript/model-runtime/cost.ts"],
       "@exo/codex/app-server": ["./typescript/codex/app-server.ts"],
       "@exo/cursor/sdk": ["./typescript/cursor/sdk.ts"],
       "@exo/cursor/protocol": ["./typescript/cursor/protocol.ts"]
@@ -24,5 +26,5 @@
     "incremental": true
   },
   "include": ["**/*.ts"],
-  "exclude": ["node_modules"]
+  "exclude": ["node_modules", "website/docs-src"]
 }

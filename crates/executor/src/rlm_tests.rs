@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use exoharness::{
     BasicExoHarness, Binding, EventData, EventQuery, EventQueryDirection, ExoHarness,
-    PutSecretRequest, Secret, ToolRequest, Uuid7,
+    PutSecretRequest, SandboxProvider, Secret, ToolRequest, Uuid7,
 };
 use lingua::universal::{AssistantContent, UserContent};
 use lingua::{Message, UniversalStreamChunk};
@@ -17,18 +17,20 @@ use serde_json::{Map, Value};
 use tempfile::TempDir;
 use tokio_stream::StreamExt;
 
+use crate::test_support::local_test_config;
 use crate::{CreateAgentRequest, CreateConversationRequest, Harness, RlmHarness};
 
 #[tokio::test(flavor = "current_thread")]
 async fn rlm_send_executes_repl_steps_and_persists_final_answer() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness = Arc::new(
-        BasicExoHarness::new_with_local_process_sandbox(tempdir.path().join("exoharness"))
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
             .await
             .expect("basic exoharness should initialize"),
     ) as Arc<dyn ExoHarness>;
     let model = Arc::new(FakeModelClient::new(vec![
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("Inspecting the transcript.")],
             tool_calls: vec![PendingToolCall {
@@ -45,12 +47,19 @@ async fn rlm_send_executes_repl_steps_and_persists_final_answer() {
                 },
             }],
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("FINAL(done)")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
     ]));
     let harness = RlmHarness::new(exoharness, model);
@@ -62,7 +71,9 @@ async fn rlm_send_executes_repl_steps_and_persists_final_answer() {
             name: Some("Demo".to_string()),
             harness: crate::AgentHarnessKind::Rlm,
             typescript: None,
+            enable_agent_tool_creation: true,
             sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
             enable_networking: false,
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
@@ -121,12 +132,13 @@ async fn rlm_send_executes_repl_steps_and_persists_final_answer() {
 async fn rlm_subquery_variable_can_store_final_answer() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness = Arc::new(
-        BasicExoHarness::new_with_local_process_sandbox(tempdir.path().join("exoharness"))
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
             .await
             .expect("basic exoharness should initialize"),
     ) as Arc<dyn ExoHarness>;
     let model = Arc::new(FakeModelClient::new(vec![
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("Preparing a smaller prompt.")],
             tool_calls: vec![PendingToolCall {
@@ -140,8 +152,12 @@ async fn rlm_subquery_variable_can_store_final_answer() {
                 },
             }],
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("Delegating the arithmetic.")],
             tool_calls: vec![PendingToolCall {
@@ -165,18 +181,29 @@ async fn rlm_subquery_variable_can_store_final_answer() {
                 },
             }],
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("4")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("FINAL_VAR(final_answer)")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
     ]));
     let harness = RlmHarness::new(exoharness, Arc::clone(&model));
@@ -188,7 +215,9 @@ async fn rlm_subquery_variable_can_store_final_answer() {
             name: Some("Demo".to_string()),
             harness: crate::AgentHarnessKind::Rlm,
             typescript: None,
+            enable_agent_tool_creation: true,
             sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
             enable_networking: false,
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
@@ -225,7 +254,7 @@ async fn rlm_subquery_variable_can_store_final_answer() {
 async fn rlm_send_stream_suppresses_internal_control_text() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness = Arc::new(
-        BasicExoHarness::new_with_local_process_sandbox(tempdir.path().join("exoharness"))
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
             .await
             .expect("basic exoharness should initialize"),
     ) as Arc<dyn ExoHarness>;
@@ -237,10 +266,14 @@ async fn rlm_send_stream_suppresses_internal_control_text() {
             UniversalStreamChunk::finish(0, "stop"),
         ],
         final_response: ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("FINAL(2)")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
     }]));
     let harness = RlmHarness::new(exoharness, model);
@@ -252,7 +285,9 @@ async fn rlm_send_stream_suppresses_internal_control_text() {
             name: Some("Demo".to_string()),
             harness: crate::AgentHarnessKind::Rlm,
             typescript: None,
+            enable_agent_tool_creation: true,
             sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
             enable_networking: false,
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
@@ -298,18 +333,23 @@ async fn rlm_send_stream_suppresses_internal_control_text() {
 async fn rlm_exposes_history_via_get_messages() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness = Arc::new(
-        BasicExoHarness::new_with_local_process_sandbox(tempdir.path().join("exoharness"))
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
             .await
             .expect("basic exoharness should initialize"),
     ) as Arc<dyn ExoHarness>;
     let model = Arc::new(FakeModelClient::new(vec![
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("FINAL(recorded)")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("Checking prior user content.")],
             tool_calls: vec![PendingToolCall {
@@ -336,12 +376,19 @@ globalThis.answer = String(\n\
                 },
             }],
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
         ModelResponse {
+            provider_cost_usd: None,
             response_id: Some(Uuid7::now()),
             messages: vec![assistant_message("FINAL_VAR(answer)")],
             tool_calls: Vec::new(),
             usage: None,
+            model: None,
+            ttft: None,
+            duration: None,
         },
     ]));
     let harness = RlmHarness::new(exoharness, model);
@@ -353,7 +400,9 @@ globalThis.answer = String(\n\
             name: Some("Demo".to_string()),
             harness: crate::AgentHarnessKind::Rlm,
             typescript: None,
+            enable_agent_tool_creation: true,
             sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
             enable_networking: false,
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
@@ -394,11 +443,12 @@ globalThis.answer = String(\n\
 async fn rlm_can_finish_by_setting_final_in_repl() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let exoharness = Arc::new(
-        BasicExoHarness::new_with_local_process_sandbox(tempdir.path().join("exoharness"))
+        BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
             .await
             .expect("basic exoharness should initialize"),
     ) as Arc<dyn ExoHarness>;
     let model = Arc::new(FakeModelClient::new(vec![ModelResponse {
+        provider_cost_usd: None,
         response_id: Some(Uuid7::now()),
         messages: vec![assistant_message("Setting Final in the REPL.")],
         tool_calls: vec![PendingToolCall {
@@ -412,6 +462,9 @@ async fn rlm_can_finish_by_setting_final_in_repl() {
             },
         }],
         usage: None,
+        model: None,
+        ttft: None,
+        duration: None,
     }]));
     let harness = RlmHarness::new(exoharness, Arc::clone(&model));
     register_test_model(harness.exoharness_handle().as_ref()).await;
@@ -422,7 +475,9 @@ async fn rlm_can_finish_by_setting_final_in_repl() {
             name: Some("Demo".to_string()),
             harness: crate::AgentHarnessKind::Rlm,
             typescript: None,
+            enable_agent_tool_creation: true,
             sandbox_image: None,
+            sandbox_provider: SandboxProvider::LocalProcess,
             enable_networking: false,
             model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),

@@ -17,6 +17,7 @@ const formatExtensions = new Set([
 ]);
 
 const lintExtensions = new Set([".cjs", ".js", ".jsx", ".mjs", ".ts", ".tsx"]);
+const rustExtensions = new Set([".rs"]);
 
 function run(command, args) {
   execFileSync(command, args, {
@@ -40,7 +41,10 @@ function filterByExtension(files, extensions) {
   return files.filter((file) => extensions.has(path.extname(file)));
 }
 
-const stagedFiles = getStagedFiles();
+// oxfmt breaks the VitePress markdown; docs content is authored by hand.
+const stagedFiles = getStagedFiles().filter(
+  (file) => !file.startsWith("website/docs-src/"),
+);
 
 if (stagedFiles.length === 0) {
   process.exit(0);
@@ -56,6 +60,12 @@ const lintFiles = filterByExtension(stagedFiles, lintExtensions);
 if (lintFiles.length > 0) {
   run("pnpm", ["exec", "oxlint", "--fix", ...lintFiles]);
   run("git", ["add", "--", ...lintFiles]);
+}
+
+const rustFiles = filterByExtension(stagedFiles, rustExtensions);
+if (rustFiles.length > 0) {
+  run("rustfmt", ["--edition", "2024", ...rustFiles]);
+  run("git", ["add", "--", ...rustFiles]);
 }
 
 run("pnpm", ["check"]);

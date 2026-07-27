@@ -5,25 +5,30 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use exoharness::{
-    ConversationHandle, EventId, FileSystemMount, ResponseId, Result, SessionId, ToolArguments,
-    ToolCallId, ToolRequest, ToolResult, TurnId,
+    AgentHandle, ConversationHandle, DurableFileSystem, EventId, FileSystemMount, ResponseId,
+    Result, SandboxProvider, SessionId, ToolArguments, ToolCallId, ToolRequest, ToolResult,
+    TurnHandle, TurnId,
 };
 use lingua::{Message, UniversalStreamChunk, UniversalUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::OwnedMutexGuard;
 use tokio_stream::{Stream, wrappers::UnboundedReceiverStream};
 
 use crate::braintrust::BraintrustTracingConfig;
 
-#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct AgentConfig {
     pub instructions: Vec<Message>,
     #[serde(default)]
     pub harness: AgentHarnessKind,
     #[serde(default)]
     pub typescript: Option<TypeScriptHarnessConfig>,
+    #[serde(default = "default_enable_agent_tool_creation")]
+    pub enable_agent_tool_creation: bool,
     #[serde(default)]
     pub sandbox_image: Option<String>,
+    pub sandbox_provider: SandboxProvider,
     #[serde(default)]
     pub enable_networking: bool,
     pub model: String,
@@ -40,19 +45,40 @@ pub enum AgentHarnessKind {
     Rlm,
     #[serde(rename = "typescript")]
     TypeScript,
+    Exo,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypeScriptHarnessConfig {
     pub module_path: String,
+    #[serde(default)]
+    pub tool_module_paths: Vec<String>,
+}
+
+pub fn default_enable_agent_tool_creation() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct ConversationConfig {
-    pub enable_networking: bool,
+    #[serde(default)]
+    pub sandbox_image: Option<String>,
+    #[serde(default)]
+    pub sandbox_provider: Option<SandboxProvider>,
     pub shell_program: Option<String>,
     #[serde(default)]
     pub mounts: Vec<FileSystemMount>,
+    #[serde(default)]
+    pub durable_file_systems: Vec<DurableFileSystem>,
+    #[serde(default)]
+    pub sandbox_scope: Option<SandboxScope>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxScope {
+    Agent,
+    Conversation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,10 +103,38 @@ impl fmt::Display for ConversationModelConfig {
 impl Default for ConversationConfig {
     fn default() -> Self {
         Self {
-            enable_networking: false,
+            sandbox_image: None,
+            sandbox_provider: None,
             shell_program: Some("/bin/bash".to_string()),
             mounts: Vec::new(),
+            durable_file_systems: Vec::new(),
+            sandbox_scope: None,
         }
+    }
+}
+
+pub fn effective_sandbox_scope(
+    agent_config: &AgentConfig,
+    conversation_config: &ConversationConfig,
+) -> SandboxScope {
+    conversation_config
+        .sandbox_scope
+        .unwrap_or(match agent_config.harness {
+            AgentHarnessKind::Exo => SandboxScope::Agent,
+            _ => SandboxScope::Conversation,
+        })
+}
+
+impl ConversationConfig {
+    pub fn effective_sandbox_image<'a>(&'a self, agent_config: &'a AgentConfig) -> Option<&'a str> {
+        self.sandbox_image
+            .as_deref()
+            .or(agent_config.sandbox_image.as_deref())
+    }
+
+    pub fn effective_sandbox_provider(&self, agent_config: &AgentConfig) -> SandboxProvider {
+        self.sandbox_provider
+            .unwrap_or(agent_config.sandbox_provider)
     }
 }
 
@@ -100,6 +154,7 @@ pub trait ModelResponseStream: Send {
 pub trait ToolRuntime: Send + Sync {
     async fn prepare_conversation(
         &self,
+        _agent: &dyn AgentHandle,
         _conversation: &dyn ConversationHandle,
         _agent_config: &AgentConfig,
         _config: &ConversationConfig,
@@ -109,7 +164,10 @@ pub trait ToolRuntime: Send + Sync {
 
     async fn execute(
         &self,
+        agent: &dyn AgentHandle,
         conversation: &dyn ConversationHandle,
+        turn: Option<&dyn TurnHandle>,
+        agent_config: &AgentConfig,
         config: &ConversationConfig,
         request: &ToolRequest,
     ) -> Result<ToolResult>;
@@ -131,6 +189,19 @@ pub struct ModelResponse {
     pub messages: Vec<Message>,
     pub tool_calls: Vec<PendingToolCall>,
     pub usage: Option<UniversalUsage>,
+    /// Model identifier echoed back by the provider, if available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Time to first token (streaming path only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft: Option<Duration>,
+    /// Wall-clock duration from request start to end of response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<Duration>,
+    /// Authoritative cost in USD reported by the provider (e.g. OpenRouter's
+    /// `usage.cost`), if any. Preferred over the price-table estimate when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,11 +232,20 @@ pub struct SendResult {
 
 pub struct ExecutionStreamHandle {
     event_stream: UnboundedReceiverStream<Result<ExecutionStreamEvent>>,
+    _send_guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl ExecutionStreamHandle {
     pub fn new(event_stream: UnboundedReceiverStream<Result<ExecutionStreamEvent>>) -> Self {
-        Self { event_stream }
+        Self {
+            event_stream,
+            _send_guard: None,
+        }
+    }
+
+    pub(crate) fn with_send_guard(mut self, send_guard: OwnedMutexGuard<()>) -> Self {
+        self._send_guard = Some(send_guard);
+        self
     }
 }
 

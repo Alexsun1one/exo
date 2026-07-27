@@ -8,6 +8,7 @@ use exoharness::{
 };
 use lingua::Message;
 
+use crate::conversation_wakeup::conversation_send_lock;
 use crate::harness_helpers::{
     get_conversation_model_override, materialize_conversation_messages,
     put_conversation_model_override, resolve_agent_handle, resolve_conversation_handle,
@@ -124,7 +125,9 @@ where
             instructions: Vec::new(),
             harness: request.harness,
             typescript: request.typescript,
+            enable_agent_tool_creation: request.enable_agent_tool_creation,
             sandbox_image: request.sandbox_image,
+            sandbox_provider: request.sandbox_provider,
             enable_networking: request.enable_networking,
             model: request.model,
             max_output_tokens: request.max_output_tokens,
@@ -193,7 +196,11 @@ where
     }
 
     async fn list_conversations(&self) -> Result<Vec<ConversationRecord>> {
-        let conversations = self.agent.list_conversations().await?;
+        let conversations = self
+            .agent
+            .list_conversations(exoharness::ListConversationsRequest::default())
+            .await?
+            .conversations;
         Ok(conversations
             .into_iter()
             .map(|conversation| conversation.record().clone())
@@ -220,6 +227,7 @@ where
         &self,
         request: CreateConversationRequest,
     ) -> Result<Arc<dyn HarnessConversation>> {
+        let agent_config = self.config().await?;
         let conversation = self
             .agent
             .new_conversation(NewConversationRequest {
@@ -227,8 +235,23 @@ where
                 name: request.name,
             })
             .await?;
+        let default_conversation_config = ConversationConfig::default();
+        let conversation_config = ConversationConfig {
+            sandbox_image: request.sandbox_image.or(agent_config.sandbox_image),
+            sandbox_provider: Some(
+                request
+                    .sandbox_provider
+                    .unwrap_or(agent_config.sandbox_provider),
+            ),
+            shell_program: request
+                .shell_program
+                .or(default_conversation_config.shell_program),
+            mounts: default_conversation_config.mounts,
+            durable_file_systems: default_conversation_config.durable_file_systems,
+            sandbox_scope: default_conversation_config.sandbox_scope,
+        };
         self.runtime
-            .put_conversation_config(conversation.as_ref(), ConversationConfig::default())
+            .put_conversation_config(conversation.as_ref(), conversation_config)
             .await?;
         Ok(Arc::new(SharedHarnessConversation {
             agent: Arc::clone(&self.agent),
@@ -302,6 +325,8 @@ where
     }
 
     async fn send(&self, request: SendRequest) -> Result<SendResult> {
+        let send_lock = conversation_send_lock(&self.conversation.record().id.to_string());
+        let _guard = send_lock.lock().await;
         self.runtime
             .send(
                 Arc::clone(&self.agent),
@@ -312,12 +337,16 @@ where
     }
 
     async fn send_stream(&self, request: SendRequest) -> Result<ExecutionStreamHandle> {
-        self.runtime
+        let send_lock = conversation_send_lock(&self.conversation.record().id.to_string());
+        let send_guard = send_lock.lock_owned().await;
+        let stream = self
+            .runtime
             .send_stream(
                 Arc::clone(&self.agent),
                 Arc::clone(&self.conversation),
                 request,
             )
-            .await
+            .await?;
+        Ok(stream.with_send_guard(send_guard))
     }
 }

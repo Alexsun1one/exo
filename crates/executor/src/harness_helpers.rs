@@ -3,7 +3,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use exoharness::{
-    AddEventsRequest, AgentHandle, Binding, ConversationHandle, EventData, EventQuery,
+    AddEventsRequest, AgentHandle, Binding, ConversationHandle, EventData, EventKind, EventQuery,
     EventQueryDirection, ExoHarness, Result, Secret, ToolCallId, Uuid7,
 };
 use lingua::Message;
@@ -46,10 +46,10 @@ pub(crate) async fn resolve_agent_handle(
     exoharness: &dyn ExoHarness,
     agent_ref: &str,
 ) -> Result<Option<Arc<dyn AgentHandle>>> {
-    if let Some(agent_id) = parse_uuid7(agent_ref) {
-        if let Some(agent) = exoharness.get_agent(&agent_id).await? {
-            return Ok(Some(agent));
-        }
+    if let Some(agent_id) = parse_uuid7(agent_ref)
+        && let Some(agent) = exoharness.get_agent(&agent_id).await?
+    {
+        return Ok(Some(agent));
     }
 
     let agents = exoharness.list_agents().await?;
@@ -62,13 +62,16 @@ pub(crate) async fn resolve_conversation_handle(
     agent: &dyn AgentHandle,
     conversation_ref: &str,
 ) -> Result<Option<Arc<dyn ConversationHandle>>> {
-    if let Some(conversation_id) = parse_uuid7(conversation_ref) {
-        if let Some(conversation) = agent.get_conversation(&conversation_id).await? {
-            return Ok(Some(conversation));
-        }
+    if let Some(conversation_id) = parse_uuid7(conversation_ref)
+        && let Some(conversation) = agent.get_conversation(&conversation_id).await?
+    {
+        return Ok(Some(conversation));
     }
 
-    let conversations = agent.list_conversations().await?;
+    let conversations = agent
+        .list_conversations(exoharness::ListConversationsRequest::default())
+        .await?
+        .conversations;
     Ok(conversations
         .into_iter()
         .find(|conversation| conversation.record().slug == conversation_ref))
@@ -138,7 +141,9 @@ pub(crate) async fn get_conversation_model_override(
             limit: Some(1),
             session_id: None,
             turn_id: None,
-            types: Some(vec![CONVERSATION_MODEL_CONFIG_EVENT_TYPE.to_string()]),
+            types: Some(vec![EventKind::custom(
+                CONVERSATION_MODEL_CONFIG_EVENT_TYPE,
+            )]),
         }))
         .await?
         .events;
@@ -173,7 +178,6 @@ pub(crate) async fn put_conversation_model_override(
         .add_events(AddEventsRequest {
             session_id: None,
             turn_id: None,
-            expected_head: None,
             data: vec![EventData::Custom {
                 event_type: CONVERSATION_MODEL_CONFIG_EVENT_TYPE.to_string(),
                 payload,
@@ -194,7 +198,7 @@ pub(crate) async fn resolve_model_binding(
     conversation: &dyn ConversationHandle,
     name: &str,
 ) -> Result<ResolvedModelBinding> {
-    let binding_metadata = conversation
+    let binding_record = conversation
         .list_bindings()
         .await?
         .into_iter()
@@ -204,16 +208,12 @@ pub(crate) async fn resolve_model_binding(
                 "model is not registered: {name}; run `exo model register {name} --secret <secret>`"
             )
         })?;
-    let binding = conversation
-        .get_binding(&binding_metadata.id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("registered model binding disappeared: {name}"))?;
     let Binding::Llm {
         model,
         base_url,
         secret_id,
         ..
-    } = binding
+    } = binding_record.binding
     else {
         return Err(anyhow::anyhow!("binding is not a model: {name}"));
     };

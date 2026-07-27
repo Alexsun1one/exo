@@ -3,9 +3,10 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
+use cost::{PricingTable, TokenCounts};
 use exoharness::{
-    AgentHandle, ConversationHandle, ConversationId, EventData, EventId, EventQuery,
-    EventQueryDirection, Result, ToolCallId, ToolRequest, TurnHandle,
+    AgentHandle, ConversationHandle, ConversationId, EventData, EventId, EventKind, EventQuery,
+    EventQueryDirection, Result, ToolCallId, ToolRequest, TurnHandle, UsageRecord,
 };
 use lingua::Message;
 use lingua::universal::{ToolContentPart, ToolResultContentPart};
@@ -24,14 +25,21 @@ pub struct BasicExecutor<M, T> {
     model: Arc<M>,
     tools: Arc<T>,
     history_cache: Arc<RwLock<HashMap<ConversationId, HistoryCacheEntry>>>,
+    pricing: Arc<PricingTable>,
 }
 
 impl<M, T> BasicExecutor<M, T> {
     pub fn new(model: Arc<M>, tools: Arc<T>) -> Self {
+        Self::with_pricing(model, tools, Arc::new(PricingTable::empty()))
+    }
+
+    /// Cost is filled from `pricing`; an empty table leaves `cost_usd` unset.
+    pub fn with_pricing(model: Arc<M>, tools: Arc<T>, pricing: Arc<PricingTable>) -> Self {
         Self {
             model,
             tools,
             history_cache: Arc::new(RwLock::new(HashMap::new())),
+            pricing,
         }
     }
 }
@@ -42,8 +50,20 @@ impl<M, T> Clone for BasicExecutor<M, T> {
             model: Arc::clone(&self.model),
             tools: Arc::clone(&self.tools),
             history_cache: Arc::clone(&self.history_cache),
+            pricing: Arc::clone(&self.pricing),
         }
     }
+}
+
+struct ToolRoundContext<'a> {
+    agent: &'a dyn AgentHandle,
+    conversation: &'a dyn ConversationHandle,
+    turn: Arc<dyn TurnHandle>,
+    agent_config: &'a AgentConfig,
+    conversation_config: &'a ConversationConfig,
+    round: usize,
+    stream_mode: ExecutorStreamMode<'a>,
+    turn_trace: Option<&'a dyn TurnExecutionTrace>,
 }
 
 impl<M, T> BasicExecutor<M, T>
@@ -70,9 +90,9 @@ where
                 session_id: None,
                 turn_id: None,
                 types: Some(vec![
-                    "messages".to_string(),
-                    "tool_requested".to_string(),
-                    "tool_result".to_string(),
+                    EventKind::MESSAGES,
+                    EventKind::TOOL_REQUESTED,
+                    EventKind::TOOL_RESULT,
                 ]),
             }))
             .await?;
@@ -107,8 +127,9 @@ where
 
     async fn run_turn_loop(
         &self,
+        agent: &dyn AgentHandle,
         conversation: &dyn ConversationHandle,
-        turn: &dyn TurnHandle,
+        turn: Arc<dyn TurnHandle>,
         agent_config: &AgentConfig,
         conversation_config: &ConversationConfig,
         stream_mode: ExecutorStreamMode<'_>,
@@ -132,7 +153,7 @@ where
                 .complete_model_round(request, round as usize, stream_mode, turn_trace)
                 .await?;
 
-            let events = interpret_model_response(response);
+            let events = interpret_model_response(response, &self.pricing);
             turn.add_events(events.clone()).await?;
 
             let tool_requests = collect_tool_requests(&events);
@@ -142,12 +163,17 @@ where
 
             let tool_results = self
                 .execute_tool_round(
-                    conversation,
-                    conversation_config,
+                    ToolRoundContext {
+                        agent,
+                        conversation,
+                        turn: Arc::clone(&turn),
+                        agent_config,
+                        conversation_config,
+                        round: round as usize,
+                        stream_mode,
+                        turn_trace,
+                    },
                     tool_requests,
-                    round as usize,
-                    stream_mode,
-                    turn_trace,
                 )
                 .await?;
             turn.add_events(tool_results).await?;
@@ -167,9 +193,11 @@ where
             Some(turn_trace) => turn_trace.start_llm_round(&request, round).await,
             None => None,
         };
+        let requested_model = request.model.clone();
 
         match stream_mode {
             ExecutorStreamMode::Disabled => {
+                let started_at = Instant::now();
                 let response = match self.model.complete(request).await {
                     Ok(response) => response,
                     Err(error) => {
@@ -179,6 +207,14 @@ where
                         return Err(error);
                     }
                 };
+                let duration = started_at.elapsed();
+                let mut response = response;
+                if response.model.is_none() {
+                    response.model = Some(requested_model);
+                }
+                if response.duration.is_none() {
+                    response.duration = Some(duration);
+                }
                 if let Some(llm_trace) = llm_trace {
                     llm_trace.finish_success(&response, None).await;
                 }
@@ -233,6 +269,17 @@ where
                         return Err(error);
                     }
                 };
+                let duration = started_at.elapsed();
+                let mut response = response;
+                if response.model.is_none() {
+                    response.model = Some(requested_model);
+                }
+                if response.ttft.is_none() {
+                    response.ttft = ttft;
+                }
+                if response.duration.is_none() {
+                    response.duration = Some(duration);
+                }
                 if let Some(llm_trace) = llm_trace {
                     llm_trace.finish_success(&response, ttft).await;
                 }
@@ -243,17 +290,13 @@ where
 
     async fn execute_tool_round(
         &self,
-        conversation: &dyn ConversationHandle,
-        conversation_config: &ConversationConfig,
+        context: ToolRoundContext<'_>,
         tool_requests: Vec<ExecutableToolRequest>,
-        round: usize,
-        stream_mode: ExecutorStreamMode<'_>,
-        turn_trace: Option<&dyn TurnExecutionTrace>,
     ) -> Result<Vec<EventData>> {
         let mut tool_results = Vec::with_capacity(tool_requests.len());
 
         for tool_request in tool_requests {
-            if let ExecutorStreamMode::Enabled(event_tx) = stream_mode {
+            if let ExecutorStreamMode::Enabled(event_tx) = context.stream_mode {
                 try_send_stream_event(
                     event_tx,
                     ExecutionStreamEvent::ToolCall {
@@ -264,31 +307,41 @@ where
                 );
             }
 
-            let tool_trace = match turn_trace {
+            let mut tool_trace = match context.turn_trace {
                 Some(turn_trace) => {
                     turn_trace
-                        .start_tool_call(&tool_request.request, round)
+                        .start_tool_call(&tool_request.request, context.round)
                         .await
                 }
                 None => None,
             };
-            let result = match self
-                .tools
-                .execute(conversation, conversation_config, &tool_request.request)
-                .await
-            {
-                Ok(response) => response,
+            let tool_future = self.tools.execute(
+                context.agent,
+                context.conversation,
+                Some(context.turn.as_ref()),
+                context.agent_config,
+                context.conversation_config,
+                &tool_request.request,
+            );
+            let (result, tool_succeeded) = match tool_future.await {
+                Ok(response) => (response, true),
                 Err(error) => {
-                    if let Some(tool_trace) = tool_trace {
+                    if let Some(tool_trace) = tool_trace.take() {
                         tool_trace.finish_error(&error).await;
                     }
-                    return Err(error);
+                    (
+                        json!({
+                            "ok": false,
+                            "error": error.to_string(),
+                        }),
+                        false,
+                    )
                 }
             };
-            if let Some(tool_trace) = tool_trace {
+            if tool_succeeded && let Some(tool_trace) = tool_trace.take() {
                 tool_trace.finish_success(&result).await;
             }
-            if let ExecutorStreamMode::Enabled(event_tx) = stream_mode {
+            if let ExecutorStreamMode::Enabled(event_tx) = context.stream_mode {
                 try_send_stream_event(
                     event_tx,
                     ExecutionStreamEvent::ToolResult {
@@ -317,12 +370,13 @@ where
 
     async fn prepare_conversation(
         &self,
+        agent: &dyn AgentHandle,
         conversation: &dyn ConversationHandle,
         agent_config: &AgentConfig,
         conversation_config: &ConversationConfig,
     ) -> Result<()> {
         self.tools
-            .prepare_conversation(conversation, agent_config, conversation_config)
+            .prepare_conversation(agent, conversation, agent_config, conversation_config)
             .await
     }
 
@@ -330,9 +384,9 @@ where
         Ok(())
     }
 
-    async fn run_turn(
+    async fn execute_turn(
         &self,
-        _agent: &dyn AgentHandle,
+        agent: &dyn AgentHandle,
         conversation: &dyn ConversationHandle,
         turn: Arc<dyn TurnHandle>,
         agent_config: &AgentConfig,
@@ -342,8 +396,9 @@ where
         turn_trace: Option<&dyn TurnExecutionTrace>,
     ) -> Result<()> {
         self.run_turn_loop(
+            agent,
             conversation,
-            turn.as_ref(),
+            turn,
             agent_config,
             conversation_config,
             stream_mode,
@@ -358,15 +413,21 @@ fn extend_message_history(
     tool_call_names: &mut HashMap<ToolCallId, String>,
     events: &[exoharness::Event],
 ) {
+    let mut pending_tool_call_ids = Vec::new();
+
     for event in events {
         match &event.data {
-            EventData::Messages { messages, .. } => history.extend(messages.clone()),
+            EventData::Messages { messages, .. } => {
+                flush_dangling_tool_results(history, tool_call_names, &mut pending_tool_call_ids);
+                history.extend(messages.clone());
+            }
             EventData::ToolRequested {
                 tool_call_id,
                 request,
                 ..
             } => {
                 tool_call_names.insert(tool_call_id.clone(), request.function_name.clone());
+                pending_tool_call_ids.push(tool_call_id.clone());
             }
             EventData::ToolResult {
                 tool_call_id,
@@ -375,6 +436,7 @@ fn extend_message_history(
                 let Some(tool_name) = tool_call_names.get(tool_call_id) else {
                     continue;
                 };
+                remove_pending_tool_call(&mut pending_tool_call_ids, tool_call_id);
                 history.push(Message::Tool {
                     content: vec![ToolContentPart::ToolResult(ToolResultContentPart {
                         tool_call_id: tool_call_id.clone(),
@@ -389,13 +451,47 @@ fn extend_message_history(
     }
 }
 
-fn interpret_model_response(response: ModelResponse) -> Vec<EventData> {
+fn flush_dangling_tool_results(
+    history: &mut Vec<Message>,
+    tool_call_names: &HashMap<ToolCallId, String>,
+    pending_tool_call_ids: &mut Vec<ToolCallId>,
+) {
+    for tool_call_id in std::mem::take(pending_tool_call_ids) {
+        let Some(tool_name) = tool_call_names.get(&tool_call_id) else {
+            continue;
+        };
+        history.push(Message::Tool {
+            content: vec![ToolContentPart::ToolResult(ToolResultContentPart {
+                tool_call_id,
+                tool_name: tool_name.clone(),
+                output: to_lingua_value(json!({
+                    "ok": false,
+                    "error": "tool execution did not complete before the previous turn ended",
+                })),
+                provider_options: None,
+            })],
+        });
+    }
+}
+
+fn remove_pending_tool_call(pending_tool_call_ids: &mut Vec<ToolCallId>, tool_call_id: &str) {
+    if let Some(index) = pending_tool_call_ids
+        .iter()
+        .position(|pending| pending == tool_call_id)
+    {
+        pending_tool_call_ids.remove(index);
+    }
+}
+
+fn interpret_model_response(response: ModelResponse, pricing: &PricingTable) -> Vec<EventData> {
     let mut events = Vec::new();
 
     if !response.messages.is_empty() {
+        let usage = build_usage_record(&response, pricing);
         events.push(EventData::Messages {
             messages: response.messages,
             response_id: response.response_id,
+            usage,
         });
     }
 
@@ -408,6 +504,68 @@ fn interpret_model_response(response: ModelResponse) -> Vec<EventData> {
     }
 
     events
+}
+
+fn build_usage_record(
+    response: &ModelResponse,
+    pricing: &PricingTable,
+) -> Option<Box<UsageRecord>> {
+    // Only emit a record when we have *something* worth recording — token usage
+    // or timing. Skipping when both are absent keeps event JSON clean for
+    // tests/fakes that don't populate metadata.
+    let has_usage = response.usage.is_some();
+    let has_timing = response.ttft.is_some() || response.duration.is_some();
+    if !has_usage && !has_timing {
+        return None;
+    }
+
+    let model = response.model.clone().unwrap_or_default();
+    let (
+        prompt_tokens,
+        completion_tokens,
+        prompt_cached_tokens,
+        prompt_cache_creation_tokens,
+        completion_reasoning_tokens,
+    ) = match &response.usage {
+        Some(u) => (
+            u.prompt_tokens,
+            u.completion_tokens,
+            u.prompt_cached_tokens,
+            u.prompt_cache_creation_tokens,
+            u.completion_reasoning_tokens,
+        ),
+        None => (None, None, None, None, None),
+    };
+
+    // Prefer the provider-reported cost (e.g. OpenRouter's `usage.cost`); fall
+    // back to the local price-table estimate when the provider doesn't send one.
+    let cost_usd = response.provider_cost_usd.or_else(|| {
+        if has_usage && !model.is_empty() {
+            pricing.compute_cost_usd(
+                &model,
+                TokenCounts {
+                    prompt: prompt_tokens,
+                    completion: completion_tokens,
+                    prompt_cached: prompt_cached_tokens,
+                    prompt_cache_creation: prompt_cache_creation_tokens,
+                },
+            )
+        } else {
+            None
+        }
+    });
+
+    Some(Box::new(UsageRecord {
+        model,
+        prompt_tokens,
+        completion_tokens,
+        prompt_cached_tokens,
+        prompt_cache_creation_tokens,
+        completion_reasoning_tokens,
+        cost_usd,
+        ttft_ms: response.ttft.map(|d| d.as_millis() as u64),
+        duration_ms: response.duration.map(|d| d.as_millis() as u64),
+    }))
 }
 
 #[derive(Debug, Clone)]

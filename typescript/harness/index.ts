@@ -1,8 +1,16 @@
+import type { ToolModuleExport } from "./tool-modules";
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
 export interface JsonObject {
   [key: string]: JsonValue;
 }
+
+export * from "./tools";
+export * from "./built-in-tools";
+export * from "./tool-modules";
+export * from "./adapter-tools";
+export * from "./skill-tools";
 
 export type MessageRole =
   | "system"
@@ -19,11 +27,14 @@ export interface Message {
 
 export interface AgentConfig {
   instructions: Message[];
-  harness: "basic" | "rlm" | "typescript";
+  harness: "basic" | "rlm" | "typescript" | "exo";
   typescript?: {
     modulePath: string;
+    toolModulePaths: string[];
   } | null;
+  enableAgentToolCreation: boolean;
   sandboxImage?: string | null;
+  sandboxProvider: "daytona" | "apple_container" | "docker" | "local_process";
   enableNetworking: boolean;
   model: string;
   maxOutputTokens?: number | null;
@@ -52,11 +63,12 @@ export type Binding =
       secretId?: string | null;
     };
 
-export interface BindingMetadata {
+export interface BindingRecord {
   id: string;
   type: "env" | "mcp" | "llm";
   name: string;
   createdAt: string;
+  binding: Binding;
 }
 
 export type Secret =
@@ -78,8 +90,15 @@ export interface SecretMetadata {
 }
 
 export interface ConversationConfig {
-  enableNetworking: boolean;
+  sandboxImage?: string | null;
+  sandboxProvider?:
+    | "daytona"
+    | "apple_container"
+    | "docker"
+    | "local_process"
+    | null;
   shellProgram?: string | null;
+  sandboxScope?: "agent" | "conversation" | null;
   mounts: FileSystemMount[];
 }
 
@@ -94,6 +113,7 @@ export interface ToolDefinition {
   name: string;
   description: string;
   parameters: JsonValue;
+  outputSchema?: JsonValue;
 }
 
 export interface ToolRequest {
@@ -104,9 +124,13 @@ export interface ToolRequest {
 export interface SandboxProcessStartRequest {
   command: string[];
   env?: Record<string, string>;
+  reuseKey?: string;
 }
 
 export interface SandboxProcess {
+  readonly sandboxId?: string;
+  readonly sandboxProcessId?: string;
+  readonly reused: boolean;
   readonly stdout: ReadableStream<string>;
   readonly stderr: ReadableStream<string>;
   writeStdin(data: string): Promise<void>;
@@ -174,7 +198,6 @@ export interface GetEventsResult {
 export interface AddEventsRequest {
   sessionId?: string | null;
   turnId?: string | null;
-  expectedHead?: string | null;
   data: EventData[];
 }
 
@@ -243,7 +266,7 @@ export interface Agent {
     path: string;
     value: JsonValue;
   }): Promise<ArtifactVersion>;
-  listBindings(): Promise<BindingMetadata[]>;
+  listBindings(): Promise<BindingRecord[]>;
   getBinding(id: string): Promise<Binding | null>;
   listSecrets(): Promise<SecretMetadata[]>;
   getSecret(id: string): Promise<Secret | null>;
@@ -255,7 +278,7 @@ export interface ExoHarness {
   getAgent(id: string): Promise<Agent | null>;
   newAgent(request: { slug: string; name: string }): Promise<Agent>;
   deleteAgent(id: string): Promise<boolean>;
-  listBindings(): Promise<BindingMetadata[]>;
+  listBindings(): Promise<BindingRecord[]>;
   getBinding(id: string): Promise<Binding | null>;
   listSecrets(): Promise<SecretMetadata[]>;
   getSecret(id: string): Promise<Secret | null>;
@@ -301,17 +324,32 @@ export interface Conversation {
     path: string;
     value: JsonValue;
   }): Promise<ArtifactVersion>;
-  listBindings(): Promise<BindingMetadata[]>;
+  listBindings(): Promise<BindingRecord[]>;
   getBinding(id: string): Promise<Binding | null>;
   listSecrets(): Promise<SecretMetadata[]>;
   getSecret(id: string): Promise<Secret | null>;
 }
 
 export interface Turn {
-  readonly handleId: number;
+  readonly agentId: string;
+  readonly conversationId: string;
+  readonly sessionId: string;
+  readonly turnId: string;
   readonly conversation: Conversation;
   readonly record: TurnRecord;
   addEvents(data: EventData[]): Promise<AddEventsResult>;
+  writeArtifact(args: {
+    path: string;
+    contents: Uint8Array | string;
+  }): Promise<ArtifactVersion>;
+  writeArtifactText(args: {
+    path: string;
+    text: string;
+  }): Promise<ArtifactVersion>;
+  writeArtifactJson(args: {
+    path: string;
+    value: JsonValue;
+  }): Promise<ArtifactVersion>;
 }
 
 export interface TurnContext {
@@ -339,6 +377,7 @@ export interface TurnContext {
 }
 
 export interface TypeScriptHarness {
+  tools?: ToolModuleExport;
   runTurn(context: TurnContext): Promise<void>;
 }
 
@@ -398,11 +437,13 @@ export function assistantTextMessage(text: string): Message {
 export function messagesEvent(
   messages: Message[],
   responseId?: string,
+  usage?: JsonObject,
 ): EventData {
   return {
     type: "messages",
     messages,
     response_id: responseId,
+    ...(usage ? { usage } : {}),
   };
 }
 
@@ -550,10 +591,17 @@ export async function materializeConversationMessages(
 export function materializeEventsToMessages(events: Event[]): Message[] {
   const messages: Message[] = [];
   const toolCallNames = new Map<string, string>();
+  const pendingToolCallIds: string[] = [];
 
   for (const event of events) {
-    extendMaterializedMessages(messages, toolCallNames, event);
+    extendMaterializedMessages(
+      messages,
+      toolCallNames,
+      pendingToolCallIds,
+      event,
+    );
   }
+  flushDanglingToolResults(messages, toolCallNames, pendingToolCallIds);
 
   return messages;
 }
@@ -609,32 +657,6 @@ export function toolResultMessage(
   };
 }
 
-export function buildShellToolDefinitions(
-  config: ConversationConfig,
-): ToolDefinition[] {
-  if (!config.shellProgram) {
-    return [];
-  }
-
-  return [
-    {
-      name: "shell",
-      description: `Run a shell command using ${config.shellProgram}.`,
-      parameters: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          command: {
-            type: "string",
-            description: "Shell command to execute.",
-          },
-        },
-        required: ["command"],
-      },
-    },
-  ];
-}
-
 export function filterMessages(
   messages: Message[],
   role?: MessageRole,
@@ -683,6 +705,14 @@ function contentText(content: unknown): string {
         part &&
         typeof part === "object" &&
         "type" in part &&
+        (part as { type?: unknown }).type === "image"
+      ) {
+        return "[image]";
+      }
+      if (
+        part &&
+        typeof part === "object" &&
+        "type" in part &&
         (part as { type?: unknown }).type === "reasoning" &&
         "text" in part &&
         typeof (part as { text?: unknown }).text === "string"
@@ -717,9 +747,11 @@ function contentText(content: unknown): string {
 function extendMaterializedMessages(
   messages: Message[],
   toolCallNames: Map<string, string>,
+  pendingToolCallIds: string[],
   event: Event,
 ): void {
   if (isMessagesEvent(event.data)) {
+    flushDanglingToolResults(messages, toolCallNames, pendingToolCallIds);
     messages.push(...event.data.messages);
     return;
   }
@@ -729,6 +761,7 @@ function extendMaterializedMessages(
       event.data.tool_call_id,
       event.data.request.function_name,
     );
+    pendingToolCallIds.push(event.data.tool_call_id);
     return;
   }
 
@@ -737,9 +770,43 @@ function extendMaterializedMessages(
     if (!toolName) {
       return;
     }
+    removePendingToolCall(pendingToolCallIds, event.data.tool_call_id);
     messages.push(
       toolResultMessage(event.data.tool_call_id, toolName, event.data.result),
     );
+  }
+}
+
+function flushDanglingToolResults(
+  messages: Message[],
+  toolCallNames: Map<string, string>,
+  pendingToolCallIds: string[],
+): void {
+  while (pendingToolCallIds.length > 0) {
+    const toolCallId = pendingToolCallIds.shift();
+    if (!toolCallId) {
+      continue;
+    }
+    const toolName = toolCallNames.get(toolCallId);
+    if (!toolName) {
+      continue;
+    }
+    messages.push(
+      toolResultMessage(toolCallId, toolName, {
+        ok: false,
+        error: "tool execution did not complete before the previous turn ended",
+      }),
+    );
+  }
+}
+
+function removePendingToolCall(
+  pendingToolCallIds: string[],
+  toolCallId: string,
+): void {
+  const index = pendingToolCallIds.indexOf(toolCallId);
+  if (index >= 0) {
+    pendingToolCallIds.splice(index, 1);
   }
 }
 
