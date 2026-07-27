@@ -51,13 +51,32 @@ function snapOf(observeResult: any): Snapshot {
   // tolerate a flat shape.
   const agent = self.agent ?? self;
   const farm = payload?.farm ?? {};
-  // TODO(Task 12 E2E): confirm query_farm returns { plots: [...] }; if the
-  // field name differs, farmStatus stays "" and farm diffs never fire.
-  const plots = Array.isArray(farm.plots) ? farm.plots : [];
+  // Task 12 E2E confirmed: query_farm returns plots as a bucketed object
+  //   { ripe: [{id, crop}], growing: [{id, crop, ripens_in}] }
+  // (fields are `crop`, status is implied by the bucket). Also tolerate a
+  // legacy flat array of {crop_name, status} so this keeps working if the
+  // shape changes back.
+  let plotStrings: string[] = [];
+  if (Array.isArray(farm.plots)) {
+    plotStrings = farm.plots.map(
+      (p: any) => `${p.crop_name ?? p.crop}:${p.status}`,
+    );
+  } else if (farm.plots && typeof farm.plots === "object") {
+    for (const status of ["ripe", "growing"] as const) {
+      const bucket = (farm.plots as Record<string, unknown>)[status];
+      if (Array.isArray(bucket)) {
+        for (const p of bucket) {
+          plotStrings.push(
+            `${(p as any).crop ?? (p as any).crop_name}:${status}`,
+          );
+        }
+      }
+    }
+  }
   return {
     compute: Number(agent.compute_tokens ?? 0),
     coins: Number(agent.sili_coins ?? 0),
-    farmStatus: plots.map((p: any) => `${p.crop_name}:${p.status}`).join(","),
+    farmStatus: plotStrings.join(","),
   };
 }
 
