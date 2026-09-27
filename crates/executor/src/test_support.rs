@@ -42,7 +42,10 @@ pub(crate) async fn create_test_credential(exoharness: &dyn exoharness::ExoHarne
         .await
         .expect("runtime vault")
         .put_secret(exoharness::PutSecretRequest {
-            target: None,
+            policy: Some(exoharness::CredentialPolicy::destinations(vec![
+                exoharness::CredentialDestination::origin("https://api.openai.com").unwrap(),
+                exoharness::CredentialDestination::origin("https://api.anthropic.com").unwrap(),
+            ])),
             name: "test-openai".to_string(),
             secret: exoharness::Secret::Key {
                 value: "test-key".to_string(),

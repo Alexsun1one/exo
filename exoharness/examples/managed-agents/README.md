@@ -7,7 +7,7 @@ Run from the Exo repo using the local provider:
 ```sh
 exo vault create personal
 exo vault secret create personal notion \
-  --mcp-server-url https://mcp.notion.com/mcp
+  --url https://mcp.notion.com/mcp
 exo agent run --agent-file exoharness/examples/managed-agents/notion-analyst.md \
   --vault personal
 ```

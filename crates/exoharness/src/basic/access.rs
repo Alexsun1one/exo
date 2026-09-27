@@ -1,5 +1,5 @@
 use super::*;
-use crate::vault::{ResolvedSecret, SecretTarget, VaultRecord};
+use crate::vault::{CredentialDestination, ResolvedSecret, VaultRecord};
 
 impl BasicExoHarness {
     pub(super) async fn check(&self, scope: ResourceScope) -> Result<()> {
@@ -158,6 +158,7 @@ impl VaultHandle for CallerVault {
     }
     async fn put_secret(&self, request: crate::PutSecretRequest) -> Result<SecretId> {
         self.check(true).await?;
+        crate::vault::require_portable_secret(&request.secret)?;
         self.vault.put_secret(request).await
     }
     async fn get_secret(&self, id: &SecretId) -> Result<Option<Secret>> {
@@ -170,20 +171,27 @@ impl VaultHandle for CallerVault {
         request: crate::UpdateSecretRequest,
     ) -> Result<SecretMetadata> {
         self.check(true).await?;
+        if let Some(secret) = &request.secret {
+            crate::vault::require_portable_secret(secret)?;
+        }
         self.vault.update_secret(id, request).await
     }
     async fn delete_secret(&self, id: &SecretId) -> Result<()> {
         self.check(true).await?;
         self.vault.delete_secret(id).await
     }
-    async fn resolve_secret(&self, id: &SecretId, target: &SecretTarget) -> Result<ResolvedSecret> {
+    async fn resolve_secret(
+        &self,
+        id: &SecretId,
+        target: &CredentialDestination,
+    ) -> Result<ResolvedSecret> {
         self.check(false).await?;
         self.vault.resolve_secret(id, target).await
     }
     async fn refresh_secret(
         &self,
         id: &SecretId,
-        target: &SecretTarget,
+        target: &CredentialDestination,
         rejected_revision: u64,
     ) -> Result<ResolvedSecret> {
         self.check(false).await?;

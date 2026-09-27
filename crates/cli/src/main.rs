@@ -1029,12 +1029,7 @@ async fn run_selected(
                     },
                 ..
             } | Commands::Vault {
-                command: vaults::VaultCommands::List
-                    | vaults::VaultCommands::Get { .. }
-                    | vaults::VaultCommands::Secret {
-                        command: vaults::SecretCommands::List { .. }
-                            | vaults::SecretCommands::Get { .. }
-                    },
+                command: vaults::VaultCommands::List { .. } | vaults::VaultCommands::Get { .. },
                 ..
             }
         ) {
@@ -1062,6 +1057,7 @@ async fn run_selected(
     let env = CliEnvironment::load(cli.runtime().env_file.as_deref())?;
     let definition = managed_agents::load_definition(&cli.command)?;
 
+    let local = http_client.is_none();
     let harness = providers::runtime(&cli, http_client, definition.as_ref(), &env).await?;
     let env_vars = env.into_vars();
     let root = cli.runtime().root.clone();
@@ -1074,7 +1070,7 @@ async fn run_selected(
         Commands::Provider { .. } => {
             unreachable!("management commands return before harness startup")
         }
-        Commands::Vault { command, .. } => vaults::run(harness.exoharness_handle().as_ref(), &command, &env_vars).await?,
+        Commands::Vault { command, .. } => vaults::run(harness.exoharness_handle().as_ref(), &command, &env_vars, local).await?,
         Commands::Agent { command: AgentCommands::Run { thread, tui, prompt, .. }, .. } => {
             let (agent, conversation) = managed_agents::open_thread(
                 harness.as_ref(),
@@ -2384,6 +2380,23 @@ mod command_tests {
             Cli::try_parse_from(["exo"].into_iter().chain(args)).unwrap();
         }
         for args in [
+            vec!["vault", "login", "team", "--preset", "github"],
+            vec!["vault", "secret", "create", "team", "github"],
+            vec!["vault", "secret", "create", "team", "--token-env", "TOKEN"],
+            vec![
+                "vault",
+                "secret",
+                "create",
+                "team",
+                "notion",
+                "--token-env",
+                "TOKEN",
+                "--url",
+                "https://mcp.notion.com/mcp",
+            ],
+            vec![
+                "vault", "secret", "update", "team", "github", "--scope", "repo",
+            ],
             vec!["agent", "serve", "support"],
             vec!["agent", "create", "support", "--model", "test"],
             vec!["agent", "--exoharness-url", "http://localhost", "list"],

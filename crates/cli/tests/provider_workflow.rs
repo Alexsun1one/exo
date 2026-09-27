@@ -937,7 +937,7 @@ async fn remote_spec_uses_provider_harness_and_per_thread_vault_credentials() ->
                 "create",
                 vault,
                 "workspace",
-                "--mcp-server-url",
+                "--allow-url",
                 &url,
                 "--token-env",
                 "MCP_TOKEN",
@@ -1677,42 +1677,36 @@ async fn secret_destination_updates_preserve_identity_locally_and_over_http() ->
             .find(|s| s.name == "github-git")
             .context("Git secret")?;
         let original = vault.get_secret(&before.id).await?;
-        let target = exoharness::vault::SecretTarget::http("https://github.com")?;
+        let target = exoharness::vault::CredentialDestination::origin("https://github.com")?;
         let error = vault
             .resolve_secret(&before.id, &target)
             .await
             .err()
             .context("missing grant must fail")?;
         assert!(error.to_string().contains("github-git"));
-        assert!(
-            error
-                .to_string()
-                .contains("--http-origin https://github.com")
-        );
+        assert!(error.to_string().contains("--allow-origin"));
         f.cli(&[
             "vault",
             "secret",
             "update",
             "global",
             "github-git",
-            "--http-origin",
+            "--allow-origin",
             "https://github.com",
         ])
         .await?;
-        let saved: exoharness::SecretMetadata = serde_json::from_str(
-            &f.cli(&["vault", "secret", "get", "global", "github-git"])
-                .await?,
-        )?;
+        let saved: exoharness::SecretMetadata =
+            serde_json::from_str(&f.cli(&["vault", "get", "global", "github-git"]).await?)?;
         assert_eq!(saved.id, before.id);
         assert_eq!(saved.revision, before.revision + 1);
-        assert_eq!(saved.target, Some(target.clone()));
+        assert_eq!(saved.policy, Some(target.clone().into()));
         assert_eq!(vault.get_secret(&saved.id).await?, original);
         assert!(vault.resolve_secret(&saved.id, &target).await.is_ok());
         assert!(
             vault
                 .resolve_secret(
                     &saved.id,
-                    &exoharness::vault::SecretTarget::http("https://other.example")?
+                    &exoharness::vault::CredentialDestination::origin("https://other.example")?
                 )
                 .await
                 .is_err()
@@ -1737,7 +1731,7 @@ async fn secret_destination_updates_preserve_identity_locally_and_over_http() ->
                     "update",
                     "global",
                     "github-git",
-                    "--http-origin",
+                    "--allow-origin",
                     "http://github.com",
                     "--token-env",
                     "SMOKE_API_KEY",
@@ -1769,6 +1763,8 @@ async fn models_use_spec_names_and_selected_vault_credentials_locally_and_over_h
                 "model-key",
                 "--token-env",
                 "PERSONAL_KEY",
+                "--allow-origin",
+                &f.model.uri(),
             ])
             .env("PERSONAL_KEY", "personal-model-key")
             .output()
@@ -1832,4 +1828,83 @@ async fn models_use_spec_names_and_selected_vault_credentials_locally_and_over_h
         f.stop().await?;
     }
     Ok(())
+}
+
+#[actix_web::test]
+async fn remote_github_preset_copies_tokens_and_rejects_host_account_links() -> Result<()> {
+    use exoharness::{PutSecretRequest, ResourceScope, Secret};
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new().await?;
+    f.cli(&["provider", "switch", "remote"]).await?;
+    let executable = f.temp.path().join("gh");
+    std::fs::write(
+        &executable,
+        r#"#!/bin/sh
+case "$*" in
+  'auth status --active --hostname github.com --json hosts') printf '{"hosts":{"github.com":[{"login":"fixture-user","state":"success"}]}}\n' ;;
+  'auth token --hostname github.com --user fixture-user') printf 'fixture-github-token\n' ;;
+  *) exit 1 ;;
+esac
+"#,
+    )?;
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))?;
+    let output = f
+        .command(&["vault", "secret", "create", "global", "--preset", "github"])
+        .env("PATH", f.temp.path())
+        .output()
+        .await?;
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("Copied the GitHub CLI token to the remote vault")
+    );
+    success(output)?;
+    let vault = exoharness::vault::global_vault(f.runtime.exoharness_handle().as_ref()).await?;
+    let saved = vault
+        .list_secrets()
+        .await?
+        .into_iter()
+        .find(|s| s.name == "github")
+        .context("GitHub secret")?;
+    let original = vault.get_secret(&saved.id).await?;
+    assert_eq!(
+        original,
+        Some(Secret::Key {
+            value: "fixture-github-token".into()
+        })
+    );
+    let client = exo_managed_agents::http::RuntimeClient::new(&f.endpoint)?
+        .with_bearer_token("workflow-token".into());
+    let link = Secret::GithubCli {
+        value: "cached-token".into(),
+        account: "server-owner".into(),
+    };
+    let request = PutSecretRequest {
+        name: "host-link".into(),
+        secret: link.clone(),
+        policy: saved.policy,
+    };
+    let error = client
+        .put_secret(ResourceScope::Global, vault.record().id, &request)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("runtime host"));
+    let error = client
+        .update_secret(
+            ResourceScope::Global,
+            vault.record().id,
+            saved.id,
+            &link.into(),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("runtime host"));
+    assert_eq!(vault.get_secret(&saved.id).await?, original);
+    assert!(
+        !vault
+            .list_secrets()
+            .await?
+            .iter()
+            .any(|s| s.name == "host-link")
+    );
+    f.stop().await
 }

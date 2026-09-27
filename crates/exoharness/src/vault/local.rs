@@ -1,3 +1,4 @@
+mod legacy;
 mod oauth;
 #[cfg(test)]
 mod tests;
@@ -9,9 +10,11 @@ use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     io::Write,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 #[derive(Clone)]
@@ -23,6 +26,7 @@ struct Inner {
     storage: Storage,
     cipher: SecretCipher,
     refresh: Arc<tokio::sync::Mutex<()>>,
+    github_checked: Mutex<HashMap<SecretId, (u64, Instant)>>,
 }
 
 enum Storage {
@@ -36,14 +40,14 @@ struct Catalog {
 }
 
 #[derive(Serialize, Deserialize)]
-struct StoredVault {
+struct StoredVault<M = SecretMetadata> {
     record: VaultRecord,
-    secrets: Vec<StoredSecret>,
+    secrets: Vec<StoredSecret<M>>,
 }
 
 #[derive(Serialize, Deserialize)]
-struct StoredSecret {
-    metadata: SecretMetadata,
+struct StoredSecret<M = SecretMetadata> {
+    metadata: M,
     secret: EncryptedSecret,
 }
 
@@ -61,6 +65,7 @@ impl BasicVaultStore {
                 storage,
                 cipher,
                 refresh: Arc::default(),
+                github_checked: Mutex::default(),
             }),
         })
     }
@@ -81,14 +86,14 @@ impl BasicVaultStore {
             Storage::File(root) => {
                 let lock = lock_secret_file(&root.join("vaults.lock"))?;
                 let path = root.join("vaults.json");
-                let mut catalog = match std::fs::read(&path) {
-                    Ok(bytes) => serde_json::from_slice(&bytes).context("reading vault catalog")?,
+                let (mut catalog, migrated) = match std::fs::read(&path) {
+                    Ok(bytes) => legacy::read_catalog(&bytes, &inner.cipher)?,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        Catalog::default()
+                        (Catalog::default(), false)
                     }
                     Err(error) => return Err(error.into()),
                 };
-                if !write {
+                if !write && !migrated {
                     drop(lock);
                     return operation(&mut catalog, &inner.cipher);
                 }
@@ -249,7 +254,7 @@ fn encrypt(
     metadata: &SecretMetadata,
     secret: &Secret,
 ) -> Result<EncryptedSecret> {
-    validate_secret(secret, metadata.target.as_ref())?;
+    validate_secret(secret, metadata.policy.as_ref())?;
     cipher.encrypt_bound(secret, &serde_json::to_vec(&(vault_id, metadata))?)
 }
 
@@ -257,6 +262,7 @@ fn secret_type(secret: &Secret) -> SecretType {
     match secret {
         Secret::Key { .. } => SecretType::Key,
         Secret::Oauth { .. } => SecretType::Oauth,
+        Secret::GithubCli { .. } => SecretType::GithubCli,
     }
 }
 
@@ -294,13 +300,13 @@ impl VaultHandle for BasicVaultHandle {
                     bail!("secret name must not be empty");
                 }
                 let target = request
-                    .target
+                    .policy
                     .map(|target| target.normalized())
                     .transpose()?;
                 if vault.secrets.iter().any(|s| {
                     s.metadata.name == request.name
-                        || matches!(target, Some(SecretTarget::Mcp { .. }))
-                            && s.metadata.target == target
+                        || target.as_ref().is_some_and(CredentialPolicy::is_resource)
+                            && s.metadata.policy == target
                 }) {
                     bail!(
                         "a secret with this name or destination already exists in vault {vault_id}"
@@ -310,7 +316,7 @@ impl VaultHandle for BasicVaultHandle {
                     id: Uuid7::now(),
                     name: request.name,
                     r#type: secret_type(&request.secret),
-                    target,
+                    policy: target,
                     revision: 1,
                     created_at: Utc::now(),
                 };
@@ -348,7 +354,7 @@ impl VaultHandle for BasicVaultHandle {
         request: crate::UpdateSecretRequest,
     ) -> Result<SecretMetadata> {
         anyhow::ensure!(
-            request.secret.is_some() || request.target.is_some(),
+            request.secret.is_some() || request.policy.is_some(),
             "provide a secret value or destination to update"
         );
         let vault_id = self.record.id;
@@ -357,16 +363,16 @@ impl VaultHandle for BasicVaultHandle {
             .access(true, move |catalog, cipher| {
                 let vault = vault(catalog, vault_id)?;
                 let target = request
-                    .target
+                    .policy
                     .map(|target| target.normalized())
                     .transpose()?;
-                if matches!(target, Some(SecretTarget::Mcp { .. }))
+                if target.as_ref().is_some_and(CredentialPolicy::is_resource)
                     && vault
                         .secrets
                         .iter()
-                        .any(|stored| stored.metadata.id != id && stored.metadata.target == target)
+                        .any(|stored| stored.metadata.id != id && stored.metadata.policy == target)
                 {
-                    bail!("a secret for this MCP destination already exists in the vault");
+                    bail!("a secret with this resource policy already exists in the vault");
                 }
                 let stored = vault
                     .secrets
@@ -386,7 +392,7 @@ impl VaultHandle for BasicVaultHandle {
                     .checked_add(1)
                     .context("secret revision overflow")?;
                 if let Some(target) = target {
-                    metadata.target = Some(target);
+                    metadata.policy = Some(target);
                 }
                 metadata.r#type = secret_type(&secret);
                 let encrypted = encrypt(cipher, vault_id, &metadata, &secret)?;
@@ -412,67 +418,135 @@ impl VaultHandle for BasicVaultHandle {
             .await
     }
 
-    async fn resolve_secret(&self, id: &SecretId, target: &SecretTarget) -> Result<ResolvedSecret> {
+    async fn resolve_secret(
+        &self,
+        id: &SecretId,
+        target: &CredentialDestination,
+    ) -> Result<ResolvedSecret> {
         let resolved = self.read_for_destination(id, target).await?;
-        if !oauth::needs_refresh(&resolved.secret) {
+        let needs_refresh = match &resolved.secret {
+            Secret::GithubCli { .. } => !self.github_cache_fresh(id, resolved.revision)?,
+            secret => oauth::needs_refresh(secret),
+        };
+        if !needs_refresh {
             return Ok(resolved);
         }
-        self.refresh_secret(id, target, resolved.revision).await
+        self.refresh_task(id, target, resolved.revision, false)
+            .await
     }
 
     async fn refresh_secret(
         &self,
         id: &SecretId,
-        target: &SecretTarget,
+        target: &CredentialDestination,
         rejected_revision: u64,
+    ) -> Result<ResolvedSecret> {
+        self.refresh_task(id, target, rejected_revision, true).await
+    }
+}
+
+const GITHUB_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+impl BasicVaultHandle {
+    fn github_cache_fresh(&self, id: &SecretId, revision: u64) -> Result<bool> {
+        Ok(self
+            .store
+            .inner
+            .github_checked
+            .lock()
+            .map_err(|_| anyhow::anyhow!("GitHub credential cache lock is poisoned"))?
+            .get(id)
+            .is_some_and(|(checked_revision, at)| {
+                *checked_revision == revision && at.elapsed() < GITHUB_CACHE_TTL
+            }))
+    }
+
+    async fn refresh_task(
+        &self,
+        id: &SecretId,
+        target: &CredentialDestination,
+        rejected_revision: u64,
+        force: bool,
     ) -> Result<ResolvedSecret> {
         let vault = self.clone();
         let id = *id;
         let target = target.clone();
         // Finish persisting rotated tokens even if the calling request is canceled.
-        tokio::spawn(async move { vault.refresh(&id, &target, rejected_revision).await }).await?
+        tokio::spawn(async move { vault.refresh(&id, &target, rejected_revision, force).await })
+            .await?
     }
-}
 
-impl BasicVaultHandle {
     async fn refresh(
         &self,
         id: &SecretId,
-        target: &SecretTarget,
+        target: &CredentialDestination,
         rejected_revision: u64,
+        force: bool,
     ) -> Result<ResolvedSecret> {
         let _guard = self.refresh_guard().await?;
         let resolved = self.read_for_destination(id, target).await?;
         if resolved.revision != rejected_revision {
             return Ok(resolved);
         }
-        let secret = oauth::refresh(resolved.secret).await?;
-        let vault_id = self.record.id;
-        let id = *id;
-        self.store
-            .access(true, move |catalog, cipher| {
-                let stored = vault(catalog, vault_id)?
-                    .secrets
-                    .iter_mut()
-                    .find(|s| s.metadata.id == id)
-                    .context("secret is unavailable")?;
-                if stored.metadata.revision != resolved.revision {
-                    bail!("credential changed during OAuth refresh; retry the operation");
+        let github = matches!(resolved.secret, Secret::GithubCli { .. });
+        if github && !force && self.github_cache_fresh(id, resolved.revision)? {
+            return Ok(resolved);
+        }
+        let secret = match &resolved.secret {
+            Secret::GithubCli { account, .. } => {
+                let value = super::github_cli_token(account).await?;
+                Secret::GithubCli {
+                    value,
+                    account: account.clone(),
                 }
-                let mut metadata = stored.metadata.clone();
-                metadata.revision = metadata
-                    .revision
-                    .checked_add(1)
-                    .context("secret revision overflow")?;
-                let encrypted = encrypt(cipher, vault_id, &metadata, &secret)?;
-                stored.metadata = metadata;
-                stored.secret = encrypted;
-                Ok(ResolvedSecret {
-                    revision: stored.metadata.revision,
-                    secret,
+            }
+            _ => oauth::refresh(resolved.secret.clone()).await?,
+        };
+        let resolved = if secret == resolved.secret {
+            let current = self.read_for_destination(id, target).await?;
+            if current.revision != resolved.revision {
+                return Ok(current);
+            }
+            current
+        } else {
+            let vault_id = self.record.id;
+            let id = *id;
+            self.store
+                .access(true, move |catalog, cipher| {
+                    let stored = vault(catalog, vault_id)?
+                        .secrets
+                        .iter_mut()
+                        .find(|s| s.metadata.id == id)
+                        .context("secret is unavailable")?;
+                    if stored.metadata.revision != resolved.revision {
+                        bail!("credential changed during refresh; retry the operation");
+                    }
+                    let mut metadata = stored.metadata.clone();
+                    metadata.revision = metadata
+                        .revision
+                        .checked_add(1)
+                        .context("secret revision overflow")?;
+                    let encrypted = encrypt(cipher, vault_id, &metadata, &secret)?;
+                    stored.metadata = metadata;
+                    stored.secret = encrypted;
+                    Ok(ResolvedSecret {
+                        revision: stored.metadata.revision,
+                        secret,
+                    })
                 })
-            })
-            .await
+                .await?
+        };
+        if github {
+            let mut checked = self
+                .store
+                .inner
+                .github_checked
+                .lock()
+                .map_err(|_| anyhow::anyhow!("GitHub credential cache lock is poisoned"))?;
+            checked.retain(|_, (_, at)| at.elapsed() < GITHUB_CACHE_TTL);
+            checked.insert(*id, (resolved.revision, Instant::now()));
+        }
+        Ok(resolved)
     }
 }
 
@@ -523,7 +597,7 @@ impl BasicVaultHandle {
     async fn read_for_destination(
         &self,
         id: &SecretId,
-        target: &SecretTarget,
+        target: &CredentialDestination,
     ) -> Result<ResolvedSecret> {
         let vault_id = self.record.id;
         let id = *id;
@@ -535,17 +609,13 @@ impl BasicVaultHandle {
                     .iter()
                     .find(|s| s.metadata.id == id)
                     .context("secret is unavailable")?;
-                if stored.metadata.target.as_ref() != Some(&target) {
-                    if let SecretTarget::Http { origin } = &target {
-                        bail!("secret {:?} is not authorized for {origin}; set its HTTP destination with --http-origin {origin}", stored.metadata.name);
-                    }
-                    bail!("secret {:?} is not authorized for this MCP destination", stored.metadata.name);
-                }
+                anyhow::ensure!(stored.metadata.policy.as_ref().is_some_and(|policy| policy.permits(&target)),
+                    "secret {:?} is not authorized for {}; update its policy with --allow-origin or --allow-url", stored.metadata.name, target.as_str());
                 let secret = cipher.decrypt_bound(
                     &stored.secret,
                     &serde_json::to_vec(&(vault_id, &stored.metadata))?,
                 )?;
-                validate_secret(&secret, Some(&target))?;
+                validate_secret(&secret, stored.metadata.policy.as_ref())?;
                 Ok(ResolvedSecret {
                     revision: stored.metadata.revision,
                     secret,

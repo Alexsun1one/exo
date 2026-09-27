@@ -680,8 +680,8 @@ impl BasicExoHarnessInner {
     async fn secret_key(&self, name: &str) -> Result<Option<String>> {
         match self.find_secret_by(|s| s.name == name).await? {
             Some(Secret::Key { value }) => Ok(Some(value)),
-            Some(Secret::Oauth { .. }) => {
-                bail!("secret {name:?} is an OAuth secret; expected an API key")
+            Some(Secret::Oauth { .. } | Secret::GithubCli { .. }) => {
+                bail!("secret {name:?} is not a static API key")
             }
             None => Ok(None),
         }
@@ -698,7 +698,9 @@ impl BasicExoHarnessInner {
             .await?
         {
             Some(Secret::Key { value }) => Ok(Some(value)),
-            Some(Secret::Oauth { .. }) => bail!("sandbox credential must be an API key"),
+            Some(Secret::Oauth { .. } | Secret::GithubCli { .. }) => {
+                bail!("sandbox credential must be an API key")
+            }
             None => Ok(None),
         }
     }
@@ -3114,14 +3116,12 @@ impl ConversationHandle for BasicConversationHandle {
                                     "Git resource credential {name} is not in the selected vaults"
                                 )
                             })?;
-                    let target = crate::vault::SecretTarget::http(
+                    let target = crate::vault::CredentialDestination::origin(
                         &url::Url::parse(url)?.origin().ascii_serialization(),
                     )?;
                     let vault = crate::vault::require_vault(self, &reference.vault_id).await?;
                     let resolved = vault.resolve_secret(&reference.secret_id, &target).await?;
-                    let Secret::Key { value } = resolved.secret else {
-                        bail!("Git resources require a static token");
-                    };
+                    let value = resolved.secret.bearer_value().to_owned();
                     Some(crate::resources::GitCredential {
                         identity: format!("{}:{}", reference.vault_id, reference.secret_id),
                         username: "x-access-token".into(),

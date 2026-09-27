@@ -52,7 +52,7 @@ its context-size estimates are excluded from token and cost totals.
 Store an OpenAI credential:
 
 ```bash
-./target/debug/exo vault secret create global openai --token-env OPENAI_API_KEY --http-origin https://api.openai.com
+./target/debug/exo vault secret create global openai --token-env OPENAI_API_KEY --allow-origin https://api.openai.com
 ```
 
 Build the sandbox image:
@@ -89,7 +89,7 @@ EOF
 Store an Anthropic credential:
 
 ```bash
-./target/debug/exo vault secret create global anthropic --token-env ANTHROPIC_API_KEY --http-origin https://api.anthropic.com
+./target/debug/exo vault secret create global anthropic --token-env ANTHROPIC_API_KEY --allow-origin https://api.anthropic.com
 ```
 
 Build the sandbox image:
@@ -126,7 +126,7 @@ EOF
 Store a Cursor credential:
 
 ```bash
-./target/debug/exo vault secret create global cursor --token-env CURSOR_API_KEY --http-origin https://api.cursor.com
+./target/debug/exo vault secret create global cursor --token-env CURSOR_API_KEY --allow-origin https://api.cursor.com
 ```
 
 Build the sandbox image:
@@ -167,7 +167,7 @@ Store a credential for a provider Pi supports. Pi reads the provider key from th
 environment, so the same variable has to be set where exo runs:
 
 ```bash
-./target/debug/exo vault secret create global openai --token-env OPENAI_API_KEY --http-origin https://api.openai.com
+./target/debug/exo vault secret create global openai --token-env OPENAI_API_KEY --allow-origin https://api.openai.com
 ```
 
 Build the sandbox image:

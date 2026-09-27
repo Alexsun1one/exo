@@ -17,7 +17,7 @@ use lingua::{Message, universal::UniversalStreamChunk};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::vault::{SecretReference, SecretTarget, VaultContext, VaultHandle, VaultId};
+use crate::vault::{CredentialPolicy, SecretReference, VaultContext, VaultHandle, VaultId};
 use crate::{Result, Uuid7};
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -747,7 +747,6 @@ pub struct SandboxRecord {
     pub running: bool,
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub(crate) fn canonical_egress_host(host: &str) -> Result<String> {
     anyhow::ensure!(
         !host.is_empty() && host.len() <= 253 && !host.ends_with('.'),
@@ -771,7 +770,6 @@ pub(crate) fn canonical_egress_host(host: &str) -> Result<String> {
     Ok(host)
 }
 
-#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub(crate) fn canonical_egress_hosts(
     hosts: &[String],
 ) -> Result<std::collections::HashSet<String>> {
@@ -818,7 +816,12 @@ pub struct EgressCredentialBinding {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CredentialNetworkPolicy {
-    Limited { allowed_hosts: Vec<String> },
+    Limited {
+        allowed_hosts: Vec<String>,
+    },
+    Destinations {
+        allowed_destinations: Vec<crate::CredentialDestination>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1175,9 +1178,10 @@ pub enum BindingType {
 // existing records when changing fields, field order, or serde attributes, or
 // migrate their ciphertext; otherwise saved secrets become undecryptable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SecretMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<SecretTarget>,
+    pub policy: Option<CredentialPolicy>,
     #[serde(default = "initial_secret_revision")]
     pub revision: u64,
     pub id: SecretId,
@@ -1187,9 +1191,10 @@ pub struct SecretMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PutSecretRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<SecretTarget>,
+    pub policy: Option<CredentialPolicy>,
     pub name: String,
     pub secret: Secret,
 }
@@ -1201,14 +1206,14 @@ pub struct UpdateSecretRequest {
     pub secret: Option<Secret>,
     /// Replace the destination grant; omitted preserves the current grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target: Option<SecretTarget>,
+    pub policy: Option<CredentialPolicy>,
 }
 
 impl From<Secret> for UpdateSecretRequest {
     fn from(secret: Secret) -> Self {
         Self {
             secret: Some(secret),
-            target: None,
+            policy: None,
         }
     }
 }
@@ -1218,6 +1223,8 @@ impl From<Secret> for UpdateSecretRequest {
 pub enum SecretType {
     Key,
     Oauth,
+    #[serde(rename = "github_cli")]
+    GithubCli,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1376,6 +1383,11 @@ pub enum Secret {
     Key {
         value: String,
     },
+    #[serde(rename = "github_cli")]
+    GithubCli {
+        value: String,
+        account: String,
+    },
     Oauth {
         access_token: String,
         refresh_token: Option<String>,
@@ -1384,6 +1396,27 @@ pub enum Secret {
         #[serde(default)]
         refresh: Option<crate::vault::OAuthRefresh>,
     },
+}
+
+impl Secret {
+    pub fn bearer_value(&self) -> &str {
+        match self {
+            Self::Key { value } | Self::GithubCli { value, .. } => value,
+            Self::Oauth { access_token, .. } => access_token,
+        }
+    }
+
+    pub fn is_refreshable(&self) -> bool {
+        matches!(
+            self,
+            Self::GithubCli { .. }
+                | Self::Oauth {
+                    refresh_token: Some(_),
+                    refresh: Some(_),
+                    ..
+                }
+        )
+    }
 }
 
 pub type AgentId = Uuid7;
@@ -1415,7 +1448,7 @@ crate::impl_has_uuid7_id!(Event, id);
 crate::impl_has_uuid7_id!(BindingRecord, id);
 crate::impl_has_uuid7_id!(SecretMetadata, id);
 
-fn initial_secret_revision() -> u64 {
+pub(crate) fn initial_secret_revision() -> u64 {
     1
 }
 

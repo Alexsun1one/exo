@@ -9,6 +9,11 @@ mod local;
 #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
 pub(crate) use local::BasicVaultStore;
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+mod github;
+#[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+pub use github::{github_cli_account, github_cli_command, github_cli_token};
+
 pub type VaultId = Uuid7;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -18,57 +23,7 @@ pub struct VaultRecord {
     pub created_at: DateTimeUtc,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum SecretTarget {
-    Mcp { server_url: String },
-    Http { origin: String },
-}
-
-impl SecretTarget {
-    pub fn http(origin: &str) -> Result<Self> {
-        let url = url::Url::parse(origin).context("invalid HTTP credential origin")?;
-        if url.scheme() != "https"
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.path() != "/"
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            bail!(
-                "HTTP credentials require an HTTPS origin without a path, query, embedded credentials, or fragment"
-            );
-        }
-        Ok(Self::Http {
-            origin: url.origin().ascii_serialization(),
-        })
-    }
-
-    pub fn mcp(server_url: &str) -> Result<Self> {
-        let url = url::Url::parse(server_url).context("invalid MCP credential URL")?;
-        if !matches!(url.scheme(), "http" | "https")
-            || url.host_str().is_none()
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.fragment().is_some()
-        {
-            bail!(
-                "MCP credentials require an HTTP(S) URL without embedded credentials or a fragment"
-            );
-        }
-        Ok(Self::Mcp {
-            server_url: url.to_string(),
-        })
-    }
-
-    pub fn normalized(&self) -> Result<Self> {
-        match self {
-            Self::Mcp { server_url } => Self::mcp(server_url),
-            Self::Http { origin } => Self::http(origin),
-        }
-    }
-}
+pub use crate::credential_policy::{CredentialDestination, CredentialPolicy};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SecretReference {
@@ -102,49 +57,47 @@ pub struct ResolvedSecret {
 pub struct OAuthRefresh {
     pub token_endpoint: String,
     pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub client_secret_basic: bool,
     pub resource: Option<String>,
     pub scopes: Vec<String>,
 }
 
-pub fn validate_secret(secret: &Secret, target: Option<&SecretTarget>) -> Result<()> {
-    if let Some(target) = target {
-        let token = match secret {
-            Secret::Key { value } => value,
-            Secret::Oauth {
-                access_token,
-                refresh,
-                ..
-            } if matches!(target, SecretTarget::Mcp { .. }) => {
-                if let Some(refresh) = refresh {
-                    let url = url::Url::parse(&refresh.token_endpoint)
-                        .context("invalid OAuth token endpoint")?;
-                    let loopback = match url.host() {
-                        Some(url::Host::Domain("localhost")) => true,
-                        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-                        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-                        _ => false,
-                    };
-                    if (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
-                        || !url.username().is_empty()
-                        || url.password().is_some()
-                        || url.fragment().is_some()
-                    {
-                        bail!(
-                            "OAuth token endpoint must use HTTPS or loopback HTTP without embedded credentials or a fragment"
-                        );
-                    }
-                    if refresh.client_id.is_empty() {
-                        bail!("OAuth client ID is missing");
-                    }
-                }
-                access_token
-            }
-            Secret::Oauth { .. } => bail!("HTTP credentials currently require a static key"),
-        };
+pub fn validate_secret(secret: &Secret, policy: Option<&CredentialPolicy>) -> Result<()> {
+    if let Secret::GithubCli { account, .. } = secret {
+        anyhow::ensure!(
+            !account.is_empty()
+                && account.len() <= 39
+                && account
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-'),
+            "invalid GitHub account"
+        );
+    }
+    if policy.is_some() {
+        if let Secret::Oauth {
+            refresh: Some(refresh),
+            ..
+        } = secret
+        {
+            validate_oauth_endpoint(&refresh.token_endpoint)?;
+            anyhow::ensure!(!refresh.client_id.is_empty(), "OAuth client ID is missing");
+        }
+        let token = secret.bearer_value();
         if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
             bail!("bearer token must be nonempty ASCII without whitespace or control characters");
         }
     }
+    Ok(())
+}
+
+pub fn require_portable_secret(secret: &Secret) -> Result<()> {
+    anyhow::ensure!(
+        !matches!(secret, Secret::GithubCli { .. }),
+        "GitHub CLI credentials must be linked on the runtime host; send a token or OAuth grant to a remote vault"
+    );
     Ok(())
 }
 
@@ -160,11 +113,15 @@ pub trait VaultHandle: Send + Sync {
         request: crate::UpdateSecretRequest,
     ) -> Result<SecretMetadata>;
     async fn delete_secret(&self, id: &SecretId) -> Result<()>;
-    async fn resolve_secret(&self, id: &SecretId, target: &SecretTarget) -> Result<ResolvedSecret>;
+    async fn resolve_secret(
+        &self,
+        id: &SecretId,
+        target: &CredentialDestination,
+    ) -> Result<ResolvedSecret>;
     async fn refresh_secret(
         &self,
         _id: &SecretId,
-        _target: &SecretTarget,
+        _target: &CredentialDestination,
         _rejected_revision: u64,
     ) -> Result<ResolvedSecret> {
         bail!("OAuth refresh is not supported by this vault")
@@ -260,33 +217,35 @@ pub async fn resolve_model_key(
     endpoint: &url::Url,
 ) -> Result<String> {
     let vault = require_vault(context, &reference.vault_id).await?;
-    let metadata = vault
-        .list_secrets()
+    let destination = CredentialDestination::origin(&endpoint.origin().ascii_serialization())?;
+    let secret = vault
+        .resolve_secret(&reference.secret_id, &destination)
         .await?
-        .into_iter()
-        .find(|secret| secret.id == reference.secret_id)
-        .context("sandbox model credential is unavailable")?;
-    anyhow::ensure!(
-        metadata.r#type == crate::SecretType::Key,
-        "sandbox model credentials currently require an API key"
-    );
-    let secret = if let Some(target) = metadata.target {
-        anyhow::ensure!(
-            target == SecretTarget::http(&endpoint.origin().ascii_serialization())?,
-            "model credential is not authorized for this endpoint"
+        .secret;
+    Ok(secret.bearer_value().to_owned())
+}
+
+pub fn validate_oauth_endpoint(endpoint: &str) -> Result<()> {
+    let url = url::Url::parse(endpoint).context("invalid OAuth token endpoint")?;
+    let loopback = crate::credential_policy::is_loopback(&url);
+    if (url.scheme() != "https" && !(url.scheme() == "http" && loopback))
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        bail!(
+            "OAuth token endpoint must use HTTPS or loopback HTTP without embedded credentials or a fragment"
         );
-        vault
-            .resolve_secret(&reference.secret_id, &target)
-            .await?
-            .secret
-    } else {
-        vault
-            .get_secret(&reference.secret_id)
-            .await?
-            .context("model credential is unavailable")?
-    };
-    match secret {
-        Secret::Key { value } => Ok(value),
-        Secret::Oauth { .. } => bail!("model credentials currently require an API key"),
     }
+
+    Ok(())
+}
+
+pub async fn credential_policy(
+    context: &dyn VaultContext,
+    reference: &SecretReference,
+) -> Result<CredentialPolicy> {
+    require_vault(context, &reference.vault_id).await?.list_secrets().await?.into_iter()
+        .find(|secret| secret.id == reference.secret_id).context("credential is unavailable")?
+        .policy.context("credential has no permitted destinations; set its policy with --allow-origin, --allow-url, or --policy")
 }

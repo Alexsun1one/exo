@@ -1,4 +1,4 @@
-use exoharness::vault::{OAuthRefresh, SecretTarget, global_vault};
+use exoharness::vault::{CredentialDestination, OAuthRefresh, global_vault};
 use exoharness::{
     BasicExoHarness, BasicExoHarnessConfig, PutSecretRequest, SandboxBackendRegistration,
     SandboxProvider, Secret, SecretBackendChoice,
@@ -62,7 +62,21 @@ async fn vault_credentials_stay_host_side_and_typescript_preserves_oauth_refresh
     const vault = vaults.find((vault) => vault.record.name === "global");
     const metadata = (await vault.listSecrets()).find((secret) => secret.name === "mcp");
     const secret = await vault.getSecret(metadata.id);
-    await vault.updateSecret(metadata.id, secret);
+    for (const request of [secret, {}]) {
+      try {
+        await vault.updateSecret(metadata.id, request);
+        throw new Error("invalid update accepted");
+      } catch (error) {
+        if (!error.message.includes("updateSecret requires")) throw error;
+      }
+    }
+    try {
+      await vault.putSecret({ name: "missing-value" });
+      throw new Error("invalid create accepted");
+    } catch (error) {
+      if (!error.message.includes("putSecret requires")) throw error;
+    }
+    await vault.updateSecret(metadata.id, { secret });
     await context.stream.text("credentials stayed host-side");
   }
 };"#,
@@ -137,6 +151,8 @@ async fn vault_credentials_stay_host_side_and_typescript_preserves_oauth_refresh
         refresh_token: Some("refresh-token".into()),
         expires_at: Some(4_000_000_000),
         refresh: Some(OAuthRefresh {
+            client_secret: None,
+            client_secret_basic: false,
             token_endpoint: format!("{}/token", server.uri()),
             client_id: "fixture".into(),
             resource: Some(server.uri()),
@@ -146,7 +162,7 @@ async fn vault_credentials_stay_host_side_and_typescript_preserves_oauth_refresh
     let id = vault
         .put_secret(PutSecretRequest {
             name: "mcp".into(),
-            target: Some(SecretTarget::mcp(&server.uri())?),
+            policy: Some((CredentialDestination::url(&server.uri())?).into()),
             secret: secret.clone(),
         })
         .await?;

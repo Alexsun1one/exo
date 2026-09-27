@@ -104,7 +104,7 @@ impl Fixture {
         vault
             .put_secret(PutSecretRequest {
                 name: "google".into(),
-                target: None,
+                policy: None,
                 secret: Secret::Key {
                     value: "client-secret".into(),
                 },
@@ -355,7 +355,7 @@ async fn rmcp_login_private_vaults_and_session_revocation() -> Result<()> {
                 secret: Secret::Key {
                     value: "private".into(),
                 },
-                target: None,
+                policy: None,
             },
         )
         .await?;
@@ -381,7 +381,7 @@ async fn rmcp_login_private_vaults_and_session_revocation() -> Result<()> {
                     secret: Secret::Key {
                         value: "bad".into()
                     },
-                    target: None
+                    policy: None
                 }
             )
             .await
@@ -689,7 +689,7 @@ async fn multiplayer_shares_history_but_keeps_vaults_models_and_approvals_privat
             secret: Secret::Key {
                 value: "alice-key".into(),
             },
-            target: None,
+            policy: None,
         })
         .await?;
     assert!(
@@ -968,9 +968,10 @@ async fn shared_vaults_require_attachment_and_keep_writes_with_the_owner() -> Re
             team.record().id,
             &PutSecretRequest {
                 name: "key".into(),
-                target: Some(exoharness::vault::SecretTarget::http(
-                    "https://api.openai.com",
-                )?),
+                policy: Some(
+                    (exoharness::vault::CredentialDestination::origin("https://api.openai.com")?)
+                        .into(),
+                ),
                 secret: Secret::Key {
                     value: "first".into(),
                 },
@@ -989,9 +990,10 @@ async fn shared_vaults_require_attachment_and_keep_writes_with_the_owner() -> Re
             secret,
             &exoharness::UpdateSecretRequest {
                 secret: None,
-                target: Some(exoharness::vault::SecretTarget::http(
-                    "https://example.com"
-                )?),
+                policy: Some(
+                    (exoharness::vault::CredentialDestination::origin("https://example.com")?)
+                        .into()
+                ),
             }
         )
         .await
@@ -1031,7 +1033,7 @@ async fn shared_vaults_require_attachment_and_keep_writes_with_the_owner() -> Re
             team.record().id,
             &PutSecretRequest {
                 name: "unscoped".into(),
-                target: None,
+                policy: None,
                 secret: Secret::Key {
                     value: "owner-only".into(),
                 },
@@ -1040,12 +1042,14 @@ async fn shared_vaults_require_attachment_and_keep_writes_with_the_owner() -> Re
         .await?;
     model.credential = Some("unscoped".into());
     model.base_url = Some("https://attacker.example".into());
+    let error = crate::harness_helpers::resolve_model(thread.as_ref(), &model)
+        .await
+        .unwrap_err();
     assert!(
-        crate::harness_helpers::resolve_model(thread.as_ref(), &model)
-            .await
-            .unwrap_err()
+        error
             .to_string()
-            .contains("vault is unavailable")
+            .contains("not authorized for https://attacker.example"),
+        "{error:#}"
     );
     ac.delete_secret(ResourceScope::Global, team.record().id, unscoped)
         .await?;
