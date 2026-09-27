@@ -8,8 +8,7 @@ use crate::{
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use exoharness::{
-    BasicExoHarness, Binding, EventData, EventQuery, EventQueryDirection, ExoHarness,
-    PutSecretRequest, SandboxProvider, Secret, ToolRequest, Uuid7,
+    BasicExoHarness, EventData, EventQuery, EventQueryDirection, ExoHarness, ToolRequest, Uuid7,
 };
 use lingua::universal::{AssistantContent, UserContent};
 use lingua::{Message, UniversalStreamChunk};
@@ -17,7 +16,7 @@ use serde_json::{Map, Value};
 use tempfile::TempDir;
 use tokio_stream::StreamExt;
 
-use crate::test_support::local_test_config;
+use crate::test_support::{create_test_credential, local_test_config};
 use crate::{CreateAgentRequest, CreateConversationRequest, LocalProvider, Runtime};
 
 #[tokio::test(flavor = "current_thread")]
@@ -67,23 +66,14 @@ async fn rlm_send_executes_repl_steps_and_persists_final_answer() {
         LocalProvider::rlm(exoharness, model, Arc::new(crate::BasicToolRuntime)),
         None,
     );
-    register_test_model(harness.exoharness_handle().as_ref()).await;
+    create_test_credential(harness.exoharness_handle().as_ref()).await;
 
     let agent = harness
         .create_agent(CreateAgentRequest {
-            slug: "demo".to_string(),
             name: Some("Demo".to_string()),
-            harness: crate::AgentHarnessKind::Rlm,
-            typescript: None,
-            enable_agent_tool_creation: true,
-            sandbox_image: None,
-            sandbox_provider: SandboxProvider::LocalProcess,
-            sandbox_scope: None,
-            enable_networking: false,
-            model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
             max_tool_round_trips: Some(4),
-            braintrust: None,
+            ..crate::test_support::agent_request("demo", crate::AgentHarnessKind::Rlm)
         })
         .await
         .expect("agent should be created");
@@ -226,23 +216,14 @@ async fn rlm_subquery_variable_can_store_final_answer() {
         ),
         None,
     );
-    register_test_model(harness.exoharness_handle().as_ref()).await;
+    create_test_credential(harness.exoharness_handle().as_ref()).await;
 
     let agent = harness
         .create_agent(CreateAgentRequest {
-            slug: "demo".to_string(),
             name: Some("Demo".to_string()),
-            harness: crate::AgentHarnessKind::Rlm,
-            typescript: None,
-            enable_agent_tool_creation: true,
-            sandbox_image: None,
-            sandbox_provider: SandboxProvider::LocalProcess,
-            sandbox_scope: None,
-            enable_networking: false,
-            model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
             max_tool_round_trips: Some(6),
-            braintrust: None,
+            ..crate::test_support::agent_request("demo", crate::AgentHarnessKind::Rlm)
         })
         .await
         .expect("agent should be created");
@@ -306,23 +287,13 @@ async fn rlm_send_stream_suppresses_internal_control_text() {
         LocalProvider::rlm(exoharness, model, Arc::new(crate::BasicToolRuntime)),
         None,
     );
-    register_test_model(harness.exoharness_handle().as_ref()).await;
+    create_test_credential(harness.exoharness_handle().as_ref()).await;
 
     let agent = harness
         .create_agent(CreateAgentRequest {
-            slug: "demo".to_string(),
             name: Some("Demo".to_string()),
-            harness: crate::AgentHarnessKind::Rlm,
-            typescript: None,
-            enable_agent_tool_creation: true,
-            sandbox_image: None,
-            sandbox_provider: SandboxProvider::LocalProcess,
-            sandbox_scope: None,
-            enable_networking: false,
-            model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
-            max_tool_round_trips: None,
-            braintrust: None,
+            ..crate::test_support::agent_request("demo", crate::AgentHarnessKind::Rlm)
         })
         .await
         .expect("agent should be created");
@@ -435,23 +406,13 @@ globalThis.answer = String(\n\
         LocalProvider::rlm(exoharness, model, Arc::new(crate::BasicToolRuntime)),
         None,
     );
-    register_test_model(harness.exoharness_handle().as_ref()).await;
+    create_test_credential(harness.exoharness_handle().as_ref()).await;
 
     let agent = harness
         .create_agent(CreateAgentRequest {
-            slug: "demo".to_string(),
             name: Some("Demo".to_string()),
-            harness: crate::AgentHarnessKind::Rlm,
-            typescript: None,
-            enable_agent_tool_creation: true,
-            sandbox_image: None,
-            sandbox_provider: SandboxProvider::LocalProcess,
-            sandbox_scope: None,
-            enable_networking: false,
-            model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
-            max_tool_round_trips: None,
-            braintrust: None,
+            ..crate::test_support::agent_request("demo", crate::AgentHarnessKind::Rlm)
         })
         .await
         .expect("agent should be created");
@@ -529,23 +490,13 @@ async fn rlm_can_finish_by_setting_final_in_repl() {
         ),
         None,
     );
-    register_test_model(harness.exoharness_handle().as_ref()).await;
+    create_test_credential(harness.exoharness_handle().as_ref()).await;
 
     let agent = harness
         .create_agent(CreateAgentRequest {
-            slug: "demo".to_string(),
             name: Some("Demo".to_string()),
-            harness: crate::AgentHarnessKind::Rlm,
-            typescript: None,
-            enable_agent_tool_creation: true,
-            sandbox_image: None,
-            sandbox_provider: SandboxProvider::LocalProcess,
-            sandbox_scope: None,
-            enable_networking: false,
-            model: "gpt-5.4".to_string(),
             max_output_tokens: Some(512),
-            max_tool_round_trips: None,
-            braintrust: None,
+            ..crate::test_support::agent_request("demo", crate::AgentHarnessKind::Rlm)
         })
         .await
         .expect("agent should be created");
@@ -691,36 +642,4 @@ fn assistant_text(message: &Message) -> String {
         AssistantContent::String(text) => text.clone(),
         AssistantContent::Array(_) => String::new(),
     }
-}
-
-async fn register_test_model(exoharness: &dyn ExoHarness) {
-    let secret_id = exoharness::vault::global_vault(exoharness)
-        .await
-        .expect("runtime vault")
-        .put_secret(PutSecretRequest {
-            target: None,
-            name: "test-openai".to_string(),
-            secret: Secret::Key {
-                value: "test-key".to_string(),
-            },
-        })
-        .await
-        .expect("test secret should register");
-
-    exoharness
-        .put_binding(Binding::Llm {
-            name: "gpt-5.4".to_string(),
-            model: "gpt-5.4".to_string(),
-            base_url: None,
-            secret: Some(exoharness::vault::SecretReference {
-                vault_id: exoharness::vault::global_vault(exoharness)
-                    .await
-                    .unwrap()
-                    .record()
-                    .id,
-                secret_id,
-            }),
-        })
-        .await
-        .expect("test model should register");
 }

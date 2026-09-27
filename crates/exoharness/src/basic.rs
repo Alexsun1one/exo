@@ -188,7 +188,7 @@ impl SandboxBackendRegistration {
     /// is not macOS-only.
     pub fn smolvm() -> Self {
         // A factory, not a fixed backend: the binary paths are configured per
-        // binding (`exo sandbox provider create --sandbox smolvm --smolvm-binary`),
+        // binding (`exo environment provider create --backend smolvm --smolvm-binary`),
         // so they have to be read when a request arrives rather than at startup —
         // the same shape daytona/e2b use for their credentials. The result is
         // cached per provider by `sandbox_backend_for_provider`, so this runs
@@ -269,7 +269,7 @@ impl SandboxBackendRegistration {
                 {
                     let config = _inner.aws_agentcore_config_from_binding().await?.ok_or_else(|| {
                         anyhow!(
-                            "aws-agentcore sandbox requested but no sandbox provider binding is configured; run `exo sandbox provider create --sandbox aws-agentcore --runtime-arn <arn>`"
+                            "aws-agentcore sandbox requested but no sandbox provider binding is configured; run `exo environment provider create --backend aws-agentcore --runtime-arn <arn>`"
                         )
                     })?;
                     Ok(
@@ -1770,54 +1770,6 @@ impl AgentHandle for BasicAgentHandle {
         bail!("conversation {id} kept acquiring sandboxes while it was being deleted")
     }
 
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
-        self.harness
-            .check(ResourceScope::Agent {
-                agent_id: self.record.id,
-            })
-            .await?;
-        Ok(merge_binding_records(vec![
-            self.harness
-                .binding_records(&self.harness.bindings_dir())
-                .await?,
-            self.harness.binding_records(&self.bindings_dir()).await?,
-        ]))
-    }
-
-    async fn put_binding(&self, binding: Binding) -> Result<BindingId> {
-        self.harness.check_binding(&binding).await?;
-        self.harness
-            .check(ResourceScope::Agent {
-                agent_id: self.record.id,
-            })
-            .await?;
-        let _guard = self.harness.inner.write_lock.lock().await;
-        let id = Uuid7::now();
-        let record = stored_binding(id, binding);
-        self.harness
-            .inner
-            .storage
-            .put_json(
-                self.harness
-                    .caller_bindings_dir(&self.bindings_dir())
-                    .join(format!("{id}.json")),
-                &record,
-            )
-            .await?;
-        Ok(id)
-    }
-
-    async fn get_binding(&self, id: &BindingId) -> Result<Option<Binding>> {
-        self.harness
-            .check(ResourceScope::Agent {
-                agent_id: self.record.id,
-            })
-            .await?;
-        self.harness
-            .find_binding(&[self.bindings_dir(), self.harness.bindings_dir()], id)
-            .await
-    }
-
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion> {
         self.harness
             .check(ResourceScope::Agent {
@@ -1883,10 +1835,6 @@ impl BasicAgentHandle {
 
     fn conversations_dir(&self) -> PathBuf {
         self.agent_dir().join("conversations")
-    }
-
-    fn bindings_dir(&self) -> PathBuf {
-        self.agent_dir().join("bindings")
     }
 
     fn artifacts_dir(&self) -> PathBuf {
@@ -3157,6 +3105,7 @@ impl ConversationHandle for BasicConversationHandle {
                 } = &resource.definition.source
             {
                 if let Some(name) = credential {
+                    tracing::info!(target: "exoharness::progress", "Loading Git credentials");
                     let reference =
                         crate::vault::find_secret(self, name)
                             .await?
@@ -3664,67 +3613,6 @@ impl ConversationHandle for BasicConversationHandle {
             .await?;
         load_artifact_versions(&self.harness.inner.storage, &self.artifacts_dir()).await
     }
-
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
-        self.harness
-            .check(ResourceScope::Thread {
-                agent_id: self.agent_id,
-                thread_id: self.record.id,
-            })
-            .await?;
-        Ok(merge_binding_records(vec![
-            self.harness
-                .binding_records(&self.harness.bindings_dir())
-                .await?,
-            self.harness
-                .binding_records(&agent_bindings_dir(&self.harness, self.agent_id))
-                .await?,
-            self.harness.binding_records(&self.bindings_dir()).await?,
-        ]))
-    }
-
-    async fn put_binding(&self, binding: Binding) -> Result<BindingId> {
-        self.harness.check_binding(&binding).await?;
-        self.harness
-            .check(ResourceScope::Thread {
-                agent_id: self.agent_id,
-                thread_id: self.record.id,
-            })
-            .await?;
-        let _guard = self.harness.inner.write_lock.lock().await;
-        let id = Uuid7::now();
-        let record = stored_binding(id, binding);
-        self.harness
-            .inner
-            .storage
-            .put_json(
-                self.harness
-                    .caller_bindings_dir(&self.bindings_dir())
-                    .join(format!("{id}.json")),
-                &record,
-            )
-            .await?;
-        Ok(id)
-    }
-
-    async fn get_binding(&self, id: &BindingId) -> Result<Option<Binding>> {
-        self.harness
-            .check(ResourceScope::Thread {
-                agent_id: self.agent_id,
-                thread_id: self.record.id,
-            })
-            .await?;
-        self.harness
-            .find_binding(
-                &[
-                    self.bindings_dir(),
-                    agent_bindings_dir(&self.harness, self.agent_id),
-                    self.harness.bindings_dir(),
-                ],
-                id,
-            )
-            .await
-    }
 }
 
 impl BasicSandboxScope for BasicConversationHandle {
@@ -4060,7 +3948,7 @@ async fn prepare_sandbox_request(
         request.image.clone()
     };
 
-    let mut policy = request
+    let policy = request
         .policy
         .or_else(|| harness.inner.sandbox_policy.clone())
         .unwrap_or_else(|| {
@@ -4071,78 +3959,12 @@ async fn prepare_sandbox_request(
             }
         });
     let context = ScopedVaultContext { harness, scope };
-    if let Some(model) = request.model {
-        let binding = context.model_binding(&model.id).await?;
-        let endpoint =
-            crate::vault::model_endpoint(binding.base_url.as_deref(), &model.environment_variable)?;
-        let Some(reference) = binding.secret else {
-            bail!("sandbox model binding has no API key; register the model with --secret");
-        };
-        let host = endpoint
-            .host_str()
-            .context("model endpoint has no host")?
-            .to_owned();
-        if let SandboxNetworkPolicy::Limited { allowed_hosts } = &policy.networking {
-            anyhow::ensure!(
-                crate::types::canonical_egress_hosts(allowed_hosts)?.contains(&host),
-                "model endpoint {host} is not allowed by the environment network policy"
-            );
-        }
-        anyhow::ensure!(
-            policy.networking_enabled(),
-            "sandbox models require networking"
-        );
-        if let Some(existing) = policy
-            .credentials
-            .iter_mut()
-            .find(|binding| binding.environment_variable == model.environment_variable)
-        {
-            let selected = crate::vault::find_secret(&context, &existing.name).await?;
-            anyhow::ensure!(
-                existing.model == Some(model.id)
-                    || (existing.model.is_none() && selected.as_ref() == Some(&reference)),
-                "environment credential {} conflicts with the selected model",
-                model.environment_variable
-            );
-            let crate::CredentialNetworkPolicy::Limited { allowed_hosts } = &existing.networking;
-            anyhow::ensure!(
-                crate::types::canonical_egress_hosts(allowed_hosts)?.contains(&host)
-                    && existing.injection_location.header,
-                "environment credential does not permit the model endpoint"
-            );
-            existing.model = Some(model.id);
-        } else {
-            policy.credentials.push(crate::EgressCredentialBinding {
-                name: format!("model:{}", model.id),
-                model: Some(model.id),
-                environment_variable: model.environment_variable,
-                networking: crate::CredentialNetworkPolicy::Limited {
-                    allowed_hosts: vec![host],
-                },
-                injection_location: crate::CredentialInjectionLocation { header: true },
-            });
-        }
-    }
-
     let credentials = futures::future::try_join_all(policy.credentials.iter().map(|binding| {
         let context = &context;
         async move {
-            let reference = if let Some(model_id) = binding.model {
-                let model = context.model_binding(&model_id).await?;
-                let endpoint = crate::vault::model_endpoint(
-                    model.base_url.as_deref(),
-                    &binding.environment_variable,
-                )?;
-                let Some(reference) = model.secret else {
-                    bail!("sandbox model binding has no credential");
-                };
-                crate::vault::resolve_model_key(context, &reference, &endpoint).await?;
-                reference
-            } else {
-                crate::vault::find_secret(context, &binding.name)
-                    .await?
-                    .with_context(|| format!("egress credential not found: {}", binding.name))?
-            };
+            let reference = crate::vault::find_secret(context, &binding.name)
+                .await?
+                .with_context(|| format!("egress credential not found: {}", binding.name))?;
             Ok::<_, anyhow::Error>((binding.name.clone(), reference))
         }
     }))
@@ -4571,6 +4393,12 @@ impl TurnHandle for BasicTurnHandle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredBinding {
     record: BindingRecord,
+}
+
+impl StoredBinding {
+    fn into_active_record(self) -> Option<BindingRecord> {
+        (!matches!(self.record.binding, Binding::Llm { .. })).then_some(self.record)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5393,7 +5221,7 @@ async fn list_binding_records(
         .list_json_matching_suffix::<StoredBinding>(bindings_dir, ".json")
         .await?
         .into_iter()
-        .map(|stored| stored.record)
+        .filter_map(StoredBinding::into_active_record)
         .collect::<Vec<_>>();
     bindings.sort_by_key(|metadata| metadata.id);
     Ok(bindings)
@@ -5409,18 +5237,6 @@ fn stored_binding(id: BindingId, binding: Binding) -> StoredBinding {
             binding,
         },
     }
-}
-
-fn merge_binding_records(scopes: Vec<Vec<BindingRecord>>) -> Vec<BindingRecord> {
-    let mut effective = HashMap::<String, BindingRecord>::new();
-    for bindings in scopes {
-        for binding in bindings {
-            effective.insert(binding.name.clone(), binding);
-        }
-    }
-    let mut bindings = effective.into_values().collect::<Vec<_>>();
-    bindings.sort_by_key(|metadata| metadata.id);
-    bindings
 }
 
 fn binding_type(binding: &Binding) -> BindingType {
@@ -5457,13 +5273,6 @@ fn derive_unique_slug(prefix: &str, existing: &[ConversationRecord]) -> String {
 
 fn slug_to_name(slug: &str) -> String {
     slug.replace('-', " ")
-}
-
-fn agent_bindings_dir(harness: &BasicExoHarness, agent_id: AgentId) -> PathBuf {
-    harness
-        .agents_dir()
-        .join(agent_id.to_string())
-        .join("bindings")
 }
 
 pub(crate) fn build_secret_cipher(
@@ -5581,6 +5390,40 @@ mod stored_policy_tests {
     use super::*;
 
     #[test]
+    fn reads_retired_model_bindings_in_stored_sandbox_policies() {
+        let stored: StoredSandbox = serde_json::from_str(
+            r#"{
+                "id": "existing-native-sandbox", "provider": "docker", "image": "test",
+                "file_system_mounts": [], "idle_seconds": 300, "running": true,
+                "policy": {
+                    "networking": {"type": "unrestricted"},
+                    "credentials": [{
+                        "name": "model:01900000-0000-7000-8000-000000000001",
+                        "model": "01900000-0000-7000-8000-000000000001",
+                        "environment_variable": "OPENAI_API_KEY",
+                        "networking": {"type": "limited", "allowed_hosts": ["api.openai.com"]},
+                        "injection_location": {"header": true}
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        let policy = stored.policy();
+        assert_eq!(policy.credentials.len(), 1);
+        assert!(policy.credentials[0].model.is_some());
+        let serialized = serde_json::to_string(&stored).unwrap();
+        assert!(!serialized.contains("\"model\":"));
+        let current: StoredSandbox = serde_json::from_str(&serialized).unwrap();
+        assert!(current.policy().credentials[0].model.is_none());
+        assert!(
+            serde_json::from_str::<StoredSandbox>(
+                &serialized.replace("\"environment_variable\":", "\"misspelled_variable\":")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn reads_legacy_networking_and_writes_only_the_policy() {
         let mut legacy: StoredSandbox = serde_json::from_value(serde_json::json!({
             "id": "legacy", "provider": "local_process", "image": "",
@@ -5625,7 +5468,6 @@ mod egress_resolution_tests {
         config.sandbox_policy = Some(limited.clone());
         let harness = BasicExoHarness::new(config).await?;
         let request = CreateSandboxRequest {
-            model: None,
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "".into(),

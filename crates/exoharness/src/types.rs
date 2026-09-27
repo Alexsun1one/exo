@@ -169,10 +169,6 @@ pub trait AgentHandle: SandboxHandle + VaultContext {
     ) -> Result<Arc<dyn ConversationHandle>>;
     async fn delete_conversation(&self, id: &ConversationId) -> Result<bool>;
 
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>>;
-    async fn put_binding(&self, binding: Binding) -> Result<BindingId>;
-    async fn get_binding(&self, id: &BindingId) -> Result<Option<Binding>>;
-
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion>;
     async fn read_artifact(&self, request: ReadArtifactRequest) -> Result<Option<Artifact>>;
     async fn list_artifacts(&self) -> Result<Vec<ArtifactVersion>>;
@@ -226,10 +222,6 @@ pub trait ThreadHandle: SandboxHandle + VaultContext {
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion>;
     async fn read_artifact(&self, request: ReadArtifactRequest) -> Result<Option<Artifact>>;
     async fn list_artifacts(&self) -> Result<Vec<ArtifactVersion>>;
-
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>>;
-    async fn put_binding(&self, binding: Binding) -> Result<BindingId>;
-    async fn get_binding(&self, id: &BindingId) -> Result<Option<Binding>>;
 }
 
 /// Compatibility name for [`ThreadHandle`].
@@ -815,7 +807,8 @@ pub struct EgressPolicy {
 #[serde(deny_unknown_fields)]
 pub struct EgressCredentialBinding {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Decode sandbox policies written before model registration was retired.
+    #[serde(default, skip_serializing)]
     pub model: Option<BindingId>,
     pub environment_variable: String,
     pub networking: CredentialNetworkPolicy,
@@ -883,16 +876,7 @@ impl From<SandboxNetworkPolicy> for EgressPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct SandboxModelBinding {
-    pub id: BindingId,
-    pub environment_variable: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct CreateSandboxRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<SandboxModelBinding>,
     #[serde(default)]
     pub name: Option<String>,
     pub provider: SandboxProvider,
@@ -1211,6 +1195,25 @@ pub struct PutSecretRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSecretRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<Secret>,
+    /// Replace the destination grant; omitted preserves the current grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<SecretTarget>,
+}
+
+impl From<Secret> for UpdateSecretRequest {
+    fn from(secret: Secret) -> Self {
+        Self {
+            secret: Some(secret),
+            target: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SecretType {
     Key,
@@ -1230,6 +1233,7 @@ pub enum Binding {
         server_url: String,
         secret: Option<SecretReference>,
     },
+    /// Decoded only to preserve existing stores; model registration is retired.
     Llm {
         name: String,
         model: String,

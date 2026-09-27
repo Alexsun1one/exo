@@ -20,8 +20,8 @@ use tokio::runtime::Handle;
 use tokio_stream::StreamExt;
 
 use crate::render::{
-    ASSISTANT_LABEL, Verbosity, compact_timestamp, print_transcript, render_assistant_content,
-    render_tool_call, render_tool_result,
+    ASSISTANT_LABEL, Verbosity, compact_result_status, compact_timestamp, print_transcript,
+    render_assistant_content, render_tool_call, render_tool_result,
 };
 use crate::run_sandbox_shell_command;
 use crate::turn_display::{TurnProgress, UsageTotals, UsageTracker, interruptible};
@@ -30,6 +30,38 @@ use executor::harness::HarnessTurnKey;
 const DEFAULT_SHELL_PROGRAM: &str = "/bin/bash";
 const REMOTE_HISTORY_BASE: usize = 1_000_000;
 const REMOTE_HISTORY_PAGE_SIZE: u32 = 32;
+
+#[derive(Default)]
+struct AssistantLine {
+    active: bool,
+    ends_with_newline: bool,
+}
+
+impl AssistantLine {
+    fn write_text(&mut self, writer: &mut impl Write, text: &str) -> io::Result<()> {
+        if !self.active {
+            write!(writer, "{} {ASSISTANT_LABEL}: ", compact_timestamp())?;
+            self.active = true;
+        }
+        writer.write_all(text.as_bytes())?;
+        self.ends_with_newline = text.ends_with('\n');
+        writer.flush()
+    }
+
+    fn break_line(&mut self, writer: &mut impl Write) -> io::Result<()> {
+        if self.active && !self.ends_with_newline {
+            writeln!(writer)?;
+            self.ends_with_newline = true;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, writer: &mut impl Write) -> io::Result<()> {
+        self.break_line(writer)?;
+        self.active = false;
+        Ok(())
+    }
+}
 
 pub async fn run_chat_repl(
     runtime: Arc<Runtime>,
@@ -657,13 +689,10 @@ impl ChatRepl {
         self.active_turn = Some(HarnessTurnKey::new(self.conversation.record().id, turn.id));
         progress.set_status(Some("Waiting for model".to_string()));
         let mut stdout = io::stdout();
-        let mut printed_assistant = false;
-        let mut streamed_text = String::new();
+        let mut assistant_line = AssistantLine::default();
         let mut ttft = None;
         let mut completed_turn = None;
-        // Tool names by call id, so results (which only carry the id) can be
-        // labeled in compact mode.
-        let mut pending_tool_calls: HashMap<String, String> = HashMap::new();
+        let mut pending_tool_calls: HashMap<String, (String, Option<String>)> = HashMap::new();
         while let Some(event) = progress
             .wait(async { stream.next().await.transpose() })
             .await?
@@ -671,11 +700,7 @@ impl ChatRepl {
             match event {
                 ExecutionStreamEvent::ApprovalRequested { turn, approval } => {
                     progress.set_status(None);
-                    if printed_assistant {
-                        println!();
-                        printed_assistant = false;
-                        streamed_text.clear();
-                    }
+                    assistant_line.finish(&mut stdout)?;
                     self.respond_to_approval(&turn, approval).await?;
                     progress.set_status(Some("Running tool".to_owned()));
                 }
@@ -690,43 +715,39 @@ impl ChatRepl {
                     }
                     ttft.get_or_insert_with(|| started.elapsed());
                     progress.set_status(None);
-                    if !printed_assistant {
-                        print!("{} {ASSISTANT_LABEL}: ", compact_timestamp());
-                        stdout.flush()?;
-                        printed_assistant = true;
-                    }
-                    stdout.write_all(text.as_bytes())?;
-                    stdout.flush()?;
-                    streamed_text.push_str(&text);
+                    assistant_line.write_text(&mut stdout, &text)?;
                 }
                 ExecutionStreamEvent::ToolCall {
                     tool_call_id,
                     tool_name,
                     arguments,
                 } => {
-                    if printed_assistant && !streamed_text.ends_with('\n') {
-                        println!();
-                        printed_assistant = false;
-                        streamed_text.clear();
-                    }
-                    if let Some(rendered) = render_tool_call(&tool_name, &arguments, self.verbosity)
+                    assistant_line.break_line(&mut stdout)?;
+                    let rendered = render_tool_call(&tool_name, &arguments, self.verbosity);
+                    if self.verbosity == Verbosity::Full
+                        && let Some(rendered) = &rendered
                     {
+                        assistant_line.finish(&mut stdout)?;
                         println!("{rendered}");
-                        printed_assistant = false;
-                        streamed_text.clear();
                     }
                     progress.set_status(Some(format!("Running tool {tool_name}")));
-                    pending_tool_calls.insert(tool_call_id, tool_name);
+                    pending_tool_calls.insert(tool_call_id, (tool_name, rendered));
                 }
                 ExecutionStreamEvent::ToolResult {
                     tool_call_id,
                     result,
                 } => {
-                    let tool_name = pending_tool_calls
+                    let (tool_name, call) = pending_tool_calls
                         .remove(&tool_call_id)
-                        .unwrap_or_else(|| "tool".to_string());
-                    if let Some(rendered) = render_tool_result(&tool_name, &result, self.verbosity)
-                    {
+                        .unwrap_or_else(|| ("tool".to_string(), None));
+                    let rendered = match (self.verbosity, call) {
+                        (Verbosity::Compact, Some(call)) => {
+                            Some(format!("{call} {}", compact_result_status(&result)))
+                        }
+                        _ => render_tool_result(&tool_name, &result, self.verbosity),
+                    };
+                    if let Some(rendered) = rendered {
+                        assistant_line.finish(&mut stdout)?;
                         println!("{rendered}");
                     }
                     progress.set_status(Some(if pending_tool_calls.is_empty() {
@@ -744,8 +765,8 @@ impl ChatRepl {
         }
         let elapsed = started.elapsed();
 
-        if printed_assistant {
-            println!();
+        if assistant_line.active {
+            assistant_line.finish(&mut stdout)?;
         } else if let Some(last_message) =
             executor::materialize_conversation_messages(&*self.conversation)
                 .await?
@@ -849,13 +870,14 @@ impl ChatRepl {
     }
 
     async fn run_shell(&self, command: &str) -> Result<()> {
-        let output = shell_output(
-            self.runtime.as_ref(),
-            self.agent.as_ref(),
-            self.conversation.as_ref(),
-            command.to_string(),
-        )
-        .await?;
+        let output = TurnProgress::new()
+            .wait(shell_output(
+                self.runtime.as_ref(),
+                self.agent.as_ref(),
+                self.conversation.as_ref(),
+                command.to_string(),
+            ))
+            .await?;
         io::stdout().write_all(output.stdout.as_bytes())?;
         io::stderr().write_all(output.stderr.as_bytes())?;
         if output.exit_code != 0 {
@@ -1204,6 +1226,38 @@ async fn sandbox_id_for_snapshot(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hidden_tools_preserve_the_assistant_label() {
+        for first in ["Thinking", "Thinking\n"] {
+            let mut line = super::AssistantLine::default();
+            let mut output = Vec::new();
+            line.write_text(&mut output, first).unwrap();
+            line.break_line(&mut output).unwrap();
+            line.break_line(&mut output).unwrap();
+            line.write_text(&mut output, "Done").unwrap();
+            line.finish(&mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(output.matches(super::ASSISTANT_LABEL).count(), 1);
+            assert!(output.ends_with("Thinking\nDone\n"));
+        }
+    }
+
+    #[test]
+    fn visible_tool_output_ends_the_assistant_message() {
+        let mut line = super::AssistantLine::default();
+        let mut output = Vec::new();
+        line.write_text(&mut output, "Thinking").unwrap();
+        line.finish(&mut output).unwrap();
+        line.write_text(&mut output, "Done").unwrap();
+        assert_eq!(
+            String::from_utf8(output)
+                .unwrap()
+                .matches(super::ASSISTANT_LABEL)
+                .count(),
+            2
+        );
+    }
+
     use super::{Verbosity, render_external_event, render_user_content_for_history};
     use executor::EventData;
     use lingua::Message;

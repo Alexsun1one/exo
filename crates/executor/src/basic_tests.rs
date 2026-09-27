@@ -9,7 +9,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use exoharness::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
-    ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingRecord, BindingType,
+    ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingRecord,
     ConversationHandle, ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData,
     EventQuery, EventQueryDirection, EventStream, ExoHarness, ForkConversationRequest,
     ForkSandboxRequest, GetEventsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
@@ -711,7 +711,7 @@ impl ExoHarness for FakeExoHarness {
     }
 
     async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
-        Ok(vec![test_model_binding_record()])
+        Ok(vec![])
     }
 
     async fn put_binding(&self, _binding: Binding) -> Result<exoharness::BindingId> {
@@ -719,7 +719,7 @@ impl ExoHarness for FakeExoHarness {
     }
 
     async fn get_binding(&self, _id: &exoharness::BindingId) -> Result<Option<Binding>> {
-        Ok(Some(test_model_binding()))
+        Ok(None)
     }
 
     async fn create_vault(&self, _name: &str) -> Result<Arc<dyn VaultHandle>> {
@@ -778,18 +778,6 @@ impl AgentHandle for FakeAgentHandle {
 
     async fn delete_conversation(&self, _id: &ConversationId) -> Result<bool> {
         Err(anyhow!("not implemented"))
-    }
-
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
-        Ok(vec![test_model_binding_record()])
-    }
-
-    async fn put_binding(&self, _binding: Binding) -> Result<exoharness::BindingId> {
-        Err(anyhow!("not implemented"))
-    }
-
-    async fn get_binding(&self, _id: &exoharness::BindingId) -> Result<Option<Binding>> {
-        Ok(Some(test_model_binding()))
     }
 
     async fn write_artifact(&self, _request: WriteArtifactRequest) -> Result<ArtifactVersion> {
@@ -1073,18 +1061,6 @@ impl ConversationHandle for FakeConversationHandle {
     async fn list_artifacts(&self) -> Result<Vec<ArtifactVersion>> {
         Ok(Vec::new())
     }
-
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
-        Ok(vec![test_model_binding_record()])
-    }
-
-    async fn put_binding(&self, _binding: Binding) -> Result<exoharness::BindingId> {
-        Err(anyhow!("not implemented"))
-    }
-
-    async fn get_binding(&self, _id: &exoharness::BindingId) -> Result<Option<Binding>> {
-        Ok(Some(test_model_binding()))
-    }
 }
 
 #[async_trait]
@@ -1300,31 +1276,8 @@ fn assistant_message(text: &str) -> Message {
     }
 }
 
-fn test_model_binding_record() -> BindingRecord {
-    let id = Uuid7::now();
-    BindingRecord {
-        id,
-        r#type: BindingType::Llm,
-        name: "test-model".to_string(),
-        created_at: id.timestamp().expect("uuid7 timestamp"),
-        binding: test_model_binding(),
-    }
-}
-
-fn test_model_binding() -> Binding {
-    Binding::Llm {
-        name: "test-model".to_string(),
-        model: "test-model".to_string(),
-        base_url: None,
-        secret: Some(exoharness::vault::SecretReference {
-            vault_id: Uuid7::now(),
-            secret_id: Uuid7::now(),
-        }),
-    }
-}
-
 fn test_secret_metadata() -> SecretMetadata {
-    let id = Uuid7::now();
+    let id = "01900000-0000-7000-8000-000000000001".parse().unwrap();
     SecretMetadata {
         target: None,
         revision: 1,
@@ -1337,6 +1290,8 @@ fn test_secret_metadata() -> SecretMetadata {
 
 fn default_agent_config() -> AgentConfig {
     AgentConfig {
+        credential: Some("test-secret".into()),
+        base_url: None,
         resources: Vec::new(),
         instructions: Vec::new(),
         harness: crate::AgentHarnessKind::Basic,
@@ -1388,7 +1343,7 @@ impl VaultHandle for FakeVault {
     async fn update_secret(
         &self,
         _id: &exoharness::SecretId,
-        _secret: Secret,
+        _request: exoharness::UpdateSecretRequest,
     ) -> Result<SecretMetadata> {
         Err(anyhow!("not implemented"))
     }

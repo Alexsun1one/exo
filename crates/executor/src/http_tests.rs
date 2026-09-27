@@ -102,33 +102,16 @@ impl Fixture {
             BasicExoHarness::in_memory(crate::test_support::local_test_config("unused-http-test"))
                 .await?,
         );
-        state
-            .put_binding(exoharness::Binding::Llm {
-                name: "test-model".into(),
-                model: "test-model".into(),
-                base_url: None,
-                secret: None,
-            })
-            .await?;
+
         let release = Arc::new(Semaphore::new(0));
         let provider =
             LocalProvider::new(state, Arc::new(ControlledExecutor(Arc::clone(&release))));
         let runtime = Arc::new(Runtime::new(provider, None));
         let agent = runtime
             .create_agent(CreateAgentRequest {
-                slug: "http-test".into(),
-                name: None,
-                harness: AgentHarnessKind::Basic,
-                typescript: None,
                 enable_agent_tool_creation: false,
-                sandbox_image: None,
-                sandbox_provider: SandboxProvider::LocalProcess,
-                sandbox_scope: None,
-                enable_networking: false,
                 model: "test-model".into(),
-                max_output_tokens: None,
-                max_tool_round_trips: None,
-                braintrust: None,
+                ..crate::test_support::agent_request("http-test", AgentHarnessKind::Basic)
             })
             .await?;
         let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -542,14 +525,7 @@ async fn local_and_http_providers_use_the_same_runtime_contract() -> Result<()> 
 async fn managed_agents_created_locally_resume_over_http() -> Result<()> {
     let f = Fixture::new().await?;
     let state = f.runtime.exoharness_handle();
-    state
-        .put_binding(exoharness::Binding::Llm {
-            name: "test-model".into(),
-            model: "test-model".into(),
-            base_url: None,
-            secret: None,
-        })
-        .await?;
+
     let existing = state.get_agent(&f.agent_id).await?.context("agent")?;
     let config = crate::load_agent_config(existing.as_ref()).await?;
     let local = Runtime::new(

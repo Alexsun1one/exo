@@ -619,47 +619,6 @@ impl AgentHandle for HttpAgentHandle {
         }
     }
 
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
-        match self
-            .harness
-            .request(Request::AgentListBindings {
-                agent_id: self.record.id,
-            })
-            .await?
-        {
-            Response::Bindings { bindings } => Ok(bindings),
-            response => unexpected_response(response, "bindings"),
-        }
-    }
-
-    async fn put_binding(&self, binding: Binding) -> Result<BindingId> {
-        match self
-            .harness
-            .request(Request::AgentPutBinding {
-                agent_id: self.record.id,
-                binding,
-            })
-            .await?
-        {
-            Response::BindingId { binding_id } => Ok(binding_id),
-            response => unexpected_response(response, "binding_id"),
-        }
-    }
-
-    async fn get_binding(&self, id: &BindingId) -> Result<Option<Binding>> {
-        match self
-            .harness
-            .request(Request::AgentGetBinding {
-                agent_id: self.record.id,
-                binding_id: *id,
-            })
-            .await?
-        {
-            Response::Binding { binding } => Ok(binding),
-            response => unexpected_response(response, "binding"),
-        }
-    }
-
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion> {
         match self
             .harness
@@ -1057,50 +1016,6 @@ impl ConversationHandle for HttpConversationHandle {
             response => unexpected_response(response, "artifact_versions"),
         }
     }
-
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
-        match self
-            .harness
-            .request(Request::ConversationListBindings {
-                agent_id: self.agent_id,
-                conversation_id: self.record.id,
-            })
-            .await?
-        {
-            Response::Bindings { bindings } => Ok(bindings),
-            response => unexpected_response(response, "bindings"),
-        }
-    }
-
-    async fn put_binding(&self, binding: Binding) -> Result<BindingId> {
-        match self
-            .harness
-            .request(Request::ConversationPutBinding {
-                agent_id: self.agent_id,
-                conversation_id: self.record.id,
-                binding,
-            })
-            .await?
-        {
-            Response::BindingId { binding_id } => Ok(binding_id),
-            response => unexpected_response(response, "binding_id"),
-        }
-    }
-
-    async fn get_binding(&self, id: &BindingId) -> Result<Option<Binding>> {
-        match self
-            .harness
-            .request(Request::ConversationGetBinding {
-                agent_id: self.agent_id,
-                conversation_id: self.record.id,
-                binding_id: *id,
-            })
-            .await?
-        {
-            Response::Binding { binding } => Ok(binding),
-            response => unexpected_response(response, "binding"),
-        }
-    }
 }
 
 #[async_trait]
@@ -1412,14 +1327,19 @@ impl VaultHandle for HttpVaultHandle {
             response => unexpected_response(response, "secret"),
         }
     }
-    async fn update_secret(&self, id: &SecretId, secret: Secret) -> Result<SecretMetadata> {
+    async fn update_secret(
+        &self,
+        id: &SecretId,
+        request: crate::UpdateSecretRequest,
+    ) -> Result<SecretMetadata> {
         match self
             .harness
             .request(Request::VaultUpdateSecret {
                 scope: self.scope,
                 vault_id: self.record.id,
                 secret_id: *id,
-                secret,
+                secret: request.secret,
+                target: request.target,
             })
             .await?
         {

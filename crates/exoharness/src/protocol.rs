@@ -108,7 +108,10 @@ pub enum Request {
         scope: ResourceScope,
         vault_id: VaultId,
         secret_id: SecretId,
-        secret: Secret,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<Secret>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<SecretTarget>,
     },
     VaultDeleteSecret {
         #[serde(default)]
@@ -238,17 +241,6 @@ pub enum Request {
         scope: ResourceScope,
         request: CancelSandboxProcessRequest,
     },
-    AgentListBindings {
-        agent_id: AgentId,
-    },
-    AgentPutBinding {
-        agent_id: AgentId,
-        binding: Binding,
-    },
-    AgentGetBinding {
-        agent_id: AgentId,
-        binding_id: BindingId,
-    },
     ConversationUpdateEnvironment {
         agent_id: AgentId,
         conversation_id: ConversationId,
@@ -306,20 +298,6 @@ pub enum Request {
         agent_id: AgentId,
         conversation_id: ConversationId,
         request: WriteArtifactRequest,
-    },
-    ConversationListBindings {
-        agent_id: AgentId,
-        conversation_id: ConversationId,
-    },
-    ConversationPutBinding {
-        agent_id: AgentId,
-        conversation_id: ConversationId,
-        binding: Binding,
-    },
-    ConversationGetBinding {
-        agent_id: AgentId,
-        conversation_id: ConversationId,
-        binding_id: BindingId,
     },
     TurnAddEvents {
         agent_id: AgentId,
@@ -390,9 +368,6 @@ impl Request {
             Self::GetSandboxProcessEvents { .. } => "get_sandbox_process_events",
             Self::WaitSandboxProcess { .. } => "wait_sandbox_process",
             Self::CancelSandboxProcess { .. } => "cancel_sandbox_process",
-            Self::AgentListBindings { .. } => "agent_list_bindings",
-            Self::AgentPutBinding { .. } => "agent_put_binding",
-            Self::AgentGetBinding { .. } => "agent_get_binding",
             Self::ConversationUpdateEnvironment { .. } => "conversation_update_environment",
             Self::ConversationAttachVaults { .. } => "conversation_attach_vaults",
             Self::ConversationStartSession { .. } => "conversation_start_session",
@@ -405,9 +380,6 @@ impl Request {
             Self::ConversationListArtifacts { .. } => "conversation_list_artifacts",
             Self::ConversationReadArtifact { .. } => "conversation_read_artifact",
             Self::ConversationWriteArtifact { .. } => "conversation_write_artifact",
-            Self::ConversationListBindings { .. } => "conversation_list_bindings",
-            Self::ConversationPutBinding { .. } => "conversation_put_binding",
-            Self::ConversationGetBinding { .. } => "conversation_get_binding",
             Self::TurnAddEvents { .. } => "turn_add_events",
             Self::TurnWriteArtifact { .. } => "turn_write_artifact",
             Self::TurnFinish { .. } => "turn_finish",

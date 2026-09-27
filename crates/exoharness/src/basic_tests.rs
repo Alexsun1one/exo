@@ -185,20 +185,6 @@ async fn basic_backend_contract_turn_events_continue_after_artifact_writes() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn basic_backend_contract_conversation_scope_overrides_and_forks() {
-    let tempdir = TempDir::new().expect("tempdir");
-    let harness: std::sync::Arc<dyn ExoHarness> = std::sync::Arc::new(
-        BasicExoHarness::new(local_test_config(tempdir.path()))
-            .await
-            .expect("harness should initialize"),
-    );
-    crate::contract_tests::conversation_scope_overrides_agent_scope_and_fork_copies_bindings(
-        harness,
-    )
-    .await;
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn local_process_sandbox_contract_start_process_stdio_and_env() {
     let tempdir = TempDir::new().expect("tempdir");
     let handle = local_process_contract_handle(&tempdir, "stdio-and-env").await;
@@ -1252,7 +1238,6 @@ async fn basic_backend_runs_commands_in_created_sandbox() {
 
     let sandbox_id = conversation
         .create_sandbox(CreateSandboxRequest {
-            model: None,
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "basic-local-process".to_string(),
@@ -1356,7 +1341,6 @@ async fn agent_scoped_sandbox_is_shared_without_conversation_ownership() {
         .expect("second conversation");
 
     let create_request = CreateSandboxRequest {
-        model: None,
         name: Some("shared-agent-sandbox".to_string()),
         provider: SandboxProvider::LocalProcess,
         image: "basic-local-process".to_string(),
@@ -1480,7 +1464,6 @@ async fn conversation_create_sandbox_is_not_turn_scoped() {
 
     conversation
         .create_sandbox(CreateSandboxRequest {
-            model: None,
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "basic-local-process".to_string(),
@@ -1537,7 +1520,6 @@ async fn basic_backend_reuses_named_sandbox() {
         .expect("conversation");
 
     let request = CreateSandboxRequest {
-        model: None,
         name: Some("worker".to_string()),
         provider: SandboxProvider::LocalProcess,
         image: "basic-local-process".to_string(),
@@ -1592,7 +1574,6 @@ async fn basic_backend_reattaches_running_sandbox_in_new_harness_process() {
 
     let sandbox_id = conversation
         .create_sandbox(CreateSandboxRequest {
-            model: None,
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "basic-local-process".to_string(),
@@ -1675,7 +1656,6 @@ async fn basic_backend_exposes_process_events_and_input() {
         .expect("conversation");
     let sandbox_id = conversation
         .create_sandbox(CreateSandboxRequest {
-            model: None,
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "basic-local-process".to_string(),
@@ -1804,7 +1784,6 @@ async fn basic_backend_records_process_name_metadata() {
         .expect("conversation");
     let sandbox_id = conversation
         .create_sandbox(CreateSandboxRequest {
-            model: None,
             name: Some("service-test".to_string()),
             provider: SandboxProvider::LocalProcess,
             image: "basic-local-process".to_string(),
@@ -2015,7 +1994,6 @@ async fn test_conversation(harness: &BasicExoHarness) -> Arc<dyn crate::Conversa
 async fn test_sandbox(conversation: &Arc<dyn crate::ConversationHandle>) -> String {
     conversation
         .create_sandbox(CreateSandboxRequest {
-            model: None,
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "test-sandbox".to_string(),
@@ -2066,7 +2044,6 @@ async fn basic_backend_rejects_daytona_provider() {
 
     let error = conversation
         .create_sandbox(CreateSandboxRequest {
-            model: None,
             name: None,
             provider: SandboxProvider::Daytona,
             image: "test-sandbox".to_string(),
@@ -2109,7 +2086,6 @@ async fn advertised_daytona_without_secret_errors_at_first_use() {
 
     let error = conversation
         .create_sandbox(CreateSandboxRequest {
-            model: None,
             name: None,
             provider: SandboxProvider::Daytona,
             image: "test-sandbox".to_string(),
@@ -2290,7 +2266,6 @@ async fn deleting_conversation_terminates_persisted_sandbox_after_harness_reload
 
 fn provider_state_test_create_request() -> CreateSandboxRequest {
     CreateSandboxRequest {
-        model: None,
         name: Some("stateful".to_string()),
         provider: SandboxProvider::LocalProcess,
         image: "test-sandbox".to_string(),
@@ -2571,7 +2546,6 @@ async fn restored_sandbox_image_persists_for_cross_process_reattach() {
     let agent_id = agent.record().id;
 
     let create_request = CreateSandboxRequest {
-        model: None,
         name: Some("agent-sandbox".to_string()),
         provider: SandboxProvider::LocalProcess,
         image: "original-image".to_string(),
@@ -2651,7 +2625,6 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
 
     let source_id = agent
         .create_sandbox(CreateSandboxRequest {
-            model: None,
             name: Some("source".to_string()),
             provider: SandboxProvider::LocalProcess,
             image: "original-image".to_string(),
@@ -2672,7 +2645,6 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
     first_backend.acquired_images.lock().await.clear();
 
     let target_request = CreateSandboxRequest {
-        model: None,
         name: Some("target".to_string()),
         provider: SandboxProvider::LocalProcess,
         image: "original-image".to_string(),
