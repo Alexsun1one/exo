@@ -125,7 +125,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      actions: write
       contents: write
+      pull-requests: write
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -140,21 +142,23 @@ jobs:
       - name: Update pinned image references
         run: python3 exoharness/containers/update-default-image-digests.py image-digests
 
-      - name: Propose digest update branch
+      - name: Open default image digest pull request
         env:
-          BRANCH: sandbox-image-pins/${{ github.run_id }}-${{ github.run_attempt }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           if git diff --quiet; then
             echo "Default image digests are already current." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
+          branch="sandbox-image-pins/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "$BRANCH"
+          git switch -c "$branch"
           git add crates/executor/src/managed_agents/config.rs \
-            crates/executor/src/managed_agents/tests.rs \
-            exoharness/examples/environments/codex-smolvm.yaml \
-            exoharness/examples/environments/pi-local.yaml
+            crates/executor/src/managed_agents/tests.rs
           git commit -m "Pin managed agent sandbox images from release"
-          git push origin "HEAD:refs/heads/$BRANCH"
-          echo "Review and open a PR for [the published image digest update](https://github.com/exoharness/exo/compare/main...$BRANCH?expand=1)." >> "$GITHUB_STEP_SUMMARY"
+          git push origin "HEAD:refs/heads/$branch"
+          printf 'Update the default sandbox image digests from the approved [image release](https://github.com/%s/actions/runs/%s).\n\nThe published images are available now; merging this PR adopts them as Exo defaults.\n' "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" > "$RUNNER_TEMP/image-pin-pr.md"
+          pr_url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$branch" --title "Pin sandbox images from approved release" --body-file "$RUNNER_TEMP/image-pin-pr.md")
+          echo "Review the [default image digest PR]($pr_url) to adopt the released images." >> "$GITHUB_STEP_SUMMARY"
+          gh workflow run ci.yml --repo "$GITHUB_REPOSITORY" --ref "$branch"

@@ -21,12 +21,16 @@ and `ankrgyl` as its required reviewer.
 The workflow publishes `latest` and `sha-<full source commit>`; optionally
 provide a `sandbox-images-vX.Y.Z` release tag. Each job prints the
 multi-platform image digest in its summary.
-Harness defaults and bundled environment definitions use the published
-`image@sha256:...` references so they keep using the same tested images when
-`latest` changes. After publication, the workflow puts updated digest pins on
-a dedicated branch and links to a compare page in the job summary. Open and
-review a PR from that branch to adopt the new images. `codex-devbox` is
-published in the same release, but is not a harness default.
+Harness defaults use published `image@sha256:...` references so they keep using
+the same tested images when `latest` changes. Bundled environment examples use
+`latest` for easy setup; pin a digest in an environment for reproducibility.
+After publication, the workflow commits the new default-image digests to a
+dedicated branch and opens a PR. The `main` ruleset requires a review
+before those new defaults are adopted. The workflow also starts CI for the PR
+branch, since pushes made with `GITHUB_TOKEN` do not trigger ordinary push runs.
+GitHub Actions PR creation must be enabled in both the organization and
+repository settings; this job requests write permissions explicitly.
+`codex-devbox` is published in the same release, but is not a harness default.
 
 GitHub initially creates each container package as private, even when the
 source repository is public. An organization owner must allow public packages
