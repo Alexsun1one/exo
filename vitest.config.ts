@@ -3,7 +3,15 @@ import { configDefaults, defineConfig } from "vitest/config";
 
 // Mirror the tsconfig path aliases so tests can import modules that use them.
 export default defineConfig({
-  test: { exclude: [...configDefaults.exclude, "**/.exo/**", "**/.local/**"] },
+  test: {
+    exclude: [
+      ...configDefaults.exclude,
+      "**/.exo/**",
+      "**/.local/**",
+      "exoharness/examples/tutorials/**/sample-repo/**",
+      "scratch/**",
+    ],
+  },
   resolve: {
     alias: {
       "@exo/harness/tool": fileURLToPath(

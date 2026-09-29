@@ -1,7 +1,7 @@
 use crate::{AgentConfig, AgentHarnessKind, AgentSandboxConfig, TypeScriptHarnessConfig};
 use anyhow::{Context, Result, bail};
 use exo_managed_agents::AgentDefinition;
-use exoharness::SandboxProvider;
+use exoharness::{CredentialDestination, SandboxProvider};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +45,59 @@ impl TypeScriptHarnessPreset {
             ),
         }
     }
+}
+
+pub(crate) fn sandbox_model_credential_variable(
+    config: &AgentConfig,
+) -> Result<Option<&'static str>> {
+    let module = config
+        .typescript
+        .as_ref()
+        .and_then(|config| Path::new(&config.module_path).file_name())
+        .and_then(|name| name.to_str());
+    Ok(match module {
+        Some("codex-harness.ts") => Some("OPENAI_API_KEY"),
+        Some("claude-code-harness.ts") => Some("ANTHROPIC_API_KEY"),
+        Some("pi-harness.ts") => Some(
+            match config
+                .model
+                .split_once('/')
+                .map(|(provider, _)| provider)
+                .unwrap_or("openai")
+            {
+                "openai" => "OPENAI_API_KEY",
+                "anthropic" => "ANTHROPIC_API_KEY",
+                "google" => "GEMINI_API_KEY",
+                provider => {
+                    bail!("Pi API-key credentials are not configured for provider {provider}")
+                }
+            },
+        ),
+        _ => None,
+    })
+}
+
+pub fn model_credential_destination(config: &AgentConfig) -> Result<Option<CredentialDestination>> {
+    let endpoint = if let Some(variable) = sandbox_model_credential_variable(config)? {
+        exoharness::vault::model_endpoint(config.base_url.as_deref(), variable)?
+    } else if !matches!(config.harness, AgentHarnessKind::TypeScript) {
+        match config.base_url.as_deref() {
+            Some(url) => url::Url::parse(url)?,
+            None => exoharness::vault::model_endpoint(
+                None,
+                if crate::harness_runtime::is_anthropic_model(&config.model) {
+                    "ANTHROPIC_API_KEY"
+                } else {
+                    "OPENAI_API_KEY"
+                },
+            )?,
+        }
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(CredentialDestination::origin(
+        &endpoint.origin().ascii_serialization(),
+    )?))
 }
 
 pub(crate) fn installation() -> Result<PathBuf> {
@@ -162,6 +215,14 @@ pub fn agent_config(
     if model.trim().is_empty() {
         bail!("model must not be empty");
     }
+    if let Some(effort) = definition.frontmatter.config.reasoning_effort.as_deref() {
+        if preset != Some(TypeScriptHarnessPreset::Codex) {
+            bail!("model.reasoning_effort is only supported by the codex harness");
+        }
+        if effort.trim().is_empty() {
+            bail!("model.reasoning_effort must not be empty");
+        }
+    }
     Ok(AgentConfig {
         resources: Vec::new(),
         harness: kind,
@@ -182,6 +243,7 @@ pub fn agent_config(
         model: model.into(),
         credential: definition.frontmatter.config.credential.clone(),
         base_url: definition.frontmatter.config.base_url.clone(),
+        reasoning_effort: definition.frontmatter.config.reasoning_effort.clone(),
         max_output_tokens: definition.frontmatter.config.max_output_tokens,
         max_tool_round_trips: definition.frontmatter.config.max_tool_round_trips,
         braintrust: definition.frontmatter.config.braintrust.clone(),

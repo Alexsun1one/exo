@@ -199,6 +199,7 @@ mod tests {
         AgentConfig {
             credential: Some("test-openai".into()),
             base_url: None,
+            reasoning_effort: None,
             resources: Vec::new(),
             instructions: vec![],
             harness: AgentHarnessKind::Exo,
