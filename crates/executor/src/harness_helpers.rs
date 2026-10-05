@@ -2,14 +2,15 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use anyhow::Context;
+
 use exoharness::{
-    AddEventsRequest, AgentHandle, Binding, ConversationHandle, EventData, EventKind, EventQuery,
-    EventQueryDirection, ExoHarness, Result, Secret, ToolCallId, Uuid7,
+    AddEventsRequest, AgentHandle, ConversationHandle, EventData, EventKind, EventQuery,
+    EventQueryDirection, ExoHarness, Result, ToolCallId, Uuid7,
 };
 use lingua::Message;
 use lingua::universal::{
-    AssistantContent, AssistantContentPart, ToolContentPart, ToolResultContentPart, UserContent,
-    UserContentPart,
+    AssistantContent, AssistantContentPart, ToolContentPart, UserContent, UserContentPart,
 };
 use serde::{Deserialize, Serialize};
 
@@ -68,70 +69,71 @@ pub(crate) async fn resolve_conversation_handle(
         return Ok(Some(conversation));
     }
 
-    let conversations = agent
-        .list_conversations(exoharness::ListConversationsRequest::default())
-        .await?
-        .conversations;
+    let conversations = list_conversation_handles(agent).await?;
     Ok(conversations
         .into_iter()
         .find(|conversation| conversation.record().slug == conversation_ref))
 }
 
-pub(crate) async fn materialize_conversation_messages(
+pub(crate) async fn list_conversation_handles(
+    agent: &dyn AgentHandle,
+) -> Result<Vec<Arc<dyn ConversationHandle>>> {
+    let mut conversations = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = agent
+            .list_conversations(exoharness::ListConversationsRequest {
+                cursor,
+                limit: None,
+                ..Default::default()
+            })
+            .await?;
+        conversations.extend(page.conversations);
+        match page.next_cursor {
+            Some(next) => {
+                anyhow::ensure!(
+                    cursor.is_none_or(|cursor| next < cursor),
+                    "thread listing cursor did not advance"
+                );
+                cursor = Some(next);
+            }
+            None => return Ok(conversations),
+        }
+    }
+}
+
+pub async fn materialize_conversation_messages(
     conversation: &dyn ConversationHandle,
 ) -> Result<Vec<Message>> {
-    let events = conversation
-        .get_events(Some(EventQuery {
-            cursor: None,
-            direction: Some(EventQueryDirection::Asc),
-            limit: None,
-            session_id: None,
-            turn_id: None,
-            types: None,
-        }))
-        .await?
-        .events;
+    let mut events = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = conversation
+            .get_events(Some(EventQuery {
+                cursor,
+                direction: Some(EventQueryDirection::Asc),
+                limit: None,
+                ..Default::default()
+            }))
+            .await?;
+        if page.events.is_empty() {
+            break;
+        }
+        let next = page.events.last().map(|event| event.id);
+        anyhow::ensure!(next > cursor, "conversation history cursor did not advance");
+        cursor = next;
+        events.extend(page.events);
+    }
 
     let mut messages = Vec::new();
     let mut tool_call_names = HashMap::<ToolCallId, String>::new();
 
-    for event in events {
-        match event.data {
-            EventData::Messages {
-                messages: event_messages,
-                ..
-            } => messages.extend(event_messages),
-            EventData::ToolRequested {
-                tool_call_id,
-                request,
-                ..
-            } => {
-                tool_call_names.insert(tool_call_id, request.function_name);
-            }
-            EventData::ToolResult {
-                tool_call_id,
-                result,
-            } => {
-                let Some(tool_name) = tool_call_names.get(&tool_call_id) else {
-                    continue;
-                };
-                messages.push(Message::Tool {
-                    content: vec![ToolContentPart::ToolResult(ToolResultContentPart {
-                        tool_call_id,
-                        tool_name: tool_name.clone(),
-                        output: to_lingua_value(result),
-                        provider_options: None,
-                    })],
-                });
-            }
-            _ => {}
-        }
-    }
+    crate::message_history::extend_message_history(&mut messages, &mut tool_call_names, &events);
 
     Ok(messages)
 }
 
-pub(crate) async fn get_conversation_model_override(
+pub async fn get_conversation_model_override(
     conversation: &dyn ConversationHandle,
 ) -> Result<Option<ConversationModelConfig>> {
     let events = conversation
@@ -159,7 +161,7 @@ pub(crate) async fn get_conversation_model_override(
     Ok(config_event.into_model_config())
 }
 
-pub(crate) async fn put_conversation_model_override(
+pub async fn put_conversation_model_override(
     conversation: &dyn ConversationHandle,
     config: Option<ConversationModelConfig>,
 ) -> Result<()> {
@@ -188,56 +190,46 @@ pub(crate) async fn put_conversation_model_override(
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ResolvedModelBinding {
+pub(crate) struct ResolvedModel {
     pub(crate) model: String,
-    pub(crate) api_key: Option<String>,
+    pub(crate) api_key: String,
     pub(crate) base_url: Option<String>,
 }
 
-pub(crate) async fn resolve_model_binding(
+pub(crate) async fn model_credential(
     conversation: &dyn ConversationHandle,
-    name: &str,
-) -> Result<ResolvedModelBinding> {
-    let binding_record = conversation
-        .list_bindings()
+    config: &crate::AgentConfig,
+) -> Result<exoharness::vault::SecretReference> {
+    let name = config
+        .credential
+        .as_deref()
+        .context("agent config.credential must name a credential in a selected vault")?;
+    exoharness::vault::find_secret(conversation, name)
         .await?
-        .into_iter()
-        .find(|binding| binding.name == name)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "model is not registered: {name}; run `exo model register {name} --secret <secret>`"
-            )
-        })?;
-    let Binding::Llm {
-        model,
-        base_url,
-        secret_id,
-        ..
-    } = binding_record.binding
-    else {
-        return Err(anyhow::anyhow!("binding is not a model: {name}"));
+        .with_context(|| format!("model credential {name:?} was not found in the selected vaults"))
+}
+
+pub(crate) async fn resolve_model(
+    conversation: &dyn ConversationHandle,
+    config: &crate::AgentConfig,
+) -> Result<ResolvedModel> {
+    let reference = model_credential(conversation, config).await?;
+    let endpoint = match &config.base_url {
+        Some(url) => url::Url::parse(url)?,
+        None => exoharness::vault::model_endpoint(
+            None,
+            if crate::harness_runtime::is_anthropic_model(&config.model) {
+                "ANTHROPIC_API_KEY"
+            } else {
+                "OPENAI_API_KEY"
+            },
+        )?,
     };
-    let api_key = match secret_id {
-        Some(secret_id) => {
-            let secret = conversation
-                .get_secret(&secret_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("model secret does not exist for {name}"))?;
-            match secret {
-                Secret::Key { value } => Some(value),
-                Secret::Oauth { .. } => {
-                    return Err(anyhow::anyhow!(
-                        "model secret must be a key secret, got oauth for {name}"
-                    ));
-                }
-            }
-        }
-        None => None,
-    };
-    Ok(ResolvedModelBinding {
-        model,
+    let api_key = exoharness::vault::resolve_model_key(conversation, &reference, &endpoint).await?;
+    Ok(ResolvedModel {
+        model: config.model.clone(),
         api_key,
-        base_url,
+        base_url: config.base_url.clone(),
     })
 }
 
@@ -399,6 +391,73 @@ mod tests {
     use super::to_lingua_value;
 
     #[test]
+    fn materializes_embedded_and_standalone_calls_without_duplicates() {
+        use super::*;
+        let call = json!({"role": "assistant", "content": [{
+            "type": "tool_call", "tool_call_id": "call", "tool_name": "shell",
+            "arguments": {"type": "valid", "value": {}}
+        }]});
+        for (embedded, requested) in [(false, true), (true, true), (true, false)] {
+            for result in [false, true] {
+                let mut data = Vec::new();
+                if embedded {
+                    data.push(json!({"type": "messages", "messages": [call.clone()]}));
+                }
+                if requested {
+                    data.push(json!({"type": "tool_requested", "tool_call_id": "call",
+                        "request": {"function_name": "shell", "arguments": {}}}));
+                }
+                data.push(json!({"type": "messages", "messages": []}));
+                if result {
+                    data.push(
+                        json!({"type": "tool_result", "tool_call_id": "call", "result": "done"}),
+                    );
+                }
+                data.push(
+                    json!({"type": "messages", "messages": [{"role": "user", "content": "next"}]}),
+                );
+                let events: Vec<_> = data
+                    .into_iter()
+                    .map(|data| {
+                        let id = Uuid7::now();
+                        exoharness::Event {
+                            id,
+                            thread_id: id,
+                            session_id: None,
+                            turn_id: None,
+                            created_at: id.timestamp().unwrap(),
+                            data: serde_json::from_value(data).unwrap(),
+                        }
+                    })
+                    .collect();
+                let mut messages = Vec::new();
+                crate::message_history::extend_message_history(
+                    &mut messages,
+                    &mut HashMap::new(),
+                    &events,
+                );
+                assert_eq!(messages.len(), 3);
+                assert!(matches!(messages[0], Message::Assistant { .. }));
+                let Message::Tool { content } = &messages[1] else {
+                    panic!("missing result")
+                };
+                let ToolContentPart::ToolResult(output) = &content[0];
+                assert_eq!(output.tool_call_id, "call");
+                assert_eq!(output.tool_name, "shell");
+                assert_eq!(
+                    output.output,
+                    to_lingua_value(if result {
+                        json!("done")
+                    } else {
+                        json!({"ok": false, "error": "tool execution did not complete before the previous turn ended"})
+                    })
+                );
+                assert!(matches!(messages[2], Message::User { .. }));
+            }
+        }
+    }
+
+    #[test]
     fn converts_std_json_to_lingua_json_structurally() {
         let value = json!({
             "null": null,
@@ -413,5 +472,110 @@ mod tests {
             lingua::serde_json::from_str(&encoded).expect("test json should parse as lingua json");
 
         assert_eq!(to_lingua_value(value), expected);
+    }
+}
+
+#[cfg(test)]
+mod vault_tests {
+    use super::*;
+    use exoharness::{
+        BasicExoHarness, BasicExoHarnessConfig, NewAgentRequest, NewThreadRequest,
+        PutSecretRequest, SandboxBackendRegistration, SandboxProvider, Secret, SecretBackendChoice,
+    };
+
+    #[tokio::test]
+    async fn model_credentials_resolve_only_from_the_selected_vaults() -> Result<()> {
+        let harness = BasicExoHarness::in_memory(BasicExoHarnessConfig {
+            root: Default::default(),
+            secret_backend: SecretBackendChoice::Static([1; 32]),
+            sandbox_default: SandboxProvider::LocalProcess,
+            sandbox_policy: None,
+            sandbox_backends: vec![SandboxBackendRegistration::local_process()],
+        })
+        .await?;
+        let runtime = exoharness::vault::global_vault(&harness).await?;
+        let user = harness.create_vault("alice").await?;
+        runtime
+            .put_secret(PutSecretRequest {
+                name: "provider".into(),
+                policy: Some(
+                    exoharness::CredentialDestination::origin("https://api.openai.com")
+                        .unwrap()
+                        .into(),
+                ),
+                secret: Secret::Key {
+                    value: "runtime-key".into(),
+                },
+            })
+            .await?;
+        let user_secret = user
+            .put_secret(PutSecretRequest {
+                name: "provider".into(),
+                policy: Some(
+                    exoharness::CredentialDestination::origin("https://api.openai.com")
+                        .unwrap()
+                        .into(),
+                ),
+                secret: Secret::Key {
+                    value: "user-key".into(),
+                },
+            })
+            .await?;
+        let agent = harness
+            .new_agent(NewAgentRequest {
+                vaults: vec![],
+                name: "agent".into(),
+                slug: "agent".into(),
+            })
+            .await?;
+        let thread = agent
+            .new_thread(NewThreadRequest {
+                vaults: vec![user.record().id],
+                ..Default::default()
+            })
+            .await?;
+        let definition = exo_managed_agents::AgentDefinition::parse("---\nname: test\nharness: basic\nconfig:\n  model: gpt-5.6-sol\n  credential: provider\n---\nTest.".into())?;
+        let mut config = crate::managed_agents::agent_config(
+            &definition,
+            SandboxProvider::LocalProcess,
+            None,
+            None,
+        )?;
+        let model = resolve_model(thread.as_ref(), &config).await?;
+        assert_eq!(model.api_key, "user-key");
+        user.update_secret(
+            &user_secret,
+            Secret::Key {
+                value: "rotated-user-key".into(),
+            }
+            .into(),
+        )
+        .await?;
+        assert_eq!(
+            resolve_model(thread.as_ref(), &config).await?.api_key,
+            "rotated-user-key"
+        );
+        let global_thread = agent.new_thread(Default::default()).await?;
+        assert_eq!(
+            resolve_model(global_thread.as_ref(), &config)
+                .await?
+                .api_key,
+            "runtime-key"
+        );
+        config.credential = Some(user_secret.to_string());
+        assert!(
+            resolve_model(global_thread.as_ref(), &config)
+                .await
+                .is_err()
+        );
+        config.credential = None;
+        assert!(
+            resolve_model(thread.as_ref(), &config)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("config.credential")
+        );
+        Ok(())
     }
 }

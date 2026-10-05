@@ -1,7 +1,10 @@
+import { readFileSync } from "node:fs";
 import {
   appendCustomEvent,
   assistantTextMessage,
   defineHarness,
+  materializeConversationMessages,
+  validateToolPolicies,
   messageText,
   messagesEvent,
   stringifyValue,
@@ -9,6 +12,7 @@ import {
   toolRequestedEvent,
   toolResultEvent,
   turnMetadata,
+  type Event,
   type EventData,
   type JsonObject,
   type JsonValue,
@@ -24,9 +28,10 @@ import {
   type CodexServerRequest,
 } from "@exo/codex/app-server";
 import { responsesMessagesToLingua } from "@braintrust/lingua";
+import { ensureTable, getTable } from "@exo/model-runtime/cost";
 import {
   errorMessage,
-  ResponsesRuntime,
+  traceExecutorTurn,
   tracedUnderParent,
   type TraceParent,
 } from "@exo/model-runtime/responses";
@@ -38,36 +43,44 @@ import {
   isRecord,
   markFirstTextDelta,
   materializePriorConversationMessages,
-  numberField,
   objectArgs,
   pickEnv,
-  resolveLlmBinding,
+  resolveSandboxModel,
   sandboxCwd,
-  shellToolResultText,
-  shellToolSucceeded,
   stringOrNull,
   traceExoharnessToolCall,
   traceObservedToolCall,
   WarmResourceCache,
-  type ResolvedLlmBinding,
+  type SandboxModel,
 } from "@exo/model-runtime/shared";
 
+import {
+  codexReplayItems,
+  replayCodexHistory,
+} from "../../typescript/codex/replay";
+import {
+  assertNativeToolSafety,
+  nativeItemComplete,
+  nativeTurnSnapshot,
+  type NativeTurnSnapshot,
+} from "../../typescript/codex/recovery";
+import {
+  accumulateCodexUsage,
+  codexUsageEvent,
+  type CodexTokenUsage,
+} from "../../typescript/codex/usage";
+
+import { authorizeMcpElicitation } from "../../typescript/codex/mcp-approval";
+
+import { codexMcpToolName } from "../../typescript/harness/native-mcp";
+
+const CODEX_VERSION = readFileSync(
+  new URL("../../containers/codex-sandbox/version", import.meta.url),
+  "utf8",
+).trim();
 const CODEX_SHELL_TOOL = "codex.shell";
 const CODEX_WEB_SEARCH_TOOL = "codex.web_search";
-const EXO_SHELL_TOOL = "shell";
-const EXO_SHELL_DYNAMIC_TOOL = "exo_shell";
-const CODEX_PRIOR_MESSAGE_MAX_CHARS = 8_000;
-const CODEX_PRIOR_TOOL_RESULT_MAX_CHARS = 4_000;
-const CODEX_PRIOR_HISTORY_MAX_CHARS = 24_000;
 const CODEX_WARM_SESSION_EVENT = "codex_warm_session";
-
-interface CodexTokenUsage {
-  inputTokens?: number;
-  outputTokens?: number;
-  totalTokens?: number;
-  cachedInputTokens?: number;
-  reasoningOutputTokens?: number;
-}
 
 interface CodexTurnTraceState {
   finalText: string;
@@ -81,21 +94,9 @@ interface CodexTurnTraceState {
 interface CodexWarmTurnScope {
   context: TurnContext;
   protocolLog: CodexProtocolEventBuffer;
+  traceState: CodexTurnTraceState;
   turnParent: TraceParent;
-}
-
-interface PriorResponseItems {
-  items: JsonValue[];
-  sourceMessageCount: number;
-  droppedMessageCount: number;
-  truncatedMessageCount: number;
-  textChars: number;
-}
-
-interface PriorResponseItemCandidate {
-  item: JsonValue;
-  textChars: number;
-  truncated: boolean;
+  mcpCalls: Map<string, PendingToolCall>;
 }
 
 interface CodexWarmSessionRecord {
@@ -105,8 +106,139 @@ interface CodexWarmSessionRecord {
   threadId: string;
 }
 
+interface SavedCodexTurn {
+  threadId: string;
+  turnId: string;
+  completed: boolean;
+  projectedItems: Set<string>;
+}
+
+interface SavedCodexRecovery {
+  turn: SavedCodexTurn | null;
+  unresolvedTools: Set<string>;
+  unansweredApproval: boolean;
+}
+
+async function savedCodexRecovery(
+  context: TurnContext,
+): Promise<SavedCodexRecovery> {
+  const pageSize = 1000;
+  let saved: SavedCodexTurn | null = null;
+  let pendingStartIntent = false;
+  const projectedItems = new Set<string>();
+  const pendingToolCalls = new Map<string, number>();
+  const pendingApprovals = new Set<string>();
+  const events: Event[] = [];
+  let cursor: string | null = null;
+  // Read only this unfinished turn, stopping at its start. Fold the events in
+  // chronological order so tool results and approvals match their requests.
+  while (true) {
+    const page = await context.exoharness.current.conversation.getEvents({
+      cursor,
+      direction: "desc",
+      limit: pageSize,
+      turnId: context.exoharness.current.turn.record.id,
+      types: [
+        "turn_started",
+        "codex_turn_started",
+        "codex_turn_start_intent",
+        "codex_turn_completed",
+        "codex_item_projected",
+        "tool_requested",
+        "tool_result",
+        "agent_runtime.approval_requested",
+        "agent_runtime.approval_response",
+      ],
+    });
+    const startIndex = page.events.findIndex(
+      (event) => event.data.type === "turn_started",
+    );
+    events.push(
+      ...page.events.slice(0, startIndex < 0 ? page.events.length : startIndex),
+    );
+    if (startIndex >= 0) break;
+    if (
+      page.events.length < pageSize ||
+      !page.cursor ||
+      page.cursor === cursor
+    ) {
+      throw new Error("saved Codex recovery has no turn_started event");
+    }
+    cursor = page.cursor;
+  }
+  for (const event of events.reverse()) {
+    const data = event.data;
+    if (data.type === "tool_requested") {
+      if (typeof data.tool_call_id === "string") {
+        pendingToolCalls.set(
+          data.tool_call_id,
+          (pendingToolCalls.get(data.tool_call_id) ?? 0) + 1,
+        );
+      }
+      continue;
+    }
+    if (data.type === "tool_result") {
+      if (typeof data.tool_call_id === "string") {
+        const count = pendingToolCalls.get(data.tool_call_id) ?? 0;
+        if (count <= 1) pendingToolCalls.delete(data.tool_call_id);
+        else pendingToolCalls.set(data.tool_call_id, count - 1);
+      }
+      continue;
+    }
+    if (data.type !== "custom") continue;
+    if (data.event_type === "codex_turn_start_intent") {
+      pendingStartIntent = true;
+    } else if (data.event_type === "codex_turn_started") {
+      const payload = asRecord(data.payload);
+      if (
+        typeof payload.codex_thread_id === "string" &&
+        typeof payload.codex_turn_id === "string"
+      ) {
+        saved = {
+          threadId: payload.codex_thread_id,
+          turnId: payload.codex_turn_id,
+          completed: false,
+          projectedItems,
+        };
+        pendingStartIntent = false;
+      }
+    } else if (data.event_type === "codex_turn_completed" && saved) {
+      const status = asRecord(asRecord(data.payload).turn).status;
+      if (status === "completed") saved.completed = true;
+      if (status === "failed" || status === "interrupted") {
+        throw new Error(`saved Codex turn ended with status ${status}`);
+      }
+    } else if (data.event_type === "codex_item_projected") {
+      const payload = asRecord(data.payload);
+      if (
+        typeof payload.turn_id === "string" &&
+        typeof payload.item_id === "string"
+      ) {
+        projectedItems.add(`${payload.turn_id}:${payload.item_id}`);
+      }
+    } else if (data.event_type === "agent_runtime.approval_requested") {
+      const id = asRecord(data.payload).approval_id;
+      if (typeof id === "string") pendingApprovals.add(id);
+    } else if (data.event_type === "agent_runtime.approval_response") {
+      const id = asRecord(data.payload).approval_id;
+      if (typeof id === "string") pendingApprovals.delete(id);
+    }
+  }
+  if (pendingStartIntent) {
+    throw new Error(
+      "cannot safely resume Codex turn after turn/start was attempted without a saved native turn ID",
+    );
+  }
+  return {
+    turn: saved,
+    unresolvedTools: new Set(pendingToolCalls.keys()),
+    unansweredApproval: pendingApprovals.size > 0,
+  };
+}
+
 class CodexWarmSession {
   threadId: string | null;
+  resumeThreadId: string | null = null;
   private current: CodexWarmTurnScope | null;
 
   private constructor(
@@ -121,19 +253,24 @@ class CodexWarmSession {
 
   static async start(
     scope: CodexWarmTurnScope,
-    modelBinding: ResolvedLlmBinding,
     sessionKey: string,
   ): Promise<CodexWarmSession> {
     let session: CodexWarmSession | null = null;
+    let sessionReady: (session: CodexWarmSession) => void = () => {};
+    const attachedSession = new Promise<CodexWarmSession>((resolve) => {
+      sessionReady = resolve;
+    });
     const pendingProtocol: CodexProtocolLogEntry[] = [];
     const process = await scope.context.startSandboxProcess({
       command: codexSandboxCommand(scope.context),
-      env: codexSandboxEnv(modelBinding),
+      env: codexSandboxEnv(),
       reuseKey: sessionKey,
     });
-    const warmRecord = process.reused
-      ? await latestCodexWarmSession(scope.context, sessionKey, process)
-      : null;
+    const warmRecord = await latestCodexWarmSession(
+      scope.context,
+      sessionKey,
+      process,
+    );
     const options = {
       process,
       onProtocolMessage: (entry: CodexProtocolLogEntry) => {
@@ -144,7 +281,9 @@ class CodexWarmSession {
         }
       },
       onServerRequest: (request: CodexServerRequest) =>
-        session?.handleServerRequest(request),
+        process.reused
+          ? attachedSession.then((ready) => ready.handleServerRequest(request))
+          : session?.handleServerRequest(request),
     };
     const server = process.reused
       ? await CodexAppServer.attachToSandbox(options)
@@ -155,6 +294,10 @@ class CodexWarmSession {
       scope,
       process.reused ? (warmRecord?.threadId ?? null) : null,
     );
+    session.resumeThreadId = process.reused
+      ? null
+      : (warmRecord?.threadId ?? null);
+    sessionReady(session);
     for (const entry of pendingProtocol) {
       session.recordProtocol(entry);
     }
@@ -176,7 +319,22 @@ class CodexWarmSession {
   }
 
   private recordProtocol(entry: CodexProtocolLogEntry): void {
-    this.current?.protocolLog.record(entry);
+    const scope = this.current;
+    if (!scope) return;
+    scope.protocolLog.record(entry);
+    scope.traceState.tokenUsage = accumulateCodexUsage(
+      scope.traceState.tokenUsage,
+      entry,
+    );
+    if (entry.direction !== "server_to_client") return;
+    const message = asRecord(entry.message);
+    if (message.method !== "item/started") return;
+    const item = asRecord(asRecord(message.params).item);
+    const id = itemIdFromItem(item);
+    if (item.type === "mcpToolCall" && id) {
+      const call = toolCallFromCodexItem(scope.context, item, id);
+      if (call) scope.mcpCalls.set(id, call);
+    }
   }
 
   private handleServerRequest(
@@ -190,6 +348,7 @@ class CodexWarmSession {
       current.context,
       current.turnParent,
       request,
+      current.mcpCalls,
     );
   }
 }
@@ -197,14 +356,30 @@ class CodexWarmSession {
 const codexSessions = new WarmResourceCache<CodexWarmSession>();
 
 export default defineHarness({
+  nativeToolApprovals: false,
+  reconcileUnresolvedToolCalls: true,
   async runTurn(context) {
-    const modelBinding = await resolveLlmBinding(context);
-    const runtime = ResponsesRuntime.fromModelBinding(
-      context.agentConfig,
-      modelBinding,
+    validateToolPolicies(
+      context,
+      context.tools.map((tool) => tool.name),
+      false,
     );
-    await runtime.runTurn(context, (turnParent) =>
-      runCodexTurn(context, turnParent, modelBinding),
+    await ensureTable();
+    const modelBinding = resolveSandboxModel(context);
+    await traceExecutorTurn(context, (turnParent) =>
+      runCodexTurn(context, turnParent, modelBinding, false),
+    );
+  },
+  async resumeTurn(context) {
+    validateToolPolicies(
+      context,
+      context.tools.map((tool) => tool.name),
+      false,
+    );
+    await ensureTable();
+    const modelBinding = resolveSandboxModel(context);
+    await traceExecutorTurn(context, (turnParent) =>
+      runCodexTurn(context, turnParent, modelBinding, true),
     );
   },
 });
@@ -212,13 +387,37 @@ export default defineHarness({
 async function runCodexTurn(
   context: TurnContext,
   turnParent: TraceParent,
-  modelBinding: ResolvedLlmBinding,
+  modelBinding: SandboxModel,
+  recovering: boolean,
 ): Promise<string | null> {
   await requireCodexSandboxNetworking(context);
 
   const { turn } = context.exoharness.current;
+  const recovery = recovering ? await savedCodexRecovery(context) : null;
+  const savedTurn = recovery?.turn ?? null;
+  const unresolvedTools = recovery?.unresolvedTools ?? new Set<string>();
+  if (recovering && !savedTurn && unresolvedTools.size > 0) {
+    throw new Error(
+      "cannot safely resume Codex turn with an unresolved tool call",
+    );
+  }
+  if (savedTurn?.completed) return null;
   const protocolLog = new CodexProtocolEventBuffer(context);
-  const scope: CodexWarmTurnScope = { context, protocolLog, turnParent };
+  const traceState: CodexTurnTraceState = {
+    finalText: "",
+    ttftMs: null,
+    tokenUsage: null,
+    promptMessages: [],
+    startedAt: Date.now(),
+    sawTextDelta: false,
+  };
+  const scope: CodexWarmTurnScope = {
+    context,
+    protocolLog,
+    turnParent,
+    mcpCalls: new Map(),
+    traceState,
+  };
   const sessionKey = codexWarmSessionKey(context, modelBinding);
   const sandboxRuntime = codexSandboxRuntimeKey(context);
   const { resource: session, reused: appServerReused } = await traceCodexTask(
@@ -232,22 +431,73 @@ async function runCodexTurn(
     },
     () =>
       codexSessions.get(sessionKey, () =>
-        CodexWarmSession.start(scope, modelBinding, sessionKey),
+        CodexWarmSession.start(scope, sessionKey),
       ),
   );
   session.setTurnScope(scope);
 
-  const traceState: CodexTurnTraceState = {
-    finalText: "",
-    ttftMs: null,
-    tokenUsage: null,
-    promptMessages: [],
-    startedAt: Date.now(),
-    sawTextDelta: false,
-  };
-
   try {
-    const threadReused = session.threadId !== null;
+    if (savedTurn) {
+      session.threadId = session.process.reused ? savedTurn.threadId : null;
+      session.resumeThreadId = session.process.reused
+        ? null
+        : savedTurn.threadId;
+    }
+    let threadReused = session.threadId !== null;
+    let nativeSnapshot: NativeTurnSnapshot | null = null;
+    if (savedTurn && session.process.reused) {
+      // The native process may have kept running after Exo disconnected.
+      // Read its state before issuing another turn/start.
+      const response = await session.server.request<JsonObject>("thread/read", {
+        threadId: savedTurn.threadId,
+        includeTurns: true,
+      });
+      nativeSnapshot = nativeTurnSnapshot(response, savedTurn.turnId);
+      if (!nativeSnapshot) {
+        throw new Error(
+          `live Codex thread has no saved turn ${savedTurn.turnId}`,
+        );
+      }
+    }
+    if (session.threadId === null && session.resumeThreadId !== null) {
+      try {
+        const resumedThreadId = await startOrResumeCodexThread(
+          session.server,
+          context,
+          modelBinding,
+          session.resumeThreadId,
+        );
+        if (savedTurn) {
+          const response = await session.server.request<JsonObject>(
+            "thread/read",
+            {
+              threadId: resumedThreadId,
+              includeTurns: true,
+            },
+          );
+          nativeSnapshot = nativeTurnSnapshot(response, savedTurn.turnId);
+          if (!nativeSnapshot) {
+            throw new Error(
+              `resumed Codex thread has no saved turn ${savedTurn.turnId}`,
+            );
+          }
+        }
+        session.threadId = resumedThreadId;
+        threadReused = true;
+      } catch (error) {
+        session.threadId = null;
+        threadReused = false;
+        await appendCustomEvent(
+          context.exoharness.current.turn,
+          "codex_resume_failed",
+          {
+            thread_id: session.resumeThreadId,
+            error: errorMessage(error),
+          },
+        );
+      }
+      session.resumeThreadId = null;
+    }
     const threadId =
       session.threadId ??
       (await traceCodexTask(
@@ -257,72 +507,112 @@ async function runCodexTurn(
           runtime: "codex_app_server",
           model: modelBinding.model,
           cwd: codexAppServerCwd(context),
-          external_sandbox: useCodexExternalSandbox(),
+          external_sandbox: true,
         },
-        () => startCodexThread(session.server, context, modelBinding),
+        () => startOrResumeCodexThread(session.server, context, modelBinding),
       ));
     session.threadId = threadId;
-    await recordCodexWarmSession(
-      context,
-      sessionKey,
-      session.process,
-      threadId,
-    );
-
-    const priorInjection = threadReused
-      ? emptyPriorResponseItems()
-      : messagesToResponseItems(
-          await materializePriorConversationMessages(context),
-        );
-    const priorItems = priorInjection.items;
-    if (priorItems.length > 0) {
-      await traceCodexTask(
-        turnParent,
-        "codex_thread_inject_items",
-        {
-          thread_id: threadId,
-          item_count: priorItems.length,
-          source_message_count: priorInjection.sourceMessageCount,
-          dropped_message_count: priorInjection.droppedMessageCount,
-          truncated_message_count: priorInjection.truncatedMessageCount,
-          text_chars: priorInjection.textChars,
-        },
-        () =>
-          session.server.request("thread/inject_items", {
-            threadId,
-            items: priorItems,
-          }),
+    const activeItems = new Set(unresolvedTools);
+    const projectedItems = savedTurn?.projectedItems ?? new Set<string>();
+    if (
+      session.process.reused &&
+      nativeSnapshot?.status === "inProgress" &&
+      recovery?.unansweredApproval
+    ) {
+      throw new Error(
+        "cannot reattach Codex turn with an unanswered approval; the native request was lost during restart",
       );
     }
-
-    const turnInput = messagesToUserInput(context.request.input);
-    const turnStart = await traceCodexTask(
-      turnParent,
-      "codex_turn_start",
-      {
-        thread_id: threadId,
-        model: modelBinding.model,
-        input: turnInput,
-        external_sandbox: useCodexExternalSandbox(),
-      },
-      () =>
-        session.server.request<JsonObject>("turn/start", {
+    assertNativeToolSafety(nativeSnapshot, unresolvedTools);
+    if (nativeSnapshot && savedTurn) {
+      await projectNativeSnapshot(
+        context,
+        turnParent,
+        nativeSnapshot,
+        projectedItems,
+        activeItems,
+      );
+      if (nativeSnapshot.status === "failed") {
+        throw new Error(codexTurnError(asRecord(nativeSnapshot)));
+      }
+      if (nativeSnapshot.status === "completed") {
+        await appendCustomEvent(turn, "codex_turn_completed", {
           threadId,
-          input: turnInput,
-          model: modelBinding.model,
-          approvalPolicy: "on-request",
-          sandboxPolicy: codexNativeSandboxPolicy(),
-        }),
-    );
-    await appendCustomEvent(turn, "codex_turn_started", {
-      metadata: turnMetadata(context),
-      codex_thread_id: threadId,
-      codex_turn: turnStart.turn ?? null,
-      hydrated_from: threadReused ? "warm_codex_thread" : "exoharness_events",
-      injected_response_items: priorItems.length,
-      warm_app_server_reused: appServerReused,
-      warm_thread_reused: threadReused,
-    });
+          turn: toJsonValue(nativeSnapshot),
+        });
+        await recordCodexWarmSession(
+          context,
+          sessionKey,
+          session.process,
+          threadId,
+        );
+        return null;
+      }
+    }
+    const attachingLiveTurn =
+      nativeSnapshot?.status === "inProgress" && session.process.reused;
+    const priorItems = threadReused
+      ? []
+      : codexReplayItems(
+          recovering && savedTurn
+            ? await materializeConversationMessages(
+                context.exoharness.current.conversation,
+              )
+            : await materializePriorConversationMessages(context),
+        );
+    await replayCodexHistory(session.server, threadId, priorItems);
+
+    const turnInput =
+      recovering && savedTurn ? [] : messagesToUserInput(context.request.input);
+    if (!attachingLiveTurn) {
+      await appendCustomEvent(turn, "codex_turn_start_intent", {
+        codex_thread_id: threadId,
+      });
+    }
+    const turnStart = attachingLiveTurn
+      ? null
+      : await traceCodexTask(
+          turnParent,
+          "codex_turn_start",
+          {
+            thread_id: threadId,
+            model: modelBinding.model,
+            input: turnInput,
+            external_sandbox: true,
+          },
+          () =>
+            session.server.request<JsonObject>("turn/start", {
+              threadId,
+              input: turnInput,
+              model: modelBinding.model,
+              ...(context.agentConfig.reasoningEffort
+                ? { effort: context.agentConfig.reasoningEffort }
+                : {}),
+              approvalPolicy: "on-request",
+              sandboxPolicy: {
+                type: "externalSandbox",
+                networkAccess: "restricted",
+              },
+            }),
+        );
+    const nativeTurnId = attachingLiveTurn
+      ? savedTurn?.turnId
+      : asRecord(turnStart?.turn).id;
+    if (typeof nativeTurnId !== "string") {
+      throw new Error("Codex turn/start returned no native turn ID");
+    }
+    if (turnStart) {
+      await appendCustomEvent(turn, "codex_turn_started", {
+        metadata: turnMetadata(context),
+        codex_thread_id: threadId,
+        codex_turn_id: nativeTurnId,
+        codex_turn: turnStart.turn ?? null,
+        hydrated_from: threadReused ? "warm_codex_thread" : "exoharness_events",
+        injected_response_items: priorItems.length,
+        warm_app_server_reused: appServerReused,
+        warm_thread_reused: threadReused,
+      });
+    }
 
     await traceCodexLlmTurn(
       turnParent,
@@ -333,13 +623,41 @@ async function runCodexTurn(
       modelBinding,
       async () => {
         let completed = false;
-        const activeItems = new Set<string>();
         for await (const notification of session.server.events()) {
+          if (
+            !notificationBelongsToTurn(notification, threadId, nativeTurnId)
+          ) {
+            continue;
+          }
+          if (notification.method === "turn/completed") {
+            const response = await session.server.request<JsonObject>(
+              "thread/read",
+              { threadId, includeTurns: true },
+            );
+            const completedSnapshot = nativeTurnSnapshot(
+              response,
+              nativeTurnId,
+            );
+            if (!completedSnapshot) {
+              throw new Error(
+                `Codex thread has no completed turn ${nativeTurnId}`,
+              );
+            }
+            await projectNativeSnapshot(
+              context,
+              turnParent,
+              completedSnapshot,
+              projectedItems,
+              activeItems,
+            );
+          }
           const outcome = await handleCodexNotification(
             context,
             turnParent,
             notification,
             activeItems,
+            projectedItems,
+            nativeTurnId,
             traceState,
           );
           if (outcome === "completed") {
@@ -354,6 +672,12 @@ async function runCodexTurn(
       },
     );
 
+    await recordCodexWarmSession(
+      context,
+      sessionKey,
+      session.process,
+      threadId,
+    );
     await protocolLog.flush();
     return null;
   } catch (error) {
@@ -363,7 +687,19 @@ async function runCodexTurn(
     throw error;
   } finally {
     session.clearTurnScope(scope);
-    await protocolLog.flush();
+    try {
+      if (traceState.tokenUsage) {
+        await appendEvents(context, [
+          codexUsageEvent(
+            modelBinding.model,
+            traceState.tokenUsage,
+            getTable(),
+          ),
+        ]);
+      }
+    } finally {
+      await protocolLog.flush();
+    }
   }
 }
 
@@ -400,7 +736,7 @@ async function traceCodexLlmTurn(
   threadId: string,
   injectedResponseItems: number,
   traceState: CodexTurnTraceState,
-  modelBinding: ResolvedLlmBinding,
+  modelBinding: SandboxModel,
   run: () => Promise<void>,
 ): Promise<void> {
   await tracedUnderParent(
@@ -467,6 +803,9 @@ function codexUsageMetrics(
   if (usage?.cachedInputTokens !== undefined) {
     metrics.prompt_cached_tokens = usage.cachedInputTokens;
   }
+  if (usage?.cacheWriteInputTokens !== undefined) {
+    metrics.prompt_cache_creation_tokens = usage.cacheWriteInputTokens;
+  }
   if (usage?.reasoningOutputTokens !== undefined) {
     metrics.completion_reasoning_tokens = usage.reasoningOutputTokens;
   }
@@ -497,30 +836,64 @@ function codexLlmTraceOutput(
   };
 }
 
-async function startCodexThread(
+async function startOrResumeCodexThread(
   codex: CodexAppServer,
   context: TurnContext,
-  modelBinding: ResolvedLlmBinding,
+  modelBinding: SandboxModel,
+  resumeThreadId?: string,
 ): Promise<string> {
-  const developerInstructions = codexDeveloperInstructions(context);
+  const developerInstructions = instructionsText(
+    context.agentConfig.instructions,
+  );
   const request: JsonObject = {
     model: modelBinding.model,
-    modelProvider: "openai",
+    modelProvider: "exo",
+    config: {
+      features: { tool_call_mcp_elicitation: true },
+      mcp_servers: Object.fromEntries(
+        context.mcpServers.map((server) => [
+          server.name,
+          {
+            url: server.url,
+            ...(server.environmentVariable
+              ? { bearer_token_env_var: server.environmentVariable }
+              : {}),
+            enabled_tools: server.tools.map((tool) => tool.name),
+            required: true,
+            default_tools_approval_mode: "prompt",
+          },
+        ]),
+      ),
+      model_providers: {
+        exo: {
+          name: "Exo",
+          base_url: modelBinding.baseUrl ?? "https://api.openai.com/v1",
+          env_key: "OPENAI_API_KEY",
+          wire_api: "responses",
+          supports_websockets: false,
+        },
+      },
+    },
     cwd: codexAppServerCwd(context),
     approvalPolicy: "on-request",
     sandbox: "read-only",
     dynamicTools: buildCodexDynamicTools(context),
-    ephemeral: true,
+    ...(resumeThreadId ? { threadId: resumeThreadId } : { ephemeral: false }),
     experimentalRawEvents: true,
     persistFullHistory: true,
   };
+  if (context.agentConfig.reasoningEffort) {
+    request[resumeThreadId ? "reasoningEffort" : "effort"] =
+      context.agentConfig.reasoningEffort;
+  }
   if (developerInstructions) {
     request.developerInstructions = developerInstructions;
   }
-  const response = await codex.request<JsonObject>("thread/start", request);
+  const method = resumeThreadId ? "thread/resume" : "thread/start";
+  const response = await codex.request<JsonObject>(method, request);
   const thread = response.thread;
   if (!isRecord(thread) || typeof thread.id !== "string") {
-    throw new Error("codex thread/start response did not include thread.id");
+    throw new Error(`codex ${method} response did not include thread.id`);
   }
   return thread.id;
 }
@@ -540,7 +913,8 @@ async function latestCodexWarmSession(
     if (
       record?.sessionKey === sessionKey &&
       (!process.sandboxId || record.sandboxId === process.sandboxId) &&
-      (!process.sandboxProcessId ||
+      (!process.reused ||
+        !process.sandboxProcessId ||
         record.sandboxProcessId === process.sandboxProcessId)
     ) {
       return record;
@@ -563,6 +937,7 @@ async function recordCodexWarmSession(
       sandboxId: process.sandboxId ?? null,
       sandboxProcessId: process.sandboxProcessId ?? null,
       threadId,
+      completed: true,
     },
   );
 }
@@ -574,7 +949,7 @@ function codexWarmSessionRecord(
     return null;
   }
   const payload = data.payload;
-  if (!isRecord(payload)) {
+  if (!isRecord(payload) || payload.completed !== true) {
     return null;
   }
   const sessionKey = payload.sessionKey;
@@ -600,12 +975,26 @@ async function handleCodexServerRequest(
   context: TurnContext,
   turnParent: TraceParent,
   request: CodexServerRequest,
+  mcpCalls: Map<string, PendingToolCall>,
 ): Promise<JsonValue | undefined> {
-  if (
-    useCodexExternalSandbox() &&
-    request.method === "item/commandExecution/requestApproval"
-  ) {
-    return { decision: "accept" };
+  if (request.method === "mcpServer/elicitation/request") {
+    return authorizeMcpElicitation(context, asRecord(request.params), mcpCalls);
+  }
+  if (request.method === "item/commandExecution/requestApproval") {
+    const params = asRecord(request.params);
+    if (typeof params.command !== "string") return { decision: "decline" };
+    try {
+      await context.authorizeTool({
+        functionName: CODEX_SHELL_TOOL,
+        arguments: objectArgs({
+          command: params.command,
+          cwd: stringOrNull(params.cwd),
+        }),
+      });
+      return { decision: "accept" };
+    } catch {
+      return { decision: "decline" };
+    }
   }
   if (request.method !== "item/tool/call") {
     return undefined;
@@ -620,21 +1009,18 @@ async function executeDynamicToolCall(
 ): Promise<JsonValue> {
   const callId = stringOrNull(params.callId) ?? "dynamic-tool-call";
   const toolName = stringOrNull(params.tool);
-  if (toolName !== EXO_SHELL_DYNAMIC_TOOL) {
+  if (!context.tools.some((tool) => tool.name === toolName)) {
     return dynamicToolErrorResponse(`unsupported dynamic tool: ${toolName}`);
   }
-
-  const args = asRecord(params.arguments);
-  const command = stringOrNull(args.command);
-  if (!command) {
-    return dynamicToolErrorResponse("exo_shell requires a command string");
+  const args = objectArgs(asRecord(params.arguments));
+  if (!toolName) {
+    return dynamicToolErrorResponse("missing tool name");
   }
-
   const toolCall: PendingToolCall = {
     toolCallId: callId,
     request: {
-      functionName: EXO_SHELL_TOOL,
-      arguments: objectArgs({ command }),
+      functionName: toolName,
+      arguments: args,
     },
   };
   await appendEvents(context, [toolRequestedEvent(toolCall)]);
@@ -647,9 +1033,7 @@ async function executeDynamicToolCall(
       "codex_dynamic_tool",
     );
     await appendEvents(context, [toolResultEvent(callId, result)]);
-    return dynamicToolResultResponse(shellToolResultText(result), {
-      success: shellToolSucceeded(result),
-    });
+    return dynamicToolResultResponse(JSON.stringify(result), { success: true });
   } catch (error) {
     const message = errorMessage(error);
     await appendEvents(context, [
@@ -664,21 +1048,15 @@ async function handleCodexNotification(
   turnParent: TraceParent,
   notification: CodexNotification,
   activeItems: Set<string>,
+  projectedItems: Set<string>,
+  nativeTurnId: string,
   traceState: CodexTurnTraceState,
 ): Promise<"running" | "completed"> {
   const { turn } = context.exoharness.current;
   updateTraceStateFromNotification(notification, traceState);
   switch (notification.method) {
-    case "rawResponseItem/completed": {
-      const params = asRecord(notification.params);
-      const item = toJsonValue(params.item);
-      await appendCustomEvent(turn, "codex_raw_response_item", {
-        thread_id: params.threadId ?? null,
-        turn_id: params.turnId ?? null,
-        item,
-      });
+    case "rawResponseItem/completed":
       return "running";
-    }
     case "item/agentMessage/delta": {
       const params = asRecord(notification.params);
       if (typeof params.delta === "string") {
@@ -692,25 +1070,24 @@ async function handleCodexNotification(
     }
     case "item/started": {
       const item = notificationItem(notification);
-      const events = projectStartedItem(item, activeItems);
+      const itemId = itemIdFromItem(item);
+      if (itemId && projectedItems.has(`${nativeTurnId}:${itemId}`)) {
+        return "running";
+      }
+      const events = projectStartedItem(context, item, activeItems);
       await appendEvents(context, events);
       return "running";
     }
     case "item/completed": {
       const item = notificationItem(notification);
-      const events = projectCompletedItem(item, activeItems);
-      await appendEvents(context, events);
-      const itemId = itemIdFromItem(item);
-      const toolCall = itemId ? toolCallFromCodexItem(item, itemId) : null;
-      if (toolCall) {
-        await traceObservedToolCall(
-          context,
-          turnParent,
-          toolCall,
-          toolResultFromCodexItem(item),
-          "codex_observed_tool",
-        );
-      }
+      await projectNativeItem(
+        context,
+        turnParent,
+        item,
+        nativeTurnId,
+        activeItems,
+        projectedItems,
+      );
       return "running";
     }
     case "turn/plan/updated":
@@ -731,7 +1108,7 @@ async function handleCodexNotification(
       const params = asRecord(notification.params);
       const completedTurn = asRecord(params.turn);
       const status = completedTurn.status;
-      if (status === "failed") {
+      if (status !== "completed") {
         const message = codexTurnError(completedTurn);
         await streamCodexStatus(context, traceState, `error: ${message}`);
         throw new Error(message);
@@ -761,7 +1138,106 @@ async function handleCodexNotification(
   }
 }
 
+function notificationBelongsToTurn(
+  notification: CodexNotification,
+  threadId: string,
+  turnId: string,
+): boolean {
+  const params = asRecord(notification.params);
+  if (typeof params.threadId === "string" && params.threadId !== threadId) {
+    return false;
+  }
+  const eventTurnId =
+    notification.method === "turn/completed"
+      ? asRecord(params.turn).id
+      : params.turnId;
+  return typeof eventTurnId !== "string" || eventTurnId === turnId;
+}
+
+async function projectNativeSnapshot(
+  context: TurnContext,
+  turnParent: TraceParent,
+  snapshot: NativeTurnSnapshot,
+  projectedItems: Set<string>,
+  activeItems: Set<string>,
+): Promise<void> {
+  const events: EventData[] = [];
+  const observed: Array<{ call: PendingToolCall; result: JsonValue }> = [];
+  for (const item of snapshot.items) {
+    // Items without a status may still be changing in a live turn.
+    if (snapshot.status === "inProgress" && !("status" in item)) {
+      continue;
+    }
+    if (nativeItemComplete(item)) {
+      const itemId = itemIdFromItem(item);
+      const key = itemId ? `${snapshot.id}:${itemId}` : null;
+      if (key && projectedItems.has(key)) continue;
+      events.push(...projectCompletedItem(context, item, activeItems));
+      if (itemId) {
+        events.push(
+          customItemEvent("codex_item_projected", {
+            turn_id: snapshot.id,
+            item_id: itemId,
+          }),
+        );
+      }
+      if (key) projectedItems.add(key);
+      const call = itemId ? toolCallFromCodexItem(context, item, itemId) : null;
+      if (call) observed.push({ call, result: toolResultFromCodexItem(item) });
+    } else {
+      events.push(...projectStartedItem(context, item, activeItems));
+    }
+  }
+  await appendEvents(context, events);
+  await Promise.all(
+    observed.map(({ call, result }) =>
+      traceObservedToolCall(
+        context,
+        turnParent,
+        call,
+        result,
+        "codex_observed_tool",
+      ),
+    ),
+  );
+}
+
+async function projectNativeItem(
+  context: TurnContext,
+  turnParent: TraceParent,
+  item: Record<string, unknown>,
+  nativeTurnId: string,
+  activeItems: Set<string>,
+  projectedItems: Set<string>,
+): Promise<void> {
+  const itemId = itemIdFromItem(item);
+  const key = itemId ? `${nativeTurnId}:${itemId}` : null;
+  if (key && projectedItems.has(key)) return;
+  const events = projectCompletedItem(context, item, activeItems);
+  if (itemId) {
+    events.push(
+      customItemEvent("codex_item_projected", {
+        turn_id: nativeTurnId,
+        item_id: itemId,
+      }),
+    );
+  }
+  await appendEvents(context, events);
+  if (key) projectedItems.add(key);
+  const toolCall = itemId ? toolCallFromCodexItem(context, item, itemId) : null;
+  if (toolCall) {
+    await traceObservedToolCall(
+      context,
+      turnParent,
+      toolCall,
+      toolResultFromCodexItem(item),
+      "codex_observed_tool",
+    );
+  }
+}
+
 function projectStartedItem(
+  context: TurnContext,
   item: Record<string, unknown>,
   activeItems: Set<string>,
 ): EventData[] {
@@ -769,8 +1245,8 @@ function projectStartedItem(
   if (!itemId) {
     return [];
   }
-  const toolCall = toolCallFromCodexItem(item, itemId);
-  if (!toolCall) {
+  const toolCall = toolCallFromCodexItem(context, item, itemId);
+  if (!toolCall || activeItems.has(itemId)) {
     return [];
   }
   activeItems.add(itemId);
@@ -778,6 +1254,7 @@ function projectStartedItem(
 }
 
 function projectCompletedItem(
+  context: TurnContext,
   item: Record<string, unknown>,
   activeItems: Set<string>,
 ): EventData[] {
@@ -792,7 +1269,7 @@ function projectCompletedItem(
   }
 
   const events: EventData[] = [];
-  const toolCall = toolCallFromCodexItem(item, itemId);
+  const toolCall = toolCallFromCodexItem(context, item, itemId);
   if (toolCall && !activeItems.has(itemId)) {
     events.push(toolRequestedEvent(toolCall));
   }
@@ -815,6 +1292,7 @@ function projectCompletedItem(
 }
 
 function toolCallFromCodexItem(
+  context: TurnContext,
   item: Record<string, unknown>,
   itemId: string,
 ): PendingToolCall | null {
@@ -835,12 +1313,12 @@ function toolCallFromCodexItem(
     return {
       toolCallId: itemId,
       request: {
-        functionName: `codex.mcp.${String(item.server ?? "unknown")}.${String(item.tool ?? "unknown")}`,
-        arguments: objectArgs({
-          server: stringOrNull(item.server),
-          tool: stringOrNull(item.tool),
-          arguments: toJsonValue(item.arguments ?? null),
-        }),
+        functionName: codexMcpToolName(
+          context.mcpServers,
+          String(item.server),
+          String(item.tool),
+        ),
+        arguments: objectArgs(asRecord(item.arguments)),
       },
     };
   }
@@ -883,100 +1361,6 @@ function toolResultFromCodexItem(item: Record<string, unknown>): JsonValue {
   });
 }
 
-function emptyPriorResponseItems(): PriorResponseItems {
-  return {
-    items: [],
-    sourceMessageCount: 0,
-    droppedMessageCount: 0,
-    truncatedMessageCount: 0,
-    textChars: 0,
-  };
-}
-
-function messagesToResponseItems(messages: Message[]): PriorResponseItems {
-  const candidates = messages
-    .filter(
-      (message) => message.role !== "system" && message.role !== "developer",
-    )
-    .map(priorMessageToResponseItemCandidate);
-  const selected: PriorResponseItemCandidate[] = [];
-  let textChars = 0;
-  let droppedMessageCount = 0;
-
-  for (let index = candidates.length - 1; index >= 0; index -= 1) {
-    const candidate = candidates[index];
-    if (
-      selected.length > 0 &&
-      textChars + candidate.textChars > CODEX_PRIOR_HISTORY_MAX_CHARS
-    ) {
-      droppedMessageCount += 1;
-      continue;
-    }
-    selected.push(candidate);
-    textChars += candidate.textChars;
-  }
-
-  selected.reverse();
-  return {
-    items: selected.map((candidate) => candidate.item),
-    sourceMessageCount: candidates.length,
-    droppedMessageCount,
-    truncatedMessageCount: candidates.filter((candidate) => candidate.truncated)
-      .length,
-    textChars,
-  };
-}
-
-function priorMessageToResponseItemCandidate(
-  message: Message,
-): PriorResponseItemCandidate {
-  const { text, truncated } = truncatePriorMessageText(
-    messageText(message),
-    priorMessageMaxChars(message),
-  );
-  if (message.role === "assistant") {
-    return {
-      item: toJsonValue({
-        type: "message",
-        role: "assistant",
-        content: [{ type: "output_text", text }],
-      }),
-      textChars: text.length,
-      truncated,
-    };
-  }
-  return {
-    item: toJsonValue({
-      type: "message",
-      role: "user",
-      content: [{ type: "input_text", text }],
-    }),
-    textChars: text.length,
-    truncated,
-  };
-}
-
-function priorMessageMaxChars(message: Message): number {
-  return message.role === "tool"
-    ? CODEX_PRIOR_TOOL_RESULT_MAX_CHARS
-    : CODEX_PRIOR_MESSAGE_MAX_CHARS;
-}
-
-function truncatePriorMessageText(
-  text: string,
-  maxChars: number,
-): { text: string; truncated: boolean } {
-  if (text.length <= maxChars) {
-    return { text, truncated: false };
-  }
-  const omittedChars = text.length - maxChars;
-  const suffix = `\n\n[truncated ${omittedChars} characters from prior conversation history]`;
-  return {
-    text: `${text.slice(0, Math.max(0, maxChars - suffix.length))}${suffix}`,
-    truncated: true,
-  };
-}
-
 function messagesToUserInput(messages: Message[]): JsonValue[] {
   const text = messages
     .filter((message) => message.role === "user")
@@ -991,51 +1375,19 @@ function messagesToUserInput(messages: Message[]): JsonValue[] {
   ];
 }
 
-function codexDeveloperInstructions(context: TurnContext): string | null {
-  return instructionsText(context.agentConfig.instructions) || null;
-}
-
 function buildCodexDynamicTools(context: TurnContext): JsonValue[] {
-  if (useCodexExternalSandbox()) {
-    return [];
-  }
-  if (!context.conversationConfig.shellProgram) {
-    return [];
-  }
-  return [
-    {
-      name: EXO_SHELL_DYNAMIC_TOOL,
-      description: `Run a shell command through the exoharness sandbox. Commands execute from ${sandboxCwd(context)}. Use this for command execution in exo conversations.`,
-      inputSchema: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          command: {
-            type: "string",
-            description: "Shell command to execute.",
-          },
-        },
-        required: ["command"],
-      },
-    },
-  ];
-}
-
-function codexNativeSandboxPolicy(): JsonValue {
-  if (useCodexExternalSandbox()) {
-    return {
-      type: "externalSandbox",
-      networkAccess: "restricted",
-    };
-  }
-  return {
-    type: "readOnly",
-    networkAccess: false,
-  };
-}
-
-function useCodexExternalSandbox(): boolean {
-  return true;
+  const nativeTools = new Set(
+    context.mcpServers.flatMap((server) =>
+      server.tools.map((tool) => tool.exposedName),
+    ),
+  );
+  return context.tools
+    .filter((tool) => !nativeTools.has(tool.name))
+    .map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      inputSchema: tool.parameters,
+    }));
 }
 
 async function requireCodexSandboxNetworking(
@@ -1060,7 +1412,7 @@ async function requireCodexSandboxNetworking(
 function codexSandboxNetworkingError(context: TurnContext): string {
   return [
     "Codex requires agent networking because it runs model calls inside the exoharness sandbox.",
-    `Enable it with: exo agent update ${context.exoharness.current.agent.record.slug} --networking enabled`,
+    `Set sandbox.enable_networking to true in the agent spec, then run: exo agent update ${context.exoharness.current.agent.record.slug} --file agent.md`,
   ].join(" ");
 }
 
@@ -1072,39 +1424,21 @@ function codexSandboxCommand(context: TurnContext): string[] {
   const shell = context.conversationConfig.shellProgram ?? "/bin/bash";
   const command = [
     "set -e;",
-    'mkdir -p "${HOME:-/tmp/exo-home}" "${CODEX_HOME:-/tmp/exo-codex-home}" >/dev/null 2>/tmp/codex-setup.stderr;',
-    'if [ -n "${OPENAI_API_KEY:-}" ] && [ ! -f "${CODEX_HOME:-/tmp/exo-codex-home}/auth.json" ]; then',
-    'printf "%s" "$OPENAI_API_KEY" | codex login --with-api-key >/dev/null 2>/tmp/codex-login.stderr;',
-    "fi;",
-    "exec codex app-server --listen stdio:// 2>/tmp/codex-app-server.stderr",
+    'mkdir -p "${HOME:-/tmp/exo-home}" "${CODEX_HOME:-/tmp/exo-codex-home}";',
+    `test "$(codex --version)" = "codex-cli ${CODEX_VERSION}" || { echo "Expected Codex ${CODEX_VERSION}; rebuild the Codex sandbox image" >&2; exit 1; };`,
+    "exec codex app-server --listen stdio://",
   ].join(" ");
   return [shell, "-lc", command];
 }
 
-function codexSandboxEnv(
-  modelBinding: ResolvedLlmBinding,
-): Record<string, string> {
-  const env: Record<string, string> = {
-    ...pickEnv(
-      (key) =>
-        [
-          "BRAINTRUST_API_KEY",
-          "BRAINTRUST_APP_URL",
-          "OPENAI_ORG_ID",
-          "OPENAI_ORGANIZATION",
-          "OPENAI_PROJECT",
-        ].includes(key) || key.startsWith("CODEX_"),
+function codexSandboxEnv(): Record<string, string> {
+  return {
+    ...pickEnv((key) =>
+      ["OPENAI_ORG_ID", "OPENAI_ORGANIZATION", "OPENAI_PROJECT"].includes(key),
     ),
     CODEX_HOME: "/tmp/exo-codex-home",
     HOME: "/tmp/exo-home",
   };
-  if (modelBinding.apiKey) {
-    env.OPENAI_API_KEY = modelBinding.apiKey;
-  }
-  if (modelBinding.baseUrl) {
-    env.OPENAI_BASE_URL = modelBinding.baseUrl;
-  }
-  return env;
 }
 
 function dynamicToolResultResponse(
@@ -1156,20 +1490,22 @@ function codexSandboxRuntimeKey(context: TurnContext): JsonValue {
       internal: mount.internal ?? false,
     })),
     command: codexSandboxCommand(context),
-    external_sandbox: useCodexExternalSandbox(),
+    external_sandbox: true,
   };
 }
 
 function codexWarmSessionKey(
   context: TurnContext,
-  modelBinding: ResolvedLlmBinding,
+  modelBinding: SandboxModel,
 ): string {
   return JSON.stringify({
     agent_id: context.exoharness.current.agent.record.id,
     conversation_id: context.exoharness.current.conversation.record.id,
-    model_binding: modelBinding.name,
     model: modelBinding.model,
+    reasoning_effort: context.agentConfig.reasoningEffort ?? null,
     base_url: modelBinding.baseUrl ?? null,
+    instructions: context.agentConfig.instructions,
+    mcp_servers: context.mcpServers,
     sandbox_runtime: codexSandboxRuntimeKey(context),
   });
 }
@@ -1258,18 +1594,6 @@ function updateTraceStateFromNotification(
     }
     return;
   }
-  if (notification.method === "thread/tokenUsage/updated") {
-    const params = asRecord(notification.params);
-    const tokenUsage = asRecord(params.tokenUsage);
-    const last = asRecord(tokenUsage.last);
-    traceState.tokenUsage = {
-      inputTokens: numberField(last.inputTokens),
-      outputTokens: numberField(last.outputTokens),
-      totalTokens: numberField(last.totalTokens),
-      cachedInputTokens: numberField(last.cachedInputTokens),
-      reasoningOutputTokens: numberField(last.reasoningOutputTokens),
-    };
-  }
 }
 
 function rawCodexPromptMessage(item: Record<string, unknown>): Message | null {
@@ -1279,7 +1603,7 @@ function rawCodexPromptMessage(item: Record<string, unknown>): Message | null {
   if (!isRawCodexPromptRole(item.role)) {
     return null;
   }
-  const messages = responsesMessagesToLingua([item]) as Message[];
+  const messages = responsesMessagesToLingua([item]);
   return messages[0] ?? null;
 }
 

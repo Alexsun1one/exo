@@ -1,11 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use exoharness::{AgentHandle, ConversationHandle, Secret, SecretId};
+use exoharness::{AgentHandle, ConversationHandle, Secret};
 use serde::Deserialize;
 use tokio::sync::Notify;
 use tokio::task::JoinSet;
@@ -25,7 +24,7 @@ use crate::conversation_events::{
     record_host_event,
 };
 use crate::conversation_wakeup::{send_conversation_wakeup, send_conversation_wakeup_content};
-use crate::{CreateConversationRequest, Harness, HarnessAgent, HarnessConversation};
+use crate::{CreateConversationRequest, Runtime};
 
 const INITIAL_RESTART_DELAY: Duration = Duration::from_secs(5);
 const MAX_RESTART_DELAY: Duration = Duration::from_secs(300);
@@ -39,6 +38,7 @@ const REBOOT_NOTICE_MAX_AGE: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug, Clone)]
 pub struct AdapterRunOptions {
+    pub shutdown: tokio_util::sync::CancellationToken,
     pub limit: usize,
     /// When this file appears, the runner claims it (removes the file), stops
     /// starting new work, lets in-flight wakeup turns finish, and exits so a
@@ -53,6 +53,7 @@ pub struct AdapterRunOptions {
 impl Default for AdapterRunOptions {
     fn default() -> Self {
         Self {
+            shutdown: Default::default(),
             limit: 10,
             drain_marker: None,
             reboot_notice: None,
@@ -70,12 +71,12 @@ pub struct RebootNotice {
 }
 
 pub async fn run_adapters_watch(
-    harness: Arc<dyn Harness>,
+    harness: Arc<Runtime>,
     store: AdapterStore,
     options: AdapterRunOptions,
 ) -> Result<()> {
     let running = Arc::new(Mutex::new(HashSet::<String>::new()));
-    let drain = Arc::new(AtomicBool::new(false));
+    let drain = options.shutdown.clone();
     let mut supervisors = JoinSet::new();
     if let Some(notice) = claim_reboot_notice(options.reboot_notice.as_deref()) {
         // The wakeup turn can take minutes; run it in the background so the
@@ -107,9 +108,9 @@ pub async fn run_adapters_watch(
         });
     }
     loop {
-        if claim_drain_marker(options.drain_marker.as_deref()) {
+        if options.shutdown.is_cancelled() || claim_drain_marker(options.drain_marker.as_deref()) {
             tracing::info!("adapter runner drain requested; waiting for in-flight work");
-            drain.store(true, Ordering::SeqCst);
+            drain.cancel();
             record_host_event_for_adapter_conversations(
                 harness.as_ref(),
                 &store,
@@ -131,7 +132,7 @@ pub async fn run_adapters_watch(
             let harness = Arc::clone(&harness);
             let store = store.clone();
             let running = Arc::clone(&running);
-            let drain = Arc::clone(&drain);
+            let drain = drain.clone();
             supervisors.spawn(async move {
                 let adapter_id = adapter.id.clone();
                 supervise_adapter(harness, store, adapter, drain).await;
@@ -144,7 +145,10 @@ pub async fn run_adapters_watch(
         // Reap finished supervision tasks so the JoinSet does not grow
         // unboundedly while the runner stays up.
         while supervisors.try_join_next().is_some() {}
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        tokio::select! {
+            _ = options.shutdown.cancelled() => {},
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+        }
     }
     while supervisors.join_next().await.is_some() {}
     tracing::info!("adapter runner drained; exiting for restart");
@@ -197,7 +201,7 @@ fn claim_reboot_notice(notice_path: Option<&std::path::Path>) -> Option<RebootNo
 /// conversation rather than propagated: a missing conversation must not block
 /// the event from reaching the others.
 async fn record_host_event_for_adapter_conversations(
-    harness: &dyn Harness,
+    harness: &Runtime,
     store: &AdapterStore,
     event_type: &str,
     payload: serde_json::Value,
@@ -217,12 +221,7 @@ async fn record_host_event_for_adapter_conversations(
         let result = async {
             let agent = require_agent(harness, adapter).await?;
             let conversation = require_conversation(agent.as_ref(), adapter).await?;
-            record_host_event(
-                conversation.exoharness_handle().as_ref(),
-                event_type,
-                payload.clone(),
-            )
-            .await
+            record_host_event(conversation.as_ref(), event_type, payload.clone()).await
         }
         .await;
         if let Err(error) = result {
@@ -237,7 +236,7 @@ async fn record_host_event_for_adapter_conversations(
 }
 
 async fn announce_reboot(
-    harness: Arc<dyn Harness>,
+    harness: Arc<Runtime>,
     store: AdapterStore,
     notice: RebootNotice,
 ) -> Result<()> {
@@ -263,7 +262,7 @@ async fn announce_reboot(
         // Record the reboot in the canonical event log before the wakeup turn
         // so the immutable history exists even if the announcement turn fails.
         if let Err(error) = record_host_event(
-            conversation.exoharness_handle().as_ref(),
+            conversation.as_ref(),
             HOST_EVENT_REBOOT,
             serde_json::json!({
                 "reason": notice.reason,
@@ -279,7 +278,7 @@ async fn announce_reboot(
             );
         }
         send_conversation_wakeup(
-            conversation.as_ref(),
+            harness.as_ref(), &agent, &conversation,
             format!(
                 "Host services were restarted (reason: {reason}, requested at {requested_at}) and the adapter runner is back up. Adapter workers for {adapter_names} are reconnecting now. If you announced this reboot externally, or external users should know you are back, announce your return with send_adapter_message on the relevant adapters and targets; outbound messages queue durably and deliver once the adapter reconnects. If no announcement is appropriate, do nothing.",
             ),
@@ -296,14 +295,14 @@ async fn announce_reboot(
 }
 
 async fn supervise_adapter(
-    harness: Arc<dyn Harness>,
+    harness: Arc<Runtime>,
     store: AdapterStore,
     adapter: AdapterRecord,
-    drain: Arc<AtomicBool>,
+    drain: tokio_util::sync::CancellationToken,
 ) {
     let mut restart_delay = INITIAL_RESTART_DELAY;
     loop {
-        if drain.load(Ordering::SeqCst) {
+        if drain.is_cancelled() {
             break;
         }
         match store.get_adapter(&adapter.id).await {
@@ -324,13 +323,8 @@ async fn supervise_adapter(
             }
         }
         let started_at = Instant::now();
-        if let Err(error) = run_adapter_loop(
-            Arc::clone(&harness),
-            &store,
-            adapter.clone(),
-            Arc::clone(&drain),
-        )
-        .await
+        if let Err(error) =
+            run_adapter_loop(Arc::clone(&harness), &store, adapter.clone(), drain.clone()).await
         {
             if started_at.elapsed() >= STABLE_RUN_THRESHOLD {
                 restart_delay = INITIAL_RESTART_DELAY;
@@ -362,12 +356,18 @@ async fn supervise_adapter(
                     "failed to record adapter error"
                 );
             }
-            tokio::time::sleep(restart_delay).await;
+            tokio::select! {
+                _ = drain.cancelled() => break,
+                _ = tokio::time::sleep(restart_delay) => {},
+            }
             restart_delay = (restart_delay * 2).min(MAX_RESTART_DELAY);
             continue;
         }
         restart_delay = INITIAL_RESTART_DELAY;
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::select! {
+            _ = drain.cancelled() => break,
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+        }
     }
 }
 
@@ -422,17 +422,18 @@ pub async fn send_adapter_message_with_handles(
 }
 
 async fn run_adapter_loop(
-    harness: Arc<dyn Harness>,
+    harness: Arc<Runtime>,
     store: &AdapterStore,
     adapter: AdapterRecord,
-    drain: Arc<AtomicBool>,
+    drain: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let agent = require_agent(harness.as_ref(), &adapter).await?;
     let conversation = require_conversation(agent.as_ref(), &adapter).await?;
     store.requeue_inflight_messages(&adapter.id).await?;
     let config = adapter.config.clone();
-    let secret_env = worker_secret_env(agent.exoharness_handle().as_ref(), &config).await?;
+    let secret_env = worker_secret_env(harness.exoharness_handle().as_ref(), &config).await?;
     let outbound_notifier = register_adapter_outbound_notifier(&adapter.id);
+    let event_runtime = Arc::clone(&harness);
     let event_store = store.clone();
     let event_adapter = adapter.clone();
     let event_agent = std::sync::Arc::clone(&agent);
@@ -448,6 +449,7 @@ async fn run_adapter_loop(
         secret_env,
         Arc::clone(&outbound_notifier.notify),
         move |event| {
+            let harness = Arc::clone(&event_runtime);
             let store = event_store.clone();
             let adapter = event_adapter.clone();
             let agent = std::sync::Arc::clone(&event_agent);
@@ -455,8 +457,9 @@ async fn run_adapter_loop(
             let config = event_config.clone();
             async move {
                 handle_worker_event(
+                    harness.as_ref(),
                     &store,
-                    agent.as_ref(),
+                    &agent,
                     conversation,
                     &adapter,
                     &config,
@@ -485,9 +488,9 @@ async fn run_adapter_loop(
         move || {
             let store = stop_store.clone();
             let adapter_id = stop_adapter_id.clone();
-            let drain = Arc::clone(&drain);
+            let drain = drain.clone();
             async move {
-                if drain.load(Ordering::SeqCst) {
+                if drain.is_cancelled() {
                     return Ok(true);
                 }
                 Ok(store
@@ -547,9 +550,10 @@ fn adapter_outbound_notifiers() -> &'static Mutex<HashMap<String, Weak<Notify>>>
 }
 
 async fn handle_worker_event(
+    harness: &Runtime,
     store: &AdapterStore,
-    agent: &dyn HarnessAgent,
-    root_conversation: Arc<dyn HarnessConversation>,
+    agent: &Arc<dyn AgentHandle>,
+    root_conversation: Arc<dyn ConversationHandle>,
     adapter: &AdapterRecord,
     config: &AdapterConfig,
     event: WorkerEvent,
@@ -576,8 +580,9 @@ async fn handle_worker_event(
             attachments,
         } => {
             let conversation = resolve_message_conversation(
+                harness,
                 store,
-                agent,
+                agent.as_ref(),
                 root_conversation,
                 adapter,
                 config,
@@ -586,8 +591,10 @@ async fn handle_worker_event(
             )
             .await?;
             handle_worker_message(
+                harness,
+                agent,
                 store,
-                conversation.as_ref(),
+                &conversation,
                 adapter,
                 config,
                 target,
@@ -679,19 +686,23 @@ async fn handle_worker_event(
 }
 
 async fn resolve_message_conversation(
+    harness: &Runtime,
     store: &AdapterStore,
-    agent: &dyn HarnessAgent,
-    root_conversation: Arc<dyn HarnessConversation>,
+    agent: &dyn AgentHandle,
+    root_conversation: Arc<dyn ConversationHandle>,
     adapter: &AdapterRecord,
     config: &AdapterConfig,
     target: &str,
     _metadata: &serde_json::Value,
-) -> Result<Arc<dyn HarnessConversation>> {
+) -> Result<Arc<dyn ConversationHandle>> {
     if !uses_target_conversation_scope(config) {
         return Ok(root_conversation);
     }
     if let Some(record) = store.get_target_conversation(&adapter.id, target).await? {
-        if let Some(conversation) = agent.get_conversation(&record.conversation_id).await? {
+        if let Some(conversation) = harness
+            .get_conversation(agent, &record.conversation_id)
+            .await?
+        {
             return Ok(conversation);
         }
         tracing::warn!(
@@ -704,17 +715,20 @@ async fn resolve_message_conversation(
 
     let slug = target_conversation_slug(adapter, target);
     let name = format!("{} target {}", adapter.name, target);
-    let conversation = match agent
-        .create_conversation(CreateConversationRequest {
-            slug: Some(slug.clone()),
-            name: Some(name),
-            ..Default::default()
-        })
+    let conversation = match harness
+        .create_conversation(
+            agent,
+            CreateConversationRequest {
+                slug: Some(slug.clone()),
+                name: Some(name),
+                ..Default::default()
+            },
+        )
         .await
     {
         Ok(conversation) => conversation,
         Err(error) => {
-            if let Some(conversation) = agent.get_conversation(&slug).await? {
+            if let Some(conversation) = harness.get_conversation(agent, &slug).await? {
                 conversation
             } else {
                 return Err(error).with_context(|| {
@@ -769,8 +783,10 @@ const MAX_INBOUND_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_worker_message(
+    harness: &Runtime,
+    agent: &Arc<dyn AgentHandle>,
     store: &AdapterStore,
-    conversation: &dyn HarnessConversation,
+    conversation: &Arc<dyn ConversationHandle>,
     adapter: &AdapterRecord,
     config: &AdapterConfig,
     target: String,
@@ -831,7 +847,8 @@ async fn handle_worker_message(
         parts.extend(image_parts);
         UserContent::Array(parts)
     };
-    let wakeup_result = send_conversation_wakeup_content(conversation, content).await;
+    let wakeup_result =
+        send_conversation_wakeup_content(harness, agent, conversation, content).await;
     // A failed model turn must not tear down the worker: the external
     // connection is healthy and dropping it loses every queued message.
     // Record the failure and keep processing events.
@@ -986,7 +1003,7 @@ fn compose_inbound_wakeup_prompt(
 
 async fn record_worker_lifecycle(
     store: &AdapterStore,
-    _conversation: &dyn HarnessConversation,
+    _conversation: &dyn ConversationHandle,
     adapter: &AdapterRecord,
     config: &AdapterConfig,
     event_type: &str,
@@ -1019,10 +1036,7 @@ async fn record_worker_lifecycle(
     Ok(())
 }
 
-async fn require_agent(
-    harness: &dyn Harness,
-    adapter: &AdapterRecord,
-) -> Result<Arc<dyn HarnessAgent>> {
+async fn require_agent(harness: &Runtime, adapter: &AdapterRecord) -> Result<Arc<dyn AgentHandle>> {
     harness
         .get_agent(&adapter.agent_id)
         .await?
@@ -1030,11 +1044,10 @@ async fn require_agent(
 }
 
 async fn require_conversation(
-    agent: &dyn HarnessAgent,
+    agent: &dyn AgentHandle,
     adapter: &AdapterRecord,
-) -> Result<Arc<dyn HarnessConversation>> {
-    agent
-        .get_conversation(&adapter.conversation_id)
+) -> Result<Arc<dyn ConversationHandle>> {
+    crate::harness_helpers::resolve_conversation_handle(agent, &adapter.conversation_id)
         .await?
         .ok_or_else(|| {
             anyhow!(
@@ -1045,40 +1058,109 @@ async fn require_conversation(
 }
 
 async fn worker_secret_env(
-    agent: &dyn AgentHandle,
+    agent: &dyn exoharness::vault::VaultContext,
     config: &AdapterConfig,
 ) -> Result<Vec<(String, String)>> {
     let mut env = Vec::new();
     for secret_env in &config.secret_env {
-        let secret_uuid = resolve_secret_id(agent, &secret_env.secret_id).await?;
-        let Some(secret) = agent.get_secret(&secret_uuid).await? else {
-            bail!("adapter secret not found: {}", secret_env.secret_id);
-        };
+        let vault = exo_managed_agents::vaults::find_vault(
+            agent,
+            secret_env.vault.as_deref().unwrap_or("global"),
+        )
+        .await?;
+        let secrets = vault.list_secrets().await?;
+        let id = secret_env.secret_id.parse::<exoharness::SecretId>().ok();
+        let metadata = secrets
+            .iter()
+            .find(|secret| {
+                id.map_or_else(|| secret.name == secret_env.secret_id, |id| secret.id == id)
+            })
+            .with_context(|| format!("adapter secret not found: {}", secret_env.secret_id))?;
+        let secret = vault
+            .get_secret(&metadata.id)
+            .await?
+            .with_context(|| format!("adapter secret not found: {}", secret_env.secret_id))?;
         let value = match secret {
             Secret::Key { value } => value,
-            Secret::Oauth { .. } => bail!("adapter worker secrets must be key secrets"),
+            Secret::Oauth { .. } | Secret::GithubCli { .. } => {
+                bail!("adapter worker secrets must be key secrets")
+            }
         };
         env.push((secret_env.env.clone(), value));
     }
     Ok(env)
 }
 
-async fn resolve_secret_id(agent: &dyn AgentHandle, reference: &str) -> Result<SecretId> {
-    if let Ok(secret_id) = reference.parse() {
-        return Ok(secret_id);
-    }
-    agent
-        .list_secrets()
-        .await?
-        .into_iter()
-        .find(|secret| secret.name == reference)
-        .map(|secret| secret.id)
-        .ok_or_else(|| anyhow!("adapter secret not found: {reference}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn attached_vault_cannot_shadow_adapter_credentials() -> Result<()> {
+        use super::super::types::WorkerSecretEnvVar;
+        use exoharness::ExoHarness;
+        let temp = tempfile::TempDir::new()?;
+        let harness =
+            exoharness::BasicExoHarness::new(crate::test_support::local_test_config(temp.path()))
+                .await?;
+        let global = exoharness::vault::global_vault(&harness).await?;
+        let user = harness.create_vault("user").await?;
+        let mut original = None;
+        for (vault, value) in [(&global, "runtime-token"), (&user, "shadow-token")] {
+            let id = vault
+                .put_secret(exoharness::PutSecretRequest {
+                    name: "adapter".into(),
+                    policy: None,
+                    secret: Secret::Key {
+                        value: value.into(),
+                    },
+                })
+                .await?;
+            if value == "runtime-token" {
+                original = Some(id);
+            }
+        }
+        let agent = harness
+            .new_agent(exoharness::NewAgentRequest {
+                slug: "adapter".into(),
+                name: "Adapter".into(),
+                vaults: vec![user.record().id],
+            })
+            .await?;
+        for reference in ["adapter".to_owned(), original.unwrap().to_string()] {
+            let config = AdapterConfig {
+                adapter_type: "test".into(),
+                worker_command: Vec::new(),
+                initialization: serde_json::Value::Null,
+                state_dir: None,
+                secret_env: vec![WorkerSecretEnvVar {
+                    vault: None,
+                    env: "TOKEN".into(),
+                    secret_id: reference,
+                }],
+            };
+            assert_eq!(
+                worker_secret_env(agent.as_ref(), &config).await?,
+                vec![("TOKEN".into(), "runtime-token".into())]
+            );
+        }
+        let config = AdapterConfig {
+            adapter_type: "test".into(),
+            worker_command: vec![],
+            initialization: serde_json::Value::Null,
+            state_dir: None,
+            secret_env: vec![WorkerSecretEnvVar {
+                env: "TOKEN".into(),
+                secret_id: "adapter".into(),
+                vault: Some("user".into()),
+            }],
+        };
+        assert_eq!(
+            worker_secret_env(&harness, &config).await?,
+            vec![("TOKEN".into(), "shadow-token".into())]
+        );
+        Ok(())
+    }
 
     #[test]
     fn claims_and_parses_fresh_reboot_notice() {

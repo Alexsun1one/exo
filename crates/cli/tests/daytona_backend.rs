@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 use exoharness::{
-    DaytonaConfig, DaytonaSandboxBackend, ManagedSandboxBackend, SandboxKey,
+    DaytonaConfig, DaytonaSandboxBackend, ManagedSandboxBackend, ResourceScope,
     SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy, SandboxRequest,
     SandboxSpec, SnapshotFormat, SnapshotPayload,
 };
@@ -23,18 +23,20 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Standard sandbox request used across tests. Conversation-keyed so the label
 /// format matches what the find-by-label query expects to see.
-fn make_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
+fn make_request(thread_id: exoharness::Uuid7, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
-        key: SandboxKey::ConversationSandbox {
-            thread_id: thread_id.into(),
-            sandbox_id: sandbox_id.into(),
+        sandbox_id: sandbox_id.into(),
+        scope: ResourceScope::Thread {
+            agent_id: exoharness::Uuid7::now(),
+            thread_id,
         },
         spec: SandboxSpec {
+            tcp_ports: vec![],
             image: "docker.io/library/ubuntu:24.04".into(),
             resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            policy: SandboxNetworkPolicy::Unrestricted.into(),
             default_workdir: "/".into(),
         },
         lifecycle: SandboxLifecycleConfig {
@@ -107,7 +109,7 @@ async fn acquire_creates_when_no_warm_match() {
 
     mount_get_started(&server).await;
 
-    let request = make_request("conv-1", "sandbox-1");
+    let request = make_request(exoharness::Uuid7::now(), "sandbox-1");
     let _handle = backend
         .acquire(request)
         .await
@@ -120,7 +122,7 @@ async fn acquire_creates_when_no_warm_match() {
         .expect("POST /sandbox (create) should have been called");
     let body: Value = serde_json::from_slice(&create.body).expect("body is JSON");
 
-    // Labels carry the SandboxKey + spec hash; their absence would break
+    // Labels carry the sandbox ID + spec hash; their absence would break
     // cross-process recovery by label.
     let labels = body
         .get("labels")
@@ -142,6 +144,56 @@ async fn acquire_creates_when_no_warm_match() {
         Some("docker.io/library/ubuntu:24.04"),
         "fresh acquire should pass the requested image as `snapshot`: {body:?}"
     );
+    assert!(
+        body.get("autoDeleteInterval").is_none(),
+        "warm sandboxes must remain available after stop: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn one_shot_sandbox_skips_reuse_and_requests_delete_on_stop() {
+    let server = MockServer::start().await;
+    let backend = backend_for_mock(&server);
+    Mock::given(method("POST"))
+        .and(path("/sandbox"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(sandbox_json("sb-one-shot", "started")),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    mount_get_started(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/sandbox/sb-one-shot/stop"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut request = make_request(exoharness::Uuid7::now(), "sandbox-one-shot");
+    request.lifecycle.idle_ttl = None;
+    let first = backend.acquire(request.clone()).await.unwrap();
+    first.stop().await.unwrap();
+    backend.acquire(request).await.unwrap();
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.method.as_str() == "GET" && request.url.path() == "/sandbox"),
+        "one-shot sandboxes must not look up a prior sandbox by label"
+    );
+    for create in requests
+        .iter()
+        .filter(|request| request.method.as_str() == "POST" && request.url.path() == "/sandbox")
+    {
+        let body: Value = serde_json::from_slice(&create.body).unwrap();
+        assert_eq!(body.get("labels"), Some(&json!({})));
+        assert_eq!(
+            body.get("autoDeleteInterval").and_then(Value::as_i64),
+            Some(0)
+        );
+    }
 }
 
 #[tokio::test]
@@ -153,7 +205,7 @@ async fn acquire_reuses_running_match_without_create_or_start() {
     mount_find(&server, vec![sandbox_json("sb-running", "started")]).await;
     mount_get_started(&server).await;
 
-    let request = make_request("conv-3", "sandbox-3");
+    let request = make_request(exoharness::Uuid7::now(), "sandbox-3");
     backend
         .acquire(request)
         .await
@@ -183,7 +235,7 @@ async fn acquire_starts_stopped_match_without_creating() {
         .await;
     mount_get_started(&server).await;
 
-    let request = make_request("conv-4", "sandbox-4");
+    let request = make_request(exoharness::Uuid7::now(), "sandbox-4");
     backend
         .acquire(request)
         .await
@@ -216,7 +268,7 @@ async fn acquire_does_not_start_transient_match() {
     mount_get_started(&server).await;
 
     backend
-        .acquire(make_request("conv-12", "sandbox-12"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-12"))
         .await
         .expect("acquire should reuse the transitioning sandbox");
 
@@ -246,7 +298,7 @@ async fn acquire_replaces_dead_match_with_fresh_create() {
     mount_get_started(&server).await;
 
     backend
-        .acquire(make_request("conv-13", "sandbox-13"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-13"))
         .await
         .expect("acquire should create a fresh sandbox when the match is dead");
 
@@ -270,7 +322,7 @@ async fn acquire_rejects_host_mounts() {
     let server = MockServer::start().await;
     let backend = backend_for_mock(&server);
 
-    let mut request = make_request("conv-2", "sandbox-2");
+    let mut request = make_request(exoharness::Uuid7::now(), "sandbox-2");
     request.spec.mounts.push(SandboxMount {
         host_path: PathBuf::from("/tmp/foo"),
         guest_path: "/workspace".into(),
@@ -316,7 +368,7 @@ async fn acquire_filters_by_label_as_single_json_query_param() {
         .await;
     mount_get_started(&server).await;
 
-    let request = make_request("conv-6", "sandbox-6");
+    let request = make_request(exoharness::Uuid7::now(), "sandbox-6");
     backend.acquire(request).await.unwrap();
 
     let requests = server.received_requests().await.unwrap_or_default();
@@ -377,7 +429,7 @@ async fn stop_calls_stop_endpoint_not_delete() {
     mount_get_started(&server).await;
 
     let handle = backend
-        .acquire(make_request("conv-7", "sandbox-7"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-7"))
         .await
         .unwrap();
     handle.stop().await.expect("stop should succeed");
@@ -427,7 +479,7 @@ async fn snapshot_returns_daytona_snapshot_payload_with_manifest() {
         .await;
 
     let handle = backend
-        .acquire(make_request("conv-8", "sandbox-8"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-8"))
         .await
         .unwrap();
     let payload = handle
@@ -484,7 +536,7 @@ async fn snapshot_surfaces_feature_flag_error_on_403() {
     mount_get_started(&server).await;
 
     let handle = backend
-        .acquire(make_request("conv-flag", "sandbox-flag"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-flag"))
         .await
         .unwrap();
     let error = match handle.snapshot().await {
@@ -520,7 +572,7 @@ async fn acquire_from_snapshot_passes_snapshot_name_in_create_body() {
 
     mount_get_started(&server).await;
 
-    let request = make_request("conv-9", "sandbox-9");
+    let request = make_request(exoharness::Uuid7::now(), "sandbox-9");
     backend
         .acquire_from_snapshot(request, payload)
         .await
@@ -548,7 +600,7 @@ async fn acquire_from_snapshot_rejects_foreign_formats() {
         format: SnapshotFormat::E2bRef,
         bytes: Bytes::from_static(b"{}"),
     };
-    let request = make_request("conv-10", "sandbox-10");
+    let request = make_request(exoharness::Uuid7::now(), "sandbox-10");
     let error = match backend.acquire_from_snapshot(request, payload).await {
         Ok(_) => panic!("Daytona backend must reject an e2b-ref payload"),
         Err(e) => e,
@@ -575,7 +627,7 @@ async fn acquire_from_snapshot_bridges_docker_tar_but_fails_on_garbage() {
         format: SnapshotFormat::DockerImageTar,
         bytes: Bytes::from_static(b"\x00not-a-real-tar"),
     };
-    let request = make_request("conv-11", "sandbox-11");
+    let request = make_request(exoharness::Uuid7::now(), "sandbox-11");
     let error = match backend.acquire_from_snapshot(request, payload).await {
         Ok(_) => panic!("garbage tar bytes must not restore"),
         Err(e) => e,
@@ -620,7 +672,7 @@ async fn exec_uses_toolbox_url_not_api_url() {
     mount_get_started(&server).await;
 
     let handle = backend
-        .acquire(make_request("conv-11", "sandbox-11"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-11"))
         .await
         .unwrap();
     let output = handle
@@ -718,7 +770,7 @@ async fn start_process_streams_raw_daytona_session_logs() {
     mount_get_started(&server).await;
 
     let handle = backend
-        .acquire(make_request("conv-14", "sandbox-14"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-14"))
         .await
         .unwrap();
     let mut parts = handle
@@ -821,7 +873,7 @@ async fn start_process_streams_structured_daytona_session_logs() {
     mount_get_started(&server).await;
 
     let handle = backend
-        .acquire(make_request("conv-15", "sandbox-15"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-15"))
         .await
         .unwrap();
     let mut parts = handle
@@ -934,7 +986,7 @@ async fn start_process_seeds_env_for_daytona_session_without_leaking_secret_in_c
     mount_get_started(&server).await;
 
     let handle = backend
-        .acquire(make_request("conv-18", "sandbox-18"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-18"))
         .await
         .unwrap();
     let mut env = HashMap::new();
@@ -1033,7 +1085,7 @@ async fn start_process_reports_daytona_stdin_errors() {
     mount_get_started(&server).await;
 
     let handle = backend
-        .acquire(make_request("conv-16", "sandbox-16"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-16"))
         .await
         .unwrap();
     let mut parts = handle
@@ -1131,7 +1183,7 @@ async fn start_process_deletes_daytona_session_when_wait_is_aborted() {
     mount_get_started(&server).await;
 
     let handle = backend
-        .acquire(make_request("conv-17", "sandbox-17"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-17"))
         .await
         .unwrap();
     let parts = handle
@@ -1225,7 +1277,7 @@ async fn start_process_waits_on_exit_status_file_when_session_status_omits_exit_
     mount_get_started(&server).await;
 
     let handle = backend
-        .acquire(make_request("conv-19", "sandbox-19"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-19"))
         .await
         .unwrap();
     let mut parts = handle

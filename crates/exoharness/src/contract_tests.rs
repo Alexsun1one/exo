@@ -9,16 +9,16 @@ use tokio::time::timeout;
 use tracing::info;
 
 use crate::{
-    AddEventsRequest, BeginTurnRequest, Binding, EventData, EventKind, EventQuery,
-    EventQueryDirection, ExoHarness, ForkConversationRequest, ListConversationsRequest,
-    ListThreadsRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
-    NewConversationRequest, NewThreadRequest, SandboxCommand, SandboxRequest, ThreadHandle, Uuid7,
-    WriteArtifactRequest,
+    AddEventsRequest, BeginTurnRequest, EventData, EventKind, EventQuery, EventQueryDirection,
+    ExoHarness, ListConversationsRequest, ListThreadsRequest, ManagedSandboxBackend,
+    ManagedSandboxHandle, NewAgentRequest, NewConversationRequest, NewThreadRequest,
+    SandboxCommand, SandboxRequest, ThreadHandle, Uuid7, WriteArtifactRequest,
 };
 
 pub async fn supports_thread_api_and_conversation_compatibility(harness: Arc<dyn ExoHarness>) {
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: unique_slug("agent"),
             name: "Agent".to_string(),
         })
@@ -26,6 +26,8 @@ pub async fn supports_thread_api_and_conversation_compatibility(harness: Arc<dyn
         .expect("agent should be created");
     let thread: Arc<dyn ThreadHandle> = agent
         .new_thread(NewThreadRequest {
+            environment: None,
+            vaults: vec![],
             slug: Some(unique_slug("thread")),
             name: Some("Thread".to_string()),
         })
@@ -77,6 +79,8 @@ pub async fn supports_thread_api_and_conversation_compatibility(harness: Arc<dyn
 
     let conversation = agent
         .new_conversation(NewConversationRequest {
+            environment: None,
+            vaults: vec![],
             slug: Some(unique_slug("conversation")),
             name: Some("Conversation".to_string()),
         })
@@ -118,6 +122,7 @@ pub async fn supports_agent_and_conversation_crud(harness: Arc<dyn ExoHarness>) 
     let conversation_slug = unique_slug("conversation");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: agent_slug.clone(),
             name: "Agent".to_string(),
         })
@@ -125,6 +130,8 @@ pub async fn supports_agent_and_conversation_crud(harness: Arc<dyn ExoHarness>) 
         .expect("agent should be created");
     let conversation = agent
         .new_conversation(NewConversationRequest {
+            environment: None,
+            vaults: vec![],
             slug: Some(conversation_slug),
             name: Some("Conversation".to_string()),
         })
@@ -175,6 +182,7 @@ pub async fn supports_agent_and_conversation_crud(harness: Arc<dyn ExoHarness>) 
     // Deleting an agent must release its slug marker for reuse.
     let reused = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: agent_slug,
             name: "Agent".to_string(),
         })
@@ -191,6 +199,7 @@ pub async fn supports_agent_and_conversation_crud(harness: Arc<dyn ExoHarness>) 
 pub async fn list_conversations_returns_recent_first_and_paginates(harness: Arc<dyn ExoHarness>) {
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: unique_slug("agent"),
             name: "Agent".to_string(),
         })
@@ -198,6 +207,8 @@ pub async fn list_conversations_returns_recent_first_and_paginates(harness: Arc<
         .expect("agent should be created");
     let first = agent
         .new_conversation(NewConversationRequest {
+            environment: None,
+            vaults: vec![],
             slug: Some(unique_slug("first")),
             name: Some("First".to_string()),
         })
@@ -206,6 +217,8 @@ pub async fn list_conversations_returns_recent_first_and_paginates(harness: Arc<
     tokio::time::sleep(Duration::from_millis(2)).await;
     let second = agent
         .new_conversation(NewConversationRequest {
+            environment: None,
+            vaults: vec![],
             slug: Some(unique_slug("second")),
             name: Some("Second".to_string()),
         })
@@ -214,6 +227,8 @@ pub async fn list_conversations_returns_recent_first_and_paginates(harness: Arc<
     tokio::time::sleep(Duration::from_millis(2)).await;
     let third = agent
         .new_conversation(NewConversationRequest {
+            environment: None,
+            vaults: vec![],
             slug: Some(unique_slug("third")),
             name: Some("Third".to_string()),
         })
@@ -236,6 +251,7 @@ pub async fn list_conversations_returns_recent_first_and_paginates(harness: Arc<
         .list_conversations(ListConversationsRequest {
             cursor: None,
             limit: Some(2),
+            ..Default::default()
         })
         .await
         .expect("first page");
@@ -254,6 +270,7 @@ pub async fn list_conversations_returns_recent_first_and_paginates(harness: Arc<
         .list_conversations(ListConversationsRequest {
             cursor: page.next_cursor,
             limit: Some(2),
+            ..Default::default()
         })
         .await
         .expect("second page");
@@ -269,6 +286,7 @@ pub async fn list_conversations_returns_recent_first_and_paginates(harness: Arc<
 pub async fn begin_turn_tracks_events_through_finish(harness: Arc<dyn ExoHarness>) {
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: unique_slug("agent"),
             name: "Agent".to_string(),
         })
@@ -283,6 +301,7 @@ pub async fn begin_turn_tracks_events_through_finish(harness: Arc<dyn ExoHarness
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("ping")],
+            ..Default::default()
         })
         .await
         .expect("turn");
@@ -316,7 +335,7 @@ pub async fn begin_turn_tracks_events_through_finish(harness: Arc<dyn ExoHarness
     assert!(
         events
             .iter()
-            .any(|event| matches!(event.data, EventData::TurnStarted))
+            .any(|event| matches!(event.data, EventData::TurnStarted { .. }))
     );
     assert!(
         events
@@ -336,6 +355,7 @@ pub async fn begin_turn_tracks_events_through_finish(harness: Arc<dyn ExoHarness
 pub async fn turn_events_continue_after_artifact_writes(harness: Arc<dyn ExoHarness>) {
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: unique_slug("agent"),
             name: "Agent".to_string(),
         })
@@ -350,6 +370,7 @@ pub async fn turn_events_continue_after_artifact_writes(harness: Arc<dyn ExoHarn
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("ping")],
+            ..Default::default()
         })
         .await
         .expect("turn");
@@ -383,86 +404,6 @@ pub async fn turn_events_continue_after_artifact_writes(harness: Arc<dyn ExoHarn
     let artifact_event = events.first().expect("artifact_written event");
     assert_eq!(artifact_event.session_id, Some(turn.record().session_id));
     assert_eq!(artifact_event.turn_id, Some(turn.record().id));
-}
-
-pub async fn conversation_scope_overrides_agent_scope_and_fork_copies_bindings(
-    harness: Arc<dyn ExoHarness>,
-) {
-    let agent = harness
-        .new_agent(NewAgentRequest {
-            slug: unique_slug("agent"),
-            name: "Agent".to_string(),
-        })
-        .await
-        .expect("agent");
-    let conversation = agent
-        .new_conversation(NewConversationRequest {
-            slug: Some(unique_slug("base")),
-            name: Some("Base".to_string()),
-        })
-        .await
-        .expect("conversation");
-
-    agent
-        .put_binding(Binding::Env {
-            name: "OPENAI_API_KEY".to_string(),
-            env_var: "OPENAI_API_KEY".to_string(),
-            secret_id: Uuid7::now(),
-        })
-        .await
-        .expect("agent binding");
-
-    let conversation_binding_id = conversation
-        .put_binding(Binding::Env {
-            name: "OPENAI_API_KEY".to_string(),
-            env_var: "OPENAI_API_KEY".to_string(),
-            secret_id: Uuid7::now(),
-        })
-        .await
-        .expect("conversation binding");
-
-    let effective_binding = conversation
-        .list_bindings()
-        .await
-        .expect("list bindings")
-        .into_iter()
-        .find(|binding| binding.name == "OPENAI_API_KEY")
-        .expect("effective binding");
-    assert_eq!(effective_binding.id, conversation_binding_id);
-
-    let forked = conversation
-        .fork(ForkConversationRequest {
-            up_to_inclusive: None,
-            slug: Some(unique_slug("fork")),
-            name: Some("Fork".to_string()),
-        })
-        .await
-        .expect("fork");
-    let forked_binding = forked
-        .list_bindings()
-        .await
-        .expect("list forked bindings")
-        .into_iter()
-        .find(|binding| binding.name == "OPENAI_API_KEY")
-        .expect("forked effective binding");
-    assert_eq!(forked_binding.name, "OPENAI_API_KEY");
-    let events = forked
-        .get_events(Some(EventQuery {
-            cursor: None,
-            direction: Some(EventQueryDirection::Asc),
-            limit: None,
-            session_id: None,
-            turn_id: None,
-            types: None,
-        }))
-        .await
-        .expect("get forked events")
-        .events;
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event.data, EventData::ThreadForked { .. }))
-    );
 }
 
 pub async fn sandbox_handle_start_process_supports_interactive_stdio_and_env(

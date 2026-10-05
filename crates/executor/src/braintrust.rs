@@ -1,6 +1,8 @@
+pub use exo_managed_agents::{BraintrustProject, BraintrustTracingConfig};
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -9,7 +11,7 @@ use exoharness::{
     AgentRecord, ConversationRecord, Result, SessionId, ToolRequest, ToolResult, TurnId,
 };
 use lingua::UniversalUsage;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;
 
@@ -23,19 +25,6 @@ pub struct BraintrustRuntimeConfig {
     pub api_key: String,
     pub app_url: Option<String>,
     pub api_url: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BraintrustTracingConfig {
-    pub org_name: Option<String>,
-    pub project: BraintrustProject,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "value")]
-pub enum BraintrustProject {
-    Name(String),
-    Id(String),
 }
 
 #[derive(Default)]
@@ -296,7 +285,7 @@ impl TurnTrace {
         Some(ToolTrace { span })
     }
 
-    async fn finish(self) {
+    async fn finish(&self) {
         self.span.end();
     }
 }
@@ -330,7 +319,7 @@ impl TurnExecutionTrace for TurnTrace {
             .map(|trace| Box::new(trace) as Box<dyn ToolExecutionTrace>)
     }
 
-    async fn finish_success(self: Box<Self>, latest_event_id: Option<exoharness::EventId>) {
+    async fn finish_success(self: Arc<Self>, latest_event_id: Option<exoharness::EventId>) {
         self.span.log(
             SpanLog::builder()
                 .metadata(metadata_object(json!({
@@ -343,7 +332,7 @@ impl TurnExecutionTrace for TurnTrace {
         (*self).finish().await;
     }
 
-    async fn finish_error(self: Box<Self>, error: &anyhow::Error) {
+    async fn finish_error(self: Arc<Self>, error: &anyhow::Error) {
         self.span.log(
             SpanLog::builder()
                 .metadata(metadata_object(json!({ "status": "error" })))
@@ -406,12 +395,11 @@ pub struct ToolTrace {
 
 impl ToolTrace {
     async fn finish_success_inner(self, result: &ToolResult) {
-        self.span.log(
-            SpanLog::builder()
-                .output(result.clone())
-                .build()
-                .expect("span log should build"),
-        );
+        let mut log = SpanLog::builder().output(result.clone());
+        if exo_mcp::tool_result_is_error(result) {
+            log = log.error("MCP tool returned an error");
+        }
+        self.span.log(log.build().expect("span log should build"));
         self.span.end();
     }
 

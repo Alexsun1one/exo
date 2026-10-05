@@ -34,7 +34,7 @@ NETWORKING="${EXO_NETWORKING:-enabled}"
 SHELL_PROGRAM="${EXO_SHELL_PROGRAM:-/bin/bash}"
 SANDBOX_SCOPE="${EXO_SANDBOX_SCOPE:-}"
 SCHEDULER_INTERVAL_SECONDS="${EXO_SCHEDULER_INTERVAL_SECONDS:-10}"
-COMMAND="repl"
+COMMAND="chat"
 USE_SANDBOX=true
 PULL_SANDBOX=false
 START_SCHEDULER="${EXO_START_SCHEDULER:-true}"
@@ -53,9 +53,7 @@ if [[ -n "$SETUP_ADAPTER" ]]; then
   SETUP_ADAPTERS+=("$SETUP_ADAPTER")
 fi
 INITIAL_PROMPT_FILE="${EXO_INITIAL_PROMPT_FILE:-}"
-UPSTREAM_MODEL="${EXO_UPSTREAM_MODEL:-}"
-SECRET_NAME=""
-SECRET_ENV=""
+MODEL_CREDENTIAL="openai"
 MODEL_BASE_URL=""
 USER_NAME="${EXO_USER_NAME:-}"
 export EXO_LOCAL_PROMPT_FILE="$LOCAL_PROMPT_FILE"
@@ -69,7 +67,6 @@ Usage:
   ./exo.sh fresh
   ./exo.sh stop-all
   ./exo.sh build
-  ./exo.sh register-model
   ./exo.sh write-profile
   ./exo.sh setup-profile
   ./exo.sh setup-sandbox
@@ -86,9 +83,6 @@ Subcommands:
   fresh            Rebuild, delete all state, and start a clean REPL
   stop-all         Stop the scheduler and adapter runners, preserving .exo state
   build            Install JS dependencies and build the exo CLI and scheduler
-  register-model   Store an API-key secret and register a model binding; uses
-                   --model, --upstream-model, --secret-name, --secret-env, and
-                   optionally --base-url
   write-profile    Write the local profile prompt non-interactively; uses
                    --user-name and --local-prompt-file
   setup-profile    Prompt interactively and write the local profile prompt
@@ -97,11 +91,9 @@ Subcommands:
                    image) without starting anything
 
 Options:
-  --model <model>              Model binding name (default: gpt-5.6-terra)
-  --upstream-model <model>     Upstream model id for register-model (default: --model)
-  --secret-name <name>         Secret name for register-model (e.g. openai)
-  --secret-env <env-var>       Environment variable holding the API key for register-model
-  --base-url <url>             Optional API base URL for register-model
+  --model <model>              Upstream model name (default: gpt-5.6-terra)
+  --credential <name>         Model secret in a selected vault (default: openai)
+  --base-url <url>             Optional model API base URL
   --user-name <name>           User name for write-profile (default: none)
   --agent <slug>               Agent slug (default: exo-agent)
   --conversation <slug>        Conversation slug (default: dev)
@@ -118,14 +110,14 @@ Options:
                                             control console, or guardian config
   --profile <name>             Checked-in tool profile: practical (default) or bootstrap
   --sandbox-image <image>      Sandbox image (default: ubuntu:24.04)
-  --provider <provider>         Sandbox provider: daytona, apple-container, docker, smolvm, or local-process
+  --sandbox <provider>         Sandbox provider: daytona, apple-container, docker, smolvm, or local-process
   --self-repo-mount <path>      Sandbox path for this repo (default: /workspace/exo)
   --agent-cli-mount <host-dir>  Bind-mount this host directory read-write into the
                                 sandbox for the agent-cli adapter (default: none)
   --agent-cli-mount-path <path> Sandbox path for the agent-cli mount (default: /agent-cli)
   --networking <mode>          enabled or disabled (default: enabled)
   --shell-program <path>       Shell in the sandbox (default: /bin/bash)
-  --sandbox-scope <scope>      agent or conversation (default: Exo agent)
+  --sandbox-scope <scope>      conversation (environments use one sandbox per thread)
   --scheduler-interval <secs>  Scheduler polling interval (default: 10)
   --no-scheduler               Do not start the local scheduled task runner
   --scheduler                  Start the local scheduled task runner
@@ -160,7 +152,7 @@ Environment overrides:
   EXO_AGENT_CLI_ROOT, EXO_AGENT_CLI_MOUNT,
   EXO_SCHEDULER_BIN, EXO_SCHEDULER_INTERVAL_SECONDS, EXO_ADAPTER_LIMIT,
   EXO_SETUP_ADAPTER, EXO_INITIAL_PROMPT_FILE, EXO_TEMPLATE, EXO_PROFILE,
-  EXO_SKIP_BUILD, EXO_UPSTREAM_MODEL, EXO_USER_NAME
+  EXO_SKIP_BUILD, EXO_USER_NAME
 EOF
 }
 
@@ -315,21 +307,6 @@ build_all() {
   build_exo_scheduler
 }
 
-register_model() {
-  [[ -n "$SECRET_NAME" ]] || die "register-model requires --secret-name"
-  [[ -n "$SECRET_ENV" ]] || die "register-model requires --secret-env"
-  ensure_exo_bin
-  local upstream="${UPSTREAM_MODEL:-$MODEL}"
-  echo "Storing secret $SECRET_NAME from \$$SECRET_ENV..."
-  exo secret set "$SECRET_NAME" --env "$SECRET_ENV"
-  echo "Registering model $MODEL -> $upstream..."
-  local args=(model register "$MODEL" --model "$upstream" --secret "$SECRET_NAME")
-  if [[ -n "$MODEL_BASE_URL" ]]; then
-    args+=(--base-url "$MODEL_BASE_URL")
-  fi
-  exo "${args[@]}"
-}
-
 write_local_profile() {
   mkdir -p "$(dirname "$LOCAL_PROMPT_FILE")"
   {
@@ -358,14 +335,17 @@ scheduler_source_newer_than() {
   return 1
 }
 
-append_exo_global_args() {
-  EXO_GLOBAL_ARGS=(--env-file-if-exists "$ENV_FILE")
+prepare_exo_args() {
+  EXO_ARGS=("$1")
+  if [[ -f "$ENV_FILE" ]]; then
+    EXO_ARGS+=(--env-file "$ENV_FILE")
+  fi
+  EXO_ARGS+=("${@:2}")
 }
 
 exo() {
-  EXO_GLOBAL_ARGS=()
-  append_exo_global_args
-  "$EXO_BIN" "${EXO_GLOBAL_ARGS[@]}" "$@"
+  prepare_exo_args "$@"
+  "$EXO_BIN" "${EXO_ARGS[@]}"
 }
 
 scheduler_pid_file() {
@@ -386,10 +366,6 @@ repl_restart_file() {
 
 adapters_pid_file() {
   echo "$ROOT_DIR/.exo/exo-adapters.pid"
-}
-
-adapters_lock_file() {
-  echo "$ROOT_DIR/.exo/exo-adapters.lock"
 }
 
 adapters_restart_file() {
@@ -438,7 +414,7 @@ adapters_process_running() {
     return 1
   fi
   command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-  [[ "$command_line" == *"adapters run"* ]]
+  [[ "$command_line" == "$EXO_BIN serve "* && "$command_line" == *" --adapters-only"* ]]
 }
 
 adapter_source_newer_than() {
@@ -489,12 +465,11 @@ ensure_adapters() {
   pid_file="$(adapters_pid_file)"
   log_file="$(adapters_log_file)"
   echo "Starting adapter runner..."
-  EXO_GLOBAL_ARGS=()
-  append_exo_global_args
-  nohup "$EXO_BIN" "${EXO_GLOBAL_ARGS[@]}" --harness "$HARNESS" \
-    adapters run \
-      --limit "$ADAPTER_LIMIT" \
-      --lock-file "$(adapters_lock_file)" \
+  prepare_exo_args serve
+  nohup "$EXO_BIN" "${EXO_ARGS[@]}" --harness "$HARNESS" \
+    --agent "$AGENT" \
+      --adapters-only \
+      --adapter-limit "$ADAPTER_LIMIT" \
       --drain-marker "$(adapters_restart_file)" \
       --reboot-notice "$(reboot_notice_file)" \
     >>"$log_file" 2>&1 &
@@ -559,16 +534,14 @@ setup_agent() {
   fi
   ensure_agent
   ensure_conversation
-  ensure_self_repo_mount
-  ensure_agent_cli_mount
 }
 
 agent_exists() {
-  exo agent show "$AGENT" >/dev/null 2>&1
+  exo agent get "$AGENT" >/dev/null 2>&1
 }
 
 conversation_exists() {
-  exo conversation show "$AGENT" "$CONVERSATION" >/dev/null 2>&1
+  exo thread get "$AGENT" "$CONVERSATION" >/dev/null 2>&1
 }
 
 ensure_agent() {
@@ -576,65 +549,57 @@ ensure_agent() {
     return
   fi
 
-  echo "Creating agent $AGENT..."
-  local args=(
-    --harness "$HARNESS"
-    agent create "$AGENT_NAME"
-    --slug "$AGENT"
-    --module "$MODULE"
-    --model "$MODEL"
-  )
-  if [[ "$USE_SANDBOX" == true ]]; then
-    args+=(--sandbox-image "$SANDBOX_IMAGE" --networking "$NETWORKING")
-    if [[ -n "$PROVIDER" ]]; then
-      args+=(--provider "$PROVIDER")
+  if ! exo vault get global "$MODEL_CREDENTIAL" >/dev/null; then
+    local origin token_env="OPENAI_API_KEY" endpoint="${MODEL_BASE_URL:-https://api.openai.com}"
+    if [[ "$MODEL" == claude* ]]; then
+      token_env="ANTHROPIC_API_KEY"
+      endpoint="${MODEL_BASE_URL:-https://api.anthropic.com}"
     fi
-    # The exo agent shares one sandbox across all of its conversations.
-    args+=(--sandbox-scope "${SANDBOX_SCOPE:-agent}")
+    origin="$(python3 - "$endpoint" <<'PYTHON'
+import sys, urllib.parse
+endpoint = urllib.parse.urlsplit(sys.argv[1])
+print(f"{endpoint.scheme}://{endpoint.netloc}")
+PYTHON
+)"
+    echo "Create the model credential before starting Exo:" >&2
+    printf '  %q' "$EXO_BIN" vault secret create global "$MODEL_CREDENTIAL" \
+      --token-env "$token_env" --allow-origin "$origin" >&2
+    printf '\n' >&2
+    exit 1
   fi
-  exo "${args[@]}"
+
+  echo "Creating agent $AGENT..."
+  mkdir -p "$ROOT_DIR/.exo"
+  local spec="$ROOT_DIR/.exo/launch-agent.md"
+  python3 - "$spec" "$AGENT_NAME" "$HARNESS" "$MODULE" "$MODEL" "$MODEL_CREDENTIAL" "$MODEL_BASE_URL" <<'PYTHON'
+import json, pathlib, sys
+path, name, harness, module, model, credential, base_url = sys.argv[1:]
+config = {"name": name, "harness": harness, "config": {"model": model, "credential": credential, "base_url": base_url or None, "module": str(pathlib.Path(module).resolve())}}
+pathlib.Path(path).write_text("---\n" + json.dumps(config) + "\n---\nFollow the Exo harness instructions.\n")
+PYTHON
+  exo agent create "$AGENT_NAME" --slug "$AGENT" --file "$spec"
 }
 
 ensure_conversation() {
-  if conversation_exists; then
-    if [[ "$USE_SANDBOX" == true && ( -n "$SANDBOX_SCOPE" || -n "$PROVIDER" ) ]]; then
-      local update_args=(conversation update "$AGENT" "$CONVERSATION")
-      if [[ -n "$SANDBOX_SCOPE" ]]; then
-        update_args+=(--sandbox-scope "$SANDBOX_SCOPE")
-      fi
-      if [[ -n "$PROVIDER" ]]; then
-        update_args+=(--provider "$PROVIDER")
-      fi
-      exo "${update_args[@]}" >/dev/null
-    fi
-    return
+  if ! conversation_exists; then
+    echo "Creating conversation $CONVERSATION..."
+    exo thread create "$AGENT" "$CONVERSATION_NAME" --slug "$CONVERSATION"
   fi
-
-  echo "Creating conversation $CONVERSATION..."
-  local args=(conversation create "$AGENT" "$CONVERSATION_NAME" --slug "$CONVERSATION")
-  if [[ -n "$SANDBOX_SCOPE" ]]; then
-    args+=(--sandbox-scope "$SANDBOX_SCOPE")
-  fi
-  if [[ -n "$PROVIDER" ]]; then
-    args+=(--provider "$PROVIDER")
-  fi
-  exo "${args[@]}"
   if [[ "$USE_SANDBOX" == true ]]; then
-    local update_args=(conversation update "$AGENT" "$CONVERSATION" --shell-program "$SHELL_PROGRAM")
-    if [[ -n "$SANDBOX_SCOPE" ]]; then
-      update_args+=(--sandbox-scope "$SANDBOX_SCOPE")
-    fi
-    if [[ -n "$PROVIDER" ]]; then
-      update_args+=(--provider "$PROVIDER")
-    fi
-    exo "${update_args[@]}" >/dev/null
+    [[ "${SANDBOX_SCOPE:-conversation}" == conversation ]] || die "launch environments use conversation sandbox scope"
+    local environment="$ROOT_DIR/.exo/launch-environment.json"
+    mkdir -p "$ROOT_DIR/.exo"
+    write_launch_environment "$environment"
+    exo thread update "$AGENT" "$CONVERSATION" --shell-program "$SHELL_PROGRAM" >/dev/null
+    # Opening with EOF saves the environment without submitting a model turn,
+    # so startup prompts, adapters, and later CLI calls use the same settings.
+    exo agent run --agent "$AGENT" --thread "$CONVERSATION" \
+      --environment-file "$environment" </dev/null >/dev/null
   fi
 }
 
-ensure_self_repo_mount() {
-  if [[ "$USE_SANDBOX" != true ]]; then
-    return
-  fi
+write_launch_environment() {
+  local environment="$1"
   if [[ ! "$SELF_REPO_MOUNT_PATH" = /* ]]; then
     die "self repo mount path must be absolute: $SELF_REPO_MOUNT_PATH"
   fi
@@ -642,26 +607,30 @@ ensure_self_repo_mount() {
     die "Exo self map is missing: exo/SELF.md"
   fi
 
-  # Agent-level mounts apply to the shared agent sandbox for every
-  # conversation, so adapter conversations see the repo too.
-  exo agent mount add "$AGENT" "$ROOT_DIR" "$SELF_REPO_MOUNT_PATH" --rw >/dev/null
-}
-
-ensure_agent_cli_mount() {
-  if [[ "$USE_SANDBOX" != true || -z "$AGENT_CLI_MOUNT_ROOT" ]]; then
-    return
-  fi
-  if [[ ! "$AGENT_CLI_MOUNT_ROOT" = /* ]]; then
-    die "agent-cli mount root must be absolute: $AGENT_CLI_MOUNT_ROOT"
-  fi
-  if [[ ! -d "$AGENT_CLI_MOUNT_ROOT" ]]; then
-    die "agent-cli mount root does not exist: $AGENT_CLI_MOUNT_ROOT"
-  fi
-  if [[ ! "$AGENT_CLI_MOUNT_PATH" = /* ]]; then
-    die "agent-cli mount path must be absolute: $AGENT_CLI_MOUNT_PATH"
+  if [[ -n "$AGENT_CLI_MOUNT_ROOT" ]]; then
+    if [[ ! "$AGENT_CLI_MOUNT_ROOT" = /* ]]; then
+      die "agent-cli mount root must be absolute: $AGENT_CLI_MOUNT_ROOT"
+    fi
+    if [[ ! -d "$AGENT_CLI_MOUNT_ROOT" ]]; then
+      die "agent-cli mount root does not exist: $AGENT_CLI_MOUNT_ROOT"
+    fi
+    if [[ ! "$AGENT_CLI_MOUNT_PATH" = /* ]]; then
+      die "agent-cli mount path must be absolute: $AGENT_CLI_MOUNT_PATH"
+    fi
   fi
 
-  exo agent mount add "$AGENT" "$AGENT_CLI_MOUNT_ROOT" "$AGENT_CLI_MOUNT_PATH" --rw >/dev/null
+  # Resuming a thread restores its mounts from the saved environment.
+  python3 - "$environment" "${PROVIDER:-docker}" "$SANDBOX_IMAGE" "$NETWORKING" \
+    "$ROOT_DIR" "$SELF_REPO_MOUNT_PATH" "$AGENT_CLI_MOUNT_ROOT" "$AGENT_CLI_MOUNT_PATH" <<'PYTHON'
+import json, pathlib, sys
+path, provider, image, networking, root, repo_mount, cli_root, cli_mount = sys.argv[1:]
+provider = {"apple-container": "apple_container", "local-process": "local_process"}.get(provider, provider)
+mounts = [{"host_path": str(pathlib.Path(root).resolve()), "mount_path": repo_mount, "mode": "rw"}]
+if cli_root:
+    mounts.append({"host_path": str(pathlib.Path(cli_root).resolve()), "mount_path": cli_mount, "mode": "rw"})
+environment = {"name": "launch", "config": {"provider": provider, "image": image, "enable_networking": networking == "enabled", "file_system_mounts": mounts}}
+pathlib.Path(path).write_text(json.dumps(environment) + "\n")
+PYTHON
 }
 
 list_agents_and_conversations() {
@@ -677,7 +646,7 @@ list_agents_and_conversations() {
   while IFS= read -r agent; do
     [[ -z "$agent" ]] && continue
     echo
-    exo agent show "$agent" | awk '
+    exo agent get "$agent" | awk '
       /^slug:/ { slug=$2 }
       /^name:/ { name=substr($0, 7) }
       END {
@@ -690,7 +659,7 @@ list_agents_and_conversations() {
         }
       }
     '
-    exo conversation list "$agent" | awk 'NR == 1 { next } { printf "  %s - %s\n", $1, $3 }'
+    exo thread list "$agent" | awk 'NR == 1 { next } { printf "  %s - %s\n", $1, $3 }'
   done <<<"$agents"
 }
 
@@ -719,7 +688,7 @@ stop_adapters() {
       terminate_process_tree "$pid"
     fi
   fi
-  pkill -f "exo .*adapters run" >/dev/null 2>&1 || true
+  pkill -f '(^|/)exo serve .*--adapters-only([[:space:]]|$)' >/dev/null 2>&1 || true
   pkill -f "tsx exo/adapters/.*/worker.ts" >/dev/null 2>&1 || true
   rm -f "$pid_file"
 }
@@ -755,11 +724,11 @@ delete_all_agents_and_conversations() {
     [[ -z "$agent" ]] && continue
 
     local conversations
-    conversations="$(exo conversation list "$agent" | awk 'NR > 1 { print $1 }')"
+    conversations="$(exo thread list "$agent" | awk 'NR > 1 { print $1 }')"
     while IFS= read -r conversation; do
       [[ -z "$conversation" ]] && continue
       echo "Deleting conversation $agent/$conversation..."
-      exo conversation delete "$agent" "$conversation" >/dev/null
+      exo thread delete "$agent" "$conversation" >/dev/null
     done <<<"$conversations"
 
     echo "Deleting agent $agent..."
@@ -870,8 +839,6 @@ run_repl() {
   fi
   ensure_agent
   ensure_conversation
-  ensure_self_repo_mount
-  ensure_agent_cli_mount
   configure_guardian_for_current_launch
   local scheduler_log_start_line
   scheduler_log_start_line="$(scheduler_log_line_count)"
@@ -886,11 +853,10 @@ run_repl() {
   if [[ "$CONTROL" == true ]]; then
     run_control_repl "$scheduler_log_start_line" "$adapter_log_start_line"
   else
-    EXO_GLOBAL_ARGS=()
-    append_exo_global_args
-    exec "$EXO_BIN" "${EXO_GLOBAL_ARGS[@]}" repl \
+    prepare_exo_args agent run
+    exec "$EXO_BIN" "${EXO_ARGS[@]}" \
       --agent "$AGENT" \
-      --conversation "$CONVERSATION"
+      --thread "$CONVERSATION"
   fi
 }
 
@@ -941,17 +907,16 @@ run_control_repl() {
     start_control_log_tail "adapters" "$(adapters_log_file)" "$adapter_start_line"
   fi
 
-  EXO_GLOBAL_ARGS=()
-  append_exo_global_args
+  prepare_exo_args agent run
   while true; do
     rm -f "$(repl_restart_file)"
     watch_repl_restart_request "$$" &
     restart_watcher_pid="$!"
 
     local repl_exit
-    if "$EXO_BIN" "${EXO_GLOBAL_ARGS[@]}" repl \
+    if "$EXO_BIN" "${EXO_ARGS[@]}" \
       --agent "$AGENT" \
-      --conversation "$CONVERSATION"; then
+      --thread "$CONVERSATION"; then
       repl_exit=0
     else
       repl_exit=$?
@@ -985,7 +950,7 @@ kill_repl_children() {
 find_repl_children() {
   local control_pid="$1"
   ps ax -o pid= -o ppid= -o command= | awk -v ppid="$control_pid" -v exo="$EXO_BIN" '
-    $2 == ppid && index($0, exo) > 0 && index($0, " repl") > 0 { print $1 }
+    $2 == ppid && index($0, exo) > 0 && index($0, " run") > 0 { print $1 }
   '
 }
 
@@ -1071,7 +1036,7 @@ send_adapter_setup_prompt() {
     die "startup prompt is empty: $file"
   fi
   echo "Sending startup prompt from: $file"
-  exo conversation send "$AGENT" "$CONVERSATION" "$prompt"
+  exo thread send "$AGENT" "$CONVERSATION" "$prompt"
 }
 
 send_prompt_from_files() {
@@ -1088,7 +1053,7 @@ send_prompt_from_files() {
   fi
 
   echo "Sending startup prompt from: ${files[*]}"
-  exo conversation send "$AGENT" "$CONVERSATION" "$prompt"
+  exo thread send "$AGENT" "$CONVERSATION" "$prompt"
 }
 
 show_whatsapp_qr_if_needed() {
@@ -1271,10 +1236,6 @@ while [[ $# -gt 0 ]]; do
       [[ $# -eq 0 ]] || die "build does not accept additional arguments"
       COMMAND="build"
       ;;
-    register-model)
-      shift
-      COMMAND="register-model"
-      ;;
     write-profile)
       shift
       COMMAND="write-profile"
@@ -1284,19 +1245,9 @@ while [[ $# -gt 0 ]]; do
       [[ -n "$MODEL" ]] || die "--model requires a value"
       shift 2
       ;;
-    --upstream-model)
-      UPSTREAM_MODEL="${2:-}"
-      [[ -n "$UPSTREAM_MODEL" ]] || die "--upstream-model requires a value"
-      shift 2
-      ;;
-    --secret-name)
-      SECRET_NAME="${2:-}"
-      [[ -n "$SECRET_NAME" ]] || die "--secret-name requires a value"
-      shift 2
-      ;;
-    --secret-env)
-      SECRET_ENV="${2:-}"
-      [[ -n "$SECRET_ENV" ]] || die "--secret-env requires a value"
+    --credential)
+      MODEL_CREDENTIAL="${2:-}"
+      [[ -n "$MODEL_CREDENTIAL" ]] || die "--credential requires a value"
       shift 2
       ;;
     --base-url)
@@ -1338,11 +1289,11 @@ while [[ $# -gt 0 ]]; do
       [[ -n "$SANDBOX_IMAGE" ]] || die "--sandbox-image requires a value"
       shift 2
       ;;
-    --provider)
+    --sandbox)
       PROVIDER="${2:-}"
       case "$PROVIDER" in
         daytona|apple-container|docker|smolvm|local-process) ;;
-        *) die "--provider must be daytona, apple-container, docker, smolvm, or local-process" ;;
+        *) die "--sandbox must be daytona, apple-container, docker, smolvm, or local-process" ;;
       esac
       PROVIDER_EXPLICIT=true
       shift 2
@@ -1399,7 +1350,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     --sandbox-scope)
       SANDBOX_SCOPE="${2:-}"
-      [[ "$SANDBOX_SCOPE" == "agent" || "$SANDBOX_SCOPE" == "conversation" ]] || die "--sandbox-scope must be agent or conversation"
+      [[ "$SANDBOX_SCOPE" == "conversation" ]] || die "--sandbox-scope must be conversation; environments use one sandbox per thread"
       shift 2
       ;;
     --scheduler-interval)
@@ -1503,7 +1454,7 @@ export EXO_SELF_MAP="$SELF_MAP_PATH"
 export EXO_PROFILE="$PROFILE"
 
 case "$COMMAND" in
-  repl)
+  chat)
     run_repl
     ;;
   list)
@@ -1529,9 +1480,6 @@ case "$COMMAND" in
     ;;
   build)
     build_all
-    ;;
-  register-model)
-    register_model
     ;;
   write-profile)
     write_local_profile

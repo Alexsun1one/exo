@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -13,11 +13,12 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_util::compat::{FuturesAsyncReadCompatExt, FuturesAsyncWriteCompatExt};
 
 use crate::{
-    FirecrackerConfig, FirecrackerSandboxBackend, ManagedSandboxBackend, ManagedSandboxHandle,
-    SandboxCommand, SandboxCommandOutput, SandboxProcessParts, SandboxRequest, SnapshotFormat,
-    SnapshotPayload,
+    FirecrackerConfig, FirecrackerRequest, FirecrackerSandboxBackend, ManagedSandboxBackend,
+    ManagedSandboxHandle, SandboxCommand, SandboxCommandOutput, SandboxProcessParts,
+    SandboxRequest, SnapshotFormat, SnapshotPayload,
 };
 
+const MAX_EGRESS_LISTENERS: usize = 256;
 const MAX_BRIDGE_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const STREAM_INPUT_QUEUE_DEPTH: usize = 16;
@@ -26,63 +27,115 @@ const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(2);
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum FirecrackerBridgeRequest {
+    EgressCreate {
+        networking: crate::SandboxNetworkPolicy,
+        listen: Option<crate::EgressListenConfig>,
+    },
+    EgressBind {
+        listener_id: String,
+        source: std::net::Ipv4Addr,
+    },
+    EgressAccept {
+        listener_id: String,
+        tls: bool,
+    },
+    EgressClose {
+        listener_id: String,
+    },
+    MaterializeResources {
+        config: FirecrackerConfig,
+        request: crate::resources::MaterializeResourcesRequest,
+    },
+    RemoveResources {
+        config: FirecrackerConfig,
+        agent: crate::AgentId,
+        thread: crate::ThreadId,
+    },
+    ResolveImage {
+        config: FirecrackerConfig,
+        image: String,
+    },
     Acquire {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
     },
     Exec {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
         command: SandboxCommand,
     },
     StartProcess {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
         command: SandboxCommand,
     },
     ConnectTcp {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
         port: u16,
+    },
+    IsRunning {
+        config: FirecrackerConfig,
+        request: SandboxRequest,
     },
     Stop {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
     },
     Fork {
         config: FirecrackerConfig,
-        source: SandboxRequest,
-        target: SandboxRequest,
+        source: FirecrackerRequest,
+        target: FirecrackerRequest,
     },
     AcquireFromSnapshot {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
+        format: SnapshotFormat,
+        payload: String,
+    },
+    DeleteSnapshot {
+        config: FirecrackerConfig,
         format: SnapshotFormat,
         payload: String,
     },
     Snapshot {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
     },
     Terminate {
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
     },
 }
 
 impl FirecrackerBridgeRequest {
     fn is_stream(&self) -> bool {
-        matches!(self, Self::StartProcess { .. } | Self::ConnectTcp { .. })
+        matches!(
+            self,
+            Self::EgressAccept { .. } | Self::StartProcess { .. } | Self::ConnectTcp { .. }
+        )
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum FirecrackerBridgeResponse {
+    Egress {
+        listener_id: String,
+        endpoints: crate::SandboxEgressProxy,
+    },
+    Image(crate::ResolvedSandboxImage),
+    Resources {
+        mounts: Vec<crate::FileSystemMount>,
+    },
+    Running {
+        running: Option<bool>,
+    },
     Handle {
         id: String,
         provider_state: Option<Value>,
         effective_image: Option<String>,
+        source_ipv4: Option<std::net::Ipv4Addr>,
     },
     Exec {
         output: SandboxCommandOutput,
@@ -159,14 +212,30 @@ enum BridgeStreamInput {
 
 #[derive(Default)]
 struct BridgeBackendCache {
+    egress: Mutex<HashMap<String, Arc<dyn crate::egress::EgressTransport>>>,
     backends: Mutex<HashMap<FirecrackerConfig, Arc<FirecrackerSandboxBackend>>>,
 }
 
 impl BridgeBackendCache {
+    async fn egress(&self, id: &str) -> Result<Arc<dyn crate::egress::EgressTransport>> {
+        self.egress
+            .lock()
+            .await
+            .get(id)
+            .cloned()
+            .context("egress listener not found")
+    }
+
     async fn backend(&self, config: FirecrackerConfig) -> Result<Arc<FirecrackerSandboxBackend>> {
         let mut backends = self.backends.lock().await;
         if let Some(backend) = backends.get(&config) {
             return Ok(Arc::clone(backend));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let config = config.clone();
+            tokio::task::spawn_blocking(move || super::firecracker::lima_storage::prepare(&config))
+                .await??;
         }
         let backend = Arc::new(FirecrackerSandboxBackend::new(config.clone()).await?);
         // The backend exclusively owns its state root. This first reap removes
@@ -182,9 +251,31 @@ impl BridgeBackendCache {
     async fn acquire(
         &self,
         config: FirecrackerConfig,
-        request: SandboxRequest,
+        request: FirecrackerRequest,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
-        self.backend(config).await?.acquire(request).await
+        let backend = self.backend(config).await?;
+        self.acquire_on(&backend, request).await
+    }
+
+    async fn acquire_on(
+        &self,
+        backend: &FirecrackerSandboxBackend,
+        request: FirecrackerRequest,
+    ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        let endpoints = request.egress_proxy;
+        let handle = backend.acquire_request(request).await?;
+        if let Some(endpoints) = endpoints {
+            let transport = self
+                .egress
+                .lock()
+                .await
+                .values()
+                .find(|transport| transport.endpoints() == endpoints && !transport.is_closed())
+                .cloned()
+                .context("sandbox egress listener is no longer available")?;
+            backend.track_egress(handle.as_ref(), transport).await?;
+        }
+        Ok(handle)
     }
 }
 
@@ -294,12 +385,80 @@ async fn handle_request(
     backends: &BridgeBackendCache,
 ) -> Result<FirecrackerBridgeResponse> {
     match request {
+        FirecrackerBridgeRequest::EgressCreate { networking, listen } => {
+            let mut listeners = backends.egress.lock().await;
+            listeners.retain(|_, listener| !listener.is_closed());
+            ensure!(
+                listeners.len() < MAX_EGRESS_LISTENERS,
+                "too many egress listeners"
+            );
+            let listener: Arc<dyn crate::egress::EgressTransport> =
+                Arc::new(super::firecracker::native_egress_transport(&networking, listen).await?);
+            let endpoints = listener.endpoints();
+            let listener_id = uuid::Uuid::new_v4().to_string();
+            listeners.insert(listener_id.clone(), listener);
+            Ok(FirecrackerBridgeResponse::Egress {
+                listener_id,
+                endpoints,
+            })
+        }
+        FirecrackerBridgeRequest::EgressBind {
+            listener_id,
+            source,
+        } => {
+            backends
+                .egress(&listener_id)
+                .await?
+                .bind_source(source)
+                .await?;
+            Ok(FirecrackerBridgeResponse::Unit)
+        }
+        FirecrackerBridgeRequest::EgressClose { listener_id } => {
+            if let Some(listener) = backends.egress.lock().await.remove(&listener_id) {
+                listener.close();
+            }
+            Ok(FirecrackerBridgeResponse::Unit)
+        }
+        FirecrackerBridgeRequest::EgressAccept { .. } => bail!("egress accept requires a stream"),
+
+        FirecrackerBridgeRequest::MaterializeResources { config, request } => {
+            let mounts = backends
+                .backend(config)
+                .await?
+                .materialize_resources(request)
+                .await?;
+            Ok(FirecrackerBridgeResponse::Resources { mounts })
+        }
+        FirecrackerBridgeRequest::RemoveResources {
+            config,
+            agent,
+            thread,
+        } => {
+            backends
+                .backend(config)
+                .await?
+                .remove_thread_resources(agent, thread)
+                .await?;
+            Ok(FirecrackerBridgeResponse::Unit)
+        }
+        FirecrackerBridgeRequest::ResolveImage { config, image } => {
+            Ok(FirecrackerBridgeResponse::Image(
+                backends
+                    .backend(config)
+                    .await?
+                    .resolve_image(&image)
+                    .await?,
+            ))
+        }
         FirecrackerBridgeRequest::Acquire { config, request } => {
-            let handle = backends.acquire(config, request).await?;
+            let backend = backends.backend(config).await?;
+            let handle = backends.acquire_on(&backend, request).await?;
+            let source_ipv4 = backend.egress_source(handle.as_ref()).await?;
             Ok(FirecrackerBridgeResponse::Handle {
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
+                source_ipv4,
             })
         }
         FirecrackerBridgeRequest::Exec {
@@ -313,8 +472,21 @@ async fn handle_request(
                 .exec(&command)
                 .await?,
         }),
+        FirecrackerBridgeRequest::IsRunning { config, request } => {
+            Ok(FirecrackerBridgeResponse::Running {
+                running: backends
+                    .backend(config)
+                    .await?
+                    .is_running_request(&request)
+                    .await?,
+            })
+        }
         FirecrackerBridgeRequest::Stop { config, request } => {
-            backends.acquire(config, request).await?.stop().await?;
+            backends
+                .backend(config)
+                .await?
+                .stop_request(request.sandbox)
+                .await?;
             Ok(FirecrackerBridgeResponse::Unit)
         }
         FirecrackerBridgeRequest::Fork {
@@ -325,12 +497,13 @@ async fn handle_request(
             let handle = backends
                 .backend(config)
                 .await?
-                .fork_sandbox(source, target)
+                .fork_sandbox(source.sandbox, target.sandbox)
                 .await?;
             Ok(FirecrackerBridgeResponse::Handle {
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
+                source_ipv4: None,
             })
         }
         FirecrackerBridgeRequest::AcquireFromSnapshot {
@@ -346,7 +519,7 @@ async fn handle_request(
                 .backend(config)
                 .await?
                 .acquire_from_snapshot(
-                    request,
+                    request.sandbox,
                     SnapshotPayload {
                         format,
                         bytes: payload.into(),
@@ -357,6 +530,7 @@ async fn handle_request(
                 id: handle.id().to_string(),
                 provider_state: handle.provider_state(),
                 effective_image: handle.effective_image(),
+                source_ipv4: None,
             })
         }
         FirecrackerBridgeRequest::Snapshot { config, request } => {
@@ -366,8 +540,27 @@ async fn handle_request(
                 payload: BASE64.encode(snapshot.bytes),
             })
         }
+        FirecrackerBridgeRequest::DeleteSnapshot {
+            config,
+            format,
+            payload,
+        } => {
+            backends
+                .backend(config)
+                .await?
+                .delete_snapshot(SnapshotPayload {
+                    format,
+                    bytes: BASE64.decode(payload)?.into(),
+                })
+                .await?;
+            Ok(FirecrackerBridgeResponse::Unit)
+        }
         FirecrackerBridgeRequest::Terminate { config, request } => {
-            backends.backend(config).await?.terminate(request).await?;
+            backends
+                .backend(config)
+                .await?
+                .terminate(request.sandbox)
+                .await?;
             Ok(FirecrackerBridgeResponse::Unit)
         }
         FirecrackerBridgeRequest::StartProcess { .. }
@@ -389,6 +582,17 @@ async fn open_stream(
         bail!("duplicate Firecracker bridge stream id {id}");
     }
     match request {
+        FirecrackerBridgeRequest::EgressAccept { listener_id, tls } => {
+            let listener = backends.egress(&listener_id).await?;
+            let mut input_receiver = input_receiver;
+            let stream = tokio::select! {
+                stream = listener.accept(tls) => stream?,
+                _ = input_receiver.recv() => { streams.lock().await.remove(&id); return Ok(()); }
+            };
+            send_server_frame(writer, &FirecrackerBridgeServerFrame::StreamOpened { id }).await?;
+            proxy_tcp(id, stream, input_receiver, writer).await?;
+        }
+
         FirecrackerBridgeRequest::StartProcess {
             config,
             request,

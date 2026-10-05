@@ -5,9 +5,14 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   contents: read
+
+# Keep Rust build settings identical for unit and sandbox integration jobs.
+env:
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   validate:
@@ -50,6 +55,20 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Set up pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
+        with:
+          version: 10.26.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          cache: pnpm
+          node-version: 22.15.0
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
         with:
@@ -57,6 +76,10 @@ jobs:
 
       - name: Cache Rust dependencies and build output
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          # Reuse dependencies across Rust jobs; OS, architecture, and compiler
+          # settings remain part of the action's cache key.
+          shared-key: rust
 
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
@@ -66,3 +89,65 @@ jobs:
 
       - name: Run Rust tests
         run: cargo test --workspace --all-targets
+
+      - name: Check Firecracker and sandbox egress
+        run: cargo test -p exoharness --features firecracker --lib --locked
+
+  # Both supported VM backends run the same real CLI + mocked model test.
+  # Hosted macOS ARM runners lack nested virtualization; macOS still runs the
+  # regular Rust jobs above. Fail explicitly if Linux KVM is unavailable.
+  rust-integration-tests:
+    name: linux / ${{ matrix.sandbox-backend }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        sandbox-backend: [smolvm, firecracker]
+
+    env:
+      EXO_TEST_SANDBOX_BACKEND: ${{ matrix.sandbox-backend }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Verify KVM is available
+        run: |
+          test -c /dev/kvm
+          sudo chmod a+rw /dev/kvm
+          python3 - <<'PYTHON'
+          import fcntl
+          with open('/dev/kvm', 'rb+') as kvm:
+              assert fcntl.ioctl(kvm, 0xAE00) == 12, 'KVM API is unavailable'
+          PYTHON
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Cache Rust dependencies and build output
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          shared-key: rust
+
+      - name: Install sandbox runtime
+        timeout-minutes: 10
+        run: bash support/ci/setup-sandbox.sh "$EXO_TEST_SANDBOX_BACKEND"
+
+      - name: Run sandbox integration test
+        run: |
+          cargo test --locked --package exo --features firecracker \
+            --test integration_chat --no-run --message-format=json-render-diagnostics \
+            > "$RUNNER_TEMP/integration-build.jsonl"
+          test_binary="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "integration_chat") | .executable // empty' "$RUNNER_TEMP/integration-build.jsonl")"
+          test -x "$test_binary"
+          if [[ "$EXO_TEST_SANDBOX_BACKEND" == firecracker ]]; then
+            # Build as the runner user; only the test needs root for jailer.
+            sudo -n env EXO_TEST_SANDBOX_BACKEND=firecracker \
+              EXO_FIRECRACKER_BINARY="$EXO_FIRECRACKER_BINARY" \
+              EXO_FIRECRACKER_JAILER="$EXO_FIRECRACKER_JAILER" \
+              PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+              "$test_binary" --ignored --nocapture
+          else
+            "$test_binary" --ignored --nocapture
+          fi

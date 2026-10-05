@@ -9,7 +9,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -22,35 +22,8 @@ use tokio::time;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
-use crate::{DurableFileSystem, SandboxAttachment};
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SandboxKey {
-    AgentSandbox {
-        agent_id: String,
-        sandbox_id: String,
-    },
-    ConversationSandbox {
-        #[serde(alias = "conversation_id")]
-        thread_id: String,
-        sandbox_id: String,
-    },
-}
-
-impl fmt::Display for SandboxKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AgentSandbox {
-                agent_id,
-                sandbox_id,
-            } => write!(f, "agent:{agent_id}:{sandbox_id}"),
-            Self::ConversationSandbox {
-                thread_id,
-                sandbox_id,
-            } => write!(f, "thread:{thread_id}:{sandbox_id}"),
-        }
-    }
-}
+use crate::{DurableFileSystem, ResourceScope, SandboxAttachment, SandboxId};
+pub use crate::{EgressPolicy, SandboxNetworkPolicy};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxLifecycleConfig {
@@ -72,25 +45,59 @@ pub struct SandboxMount {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SandboxNetworkPolicy {
-    Enabled,
-    Disabled,
+#[serde(deny_unknown_fields)]
+pub struct EgressListenConfig {
+    pub bind_address: std::net::Ipv4Addr,
+    pub advertised_address: std::net::Ipv4Addr,
+    #[serde(default)]
+    pub http_port: u16,
+    #[serde(default)]
+    pub https_port: u16,
+    #[serde(default)]
+    pub dns_port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SandboxEgressProxy {
+    pub http: std::net::SocketAddrV4,
+    pub https: std::net::SocketAddrV4,
+    pub dns: std::net::SocketAddrV4,
+}
+
+impl SandboxEgressProxy {
+    pub fn validate(&self) -> Result<()> {
+        for endpoint in [self.http, self.https, self.dns] {
+            if endpoint.port() == 0
+                || endpoint.ip().is_unspecified()
+                || endpoint.ip().is_loopback()
+                || endpoint.ip().is_multicast()
+                || endpoint.ip().is_broadcast()
+            {
+                bail!("egress proxy requires concrete, host-reachable IPv4 endpoints");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SandboxSpec {
     pub image: String,
-    #[serde(default)]
-    pub resources: crate::SandboxResourceShape,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<crate::SandboxResourceShape>,
     pub mounts: Vec<SandboxMount>,
     pub durable_file_systems: Vec<DurableFileSystem>,
-    pub network: SandboxNetworkPolicy,
+    pub policy: EgressPolicy,
     pub default_workdir: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tcp_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxRequest {
-    pub key: SandboxKey,
+    pub sandbox_id: SandboxId,
+    #[serde(default)]
+    pub scope: ResourceScope,
     pub spec: SandboxSpec,
     pub lifecycle: SandboxLifecycleConfig,
     pub provider_state: Option<Value>,
@@ -220,9 +227,61 @@ pub trait ManagedSandboxHandle: Send + Sync {
         None
     }
 
+    async fn command_environment(&self) -> Result<HashMap<String, String>> {
+        Ok(HashMap::new())
+    }
+
+    async fn is_running(&self) -> Result<Option<bool>> {
+        Ok(None)
+    }
+
     async fn exec(&self, command: &SandboxCommand) -> Result<SandboxCommandOutput>;
 
     async fn start_process(&self, command: &SandboxCommand) -> Result<crate::SandboxProcessParts>;
+
+    /// Start a process whose ID remains usable through this sandbox's process API.
+    /// Once started, dropping a wait or output request must not cancel the process.
+    async fn start_managed_process(
+        &self,
+        _command: &SandboxCommand,
+        _stdin: crate::SandboxProcessStdin,
+    ) -> Result<crate::SandboxProcessId> {
+        bail!("sandbox backend does not support managed processes")
+    }
+
+    async fn write_process_input(&self, _process_id: &str, _data: &[u8]) -> Result<()> {
+        bail!("sandbox backend does not support managed processes")
+    }
+
+    async fn close_process_input(&self, _process_id: &str) -> Result<()> {
+        bail!("sandbox backend does not support managed processes")
+    }
+
+    /// Events strictly after `after`, ordered by cursor, with current status.
+    /// A terminal status guarantees that the terminal event is available.
+    async fn process_events(
+        &self,
+        _process_id: &str,
+        _after: u64,
+    ) -> Result<crate::GetSandboxProcessEventsResult> {
+        bail!("sandbox backend does not support managed processes")
+    }
+
+    async fn wait_process(&self, _process_id: &str) -> Result<crate::SandboxProcessStatus> {
+        bail!("sandbox backend does not support managed processes")
+    }
+
+    async fn cancel_process(&self, _process_id: &str) -> Result<crate::SandboxProcessStatus> {
+        bail!("sandbox backend does not support managed processes")
+    }
+
+    async fn start_terminal(
+        &self,
+        _command: &SandboxCommand,
+        _size: crate::SandboxTerminalSize,
+    ) -> Result<crate::SandboxTerminalParts> {
+        bail!("sandbox backend does not support terminal sessions")
+    }
 
     fn supports_tcp(&self) -> bool {
         false
@@ -241,6 +300,14 @@ pub trait ManagedSandboxHandle: Send + Sync {
     /// Capture the sandbox's current state as an opaque blob. Returns an
     /// error if this backend doesn't (yet) support snapshotting.
     async fn snapshot(&self) -> Result<SnapshotPayload>;
+
+    async fn snapshot_template(&self) -> Result<SnapshotPayload> {
+        bail!("sandbox handle does not support template capture")
+    }
+
+    async fn delete_snapshot(&self, _payload: SnapshotPayload) -> Result<()> {
+        bail!("sandbox handle does not support snapshot deletion")
+    }
 }
 
 pub trait SandboxTcpStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
@@ -249,14 +316,116 @@ impl<T> SandboxTcpStream for T where T: tokio::io::AsyncRead + tokio::io::AsyncW
 
 pub type BoxSandboxTcpStream = Pin<Box<dyn SandboxTcpStream>>;
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SandboxImageConfiguration {
+    pub entrypoint: Option<Vec<String>>,
+    pub cmd: Option<Vec<String>>,
+    pub env: Option<Vec<String>>,
+    pub working_dir: Option<String>,
+    pub healthcheck: Option<SandboxImageHealthcheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct SandboxImageHealthcheck {
+    pub test: Vec<String>,
+    pub interval: Option<u64>,
+    pub timeout: Option<u64>,
+    pub start_period: Option<u64>,
+    pub retries: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedSandboxImage {
+    pub image: String,
+    pub configuration: SandboxImageConfiguration,
+}
+
 #[async_trait]
 pub trait ManagedSandboxBackend: Send + Sync {
+    fn with_external_proxy(
+        &self,
+        _proxy: crate::egress::ExternalProxyConfig,
+    ) -> Result<Arc<dyn ManagedSandboxBackend>> {
+        bail!("sandbox backend does not support external proxies")
+    }
+
+    async fn materialize_resources(
+        &self,
+        _request: crate::resources::MaterializeResourcesRequest,
+    ) -> Result<Vec<crate::FileSystemMount>> {
+        bail!("sandbox backend does not support filesystem resources")
+    }
+
+    async fn remove_thread_resources(
+        &self,
+        _agent: crate::AgentId,
+        _thread: crate::ThreadId,
+    ) -> Result<()> {
+        bail!("sandbox backend does not support filesystem resources")
+    }
+
     fn is_local(&self) -> bool;
 
     /// Formats this backend can consume in `acquire_from_snapshot`.
     fn consumable_snapshot_formats(&self) -> &[SnapshotFormat];
 
+    async fn resolve_image(&self, _image: &str) -> Result<ResolvedSandboxImage> {
+        bail!("sandbox backend does not expose image configuration")
+    }
+
+    /// Enforce `request.spec.policy` before returning a usable handle. Attach,
+    /// restore, and fork must provide the same guarantee or reject the policy.
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>>;
+
+    /// Reconnect to an existing sandbox without provisioning a replacement.
+    /// `request` is available when the caller retained the acquisition context;
+    /// remote backends may resolve `sandbox_id` without it. Return `None` when the
+    /// sandbox is gone or reconnection is unsupported. Reuse `previous` when its
+    /// connection is unchanged so any process bookkeeping remains intact.
+    async fn resolve_existing(
+        &self,
+        _sandbox_id: &str,
+        _request: Option<&SandboxRequest>,
+        _previous: &Arc<dyn ManagedSandboxHandle>,
+    ) -> Result<Option<Arc<dyn ManagedSandboxHandle>>> {
+        Ok(None)
+    }
+
+    /// Stop the sandbox identified by `sandbox_id`, even if `previous` is stale.
+    /// Backends with independently changing allocations should override this to
+    /// target the current allocation without acquiring or resuming a sandbox.
+    async fn stop_existing(
+        &self,
+        _sandbox_id: &str,
+        previous: &Arc<dyn ManagedSandboxHandle>,
+    ) -> Result<()> {
+        previous.stop().await
+    }
+
+    /// Terminate an existing sandbox. Backends that can resolve IDs independently
+    /// may override this to work without the original acquisition request.
+    async fn terminate_existing(
+        &self,
+        _sandbox_id: &str,
+        request: Option<&SandboxRequest>,
+    ) -> Result<()> {
+        self.terminate(
+            request
+                .context("sandbox termination requires its acquisition request")?
+                .clone(),
+        )
+        .await
+    }
+
+    /// Whether an operation failure requires reconnecting before the next operation.
+    /// Ordinary command failures and missing process IDs must not invalidate a handle.
+    /// Callers must not replay an operation whose outcome is ambiguous.
+    fn invalidates_handle(&self, _error: &anyhow::Error) -> bool {
+        false
+    }
+
     async fn attach(
         &self,
         request: SandboxRequest,
@@ -278,6 +447,10 @@ pub trait ManagedSandboxBackend: Send + Sync {
     /// backend state. Unlike stopping a handle, termination must be idempotent.
     async fn terminate(&self, _request: SandboxRequest) -> Result<()> {
         bail!("sandbox backend does not support explicit termination")
+    }
+
+    async fn delete_snapshot(&self, _payload: SnapshotPayload) -> Result<()> {
+        bail!("sandbox backend does not support snapshot deletion")
     }
 
     /// Copy the current state of `source` to `target`.
@@ -313,10 +486,11 @@ impl ContainerCliFlavor {
     }
 }
 
-const DEFAULT_ENABLED_NETWORK_NAME: &str = "exo-default";
+pub(crate) const DEFAULT_ENABLED_NETWORK_NAME: &str = "exo-default";
 const WARM_SANDBOX_KEEPALIVE_ARGV: &[&str] = &["sleep", "infinity"];
 const WARM_SANDBOX_HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const WARM_SANDBOX_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const APPLE_CONTAINER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 const ORPHANED_WARM_SANDBOX_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const DEFAULT_NETWORK_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_NETWORK_CREATE_RETRY_DELAY: Duration = Duration::from_millis(200);
@@ -463,7 +637,7 @@ pub struct CliContainerSandboxBackend {
     durable_file_system_root: Option<PathBuf>,
     system_started: Mutex<bool>,
     network_created: Mutex<bool>,
-    warm_sandboxes: Arc<Mutex<HashMap<SandboxKey, WarmSandboxEntry>>>,
+    warm_sandboxes: Arc<Mutex<HashMap<SandboxId, WarmSandboxEntry>>>,
 }
 
 static DOCKER_CONSUMABLE_SNAPSHOT_FORMATS: [SnapshotFormat; 1] = [SnapshotFormat::DockerImageTar];
@@ -564,7 +738,10 @@ impl CliContainerSandboxBackend {
             &request.spec.durable_file_systems,
         )?;
         self.ensure_system_started().await?;
-        if matches!(request.spec.network, SandboxNetworkPolicy::Enabled) {
+        if matches!(
+            request.spec.policy.networking,
+            SandboxNetworkPolicy::Unrestricted
+        ) {
             self.ensure_default_network_created().await?;
         }
 
@@ -584,14 +761,16 @@ impl CliContainerSandboxBackend {
             })
             .collect::<Result<Vec<_>>>()?;
         mounts.extend(materialize_durable_file_systems(
-            &request.key,
+            request.sandbox_id.as_str(),
             &request.spec.durable_file_systems,
             self.durable_file_system_root.as_deref(),
         )?);
 
         Ok(SandboxRequest {
-            key: request.key,
+            sandbox_id: request.sandbox_id,
+            scope: request.scope,
             spec: SandboxSpec {
+                tcp_ports: vec![],
                 image: if request.spec.image.trim().is_empty() {
                     DEFAULT_SANDBOX_IMAGE.to_string()
                 } else {
@@ -600,7 +779,7 @@ impl CliContainerSandboxBackend {
                 resources: request.spec.resources,
                 mounts,
                 durable_file_systems: request.spec.durable_file_systems,
-                network: request.spec.network,
+                policy: request.spec.policy,
                 default_workdir: request.spec.default_workdir,
             },
             lifecycle: request.lifecycle,
@@ -654,31 +833,36 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.spec.policy.validate_basic("container sandbox")?;
         let request = self.prepare_request(request).await?;
 
         if request.lifecycle.idle_ttl.is_none() {
-            return Ok(Arc::new(OneShotSandboxHandle {
-                id: format!("oneshot:{}", request.key),
-                container_bin: self.container_bin.clone(),
-                request,
-            }));
+            return Ok(crate::with_process_management(Arc::new(
+                OneShotSandboxHandle {
+                    id: format!("oneshot:{}", request.sandbox_id.as_str()),
+                    container_bin: self.container_bin.clone(),
+                    request,
+                },
+            )));
         }
 
         self.reap_expired_warm_sandboxes().await;
 
         let replaced = {
             let mut warm_sandboxes = self.warm_sandboxes.lock().await;
-            match warm_sandboxes.get(&request.key) {
+            match warm_sandboxes.get(request.sandbox_id.as_str()) {
                 Some(entry) if entry.request.spec == request.spec => {
-                    return Ok(Arc::new(WarmSandboxHandle {
-                        id: format!("warm:{}", request.key),
-                        cli: self.cli,
-                        container_bin: self.container_bin.clone(),
-                        request,
-                        warm_sandboxes: Arc::clone(&self.warm_sandboxes),
-                    }));
+                    return Ok(crate::with_process_management(Arc::new(
+                        WarmSandboxHandle {
+                            id: format!("warm:{}", request.sandbox_id.as_str()),
+                            cli: self.cli,
+                            container_bin: self.container_bin.clone(),
+                            request,
+                            warm_sandboxes: Arc::clone(&self.warm_sandboxes),
+                        },
+                    )));
                 }
-                Some(_) => warm_sandboxes.remove(&request.key),
+                Some(_) => warm_sandboxes.remove(request.sandbox_id.as_str()),
                 None => None,
             }
         };
@@ -700,7 +884,7 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         {
             let mut warm_sandboxes = self.warm_sandboxes.lock().await;
             warm_sandboxes.insert(
-                request.key.clone(),
+                request.sandbox_id.clone(),
                 WarmSandboxEntry {
                     name: name.clone(),
                     request: request.clone(),
@@ -710,13 +894,15 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
             );
         }
 
-        Ok(Arc::new(WarmSandboxHandle {
-            id: format!("warm:{}", request.key),
-            cli: self.cli,
-            container_bin: self.container_bin.clone(),
-            request,
-            warm_sandboxes: Arc::clone(&self.warm_sandboxes),
-        }))
+        Ok(crate::with_process_management(Arc::new(
+            WarmSandboxHandle {
+                id: format!("warm:{}", request.sandbox_id.as_str()),
+                cli: self.cli,
+                container_bin: self.container_bin.clone(),
+                request,
+                warm_sandboxes: Arc::clone(&self.warm_sandboxes),
+            },
+        )))
     }
 
     async fn attach(
@@ -724,18 +910,25 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         request: SandboxRequest,
         attachment: SandboxAttachment,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.spec.policy.validate_basic("container sandbox")?;
+        ensure!(
+            request.spec.policy.networking == SandboxNetworkPolicy::Unrestricted,
+            "Docker attachments cannot enforce policy.networking.disabled"
+        );
         if self.cli != ContainerCliFlavor::Docker {
             bail!("Docker container attachments require the Docker sandbox provider");
         }
         let SandboxAttachment::DockerContainer { container_id } = attachment;
         let container_id =
             inspect_running_docker_container(&self.container_bin, &container_id).await?;
-        Ok(Arc::new(BorrowedDockerSandboxHandle {
-            id: format!("borrowed-docker:{container_id}"),
-            container_bin: self.container_bin.clone(),
-            container_id,
-            spec: request.spec,
-        }))
+        Ok(crate::with_process_management(Arc::new(
+            BorrowedDockerSandboxHandle {
+                id: format!("borrowed-docker:{container_id}"),
+                container_bin: self.container_bin.clone(),
+                container_id,
+                spec: request.spec,
+            },
+        )))
     }
 
     async fn acquire_from_snapshot(
@@ -743,6 +936,7 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.spec.policy.validate_basic("container sandbox")?;
         if request.lifecycle.idle_ttl.is_none() {
             bail!("restore-from-snapshot requires a warm sandbox lifecycle (idle_ttl must be set)");
         }
@@ -763,7 +957,7 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         // whatever was running before.
         let replaced = {
             let mut warm_sandboxes = self.warm_sandboxes.lock().await;
-            warm_sandboxes.remove(&request.key)
+            warm_sandboxes.remove(request.sandbox_id.as_str())
         };
         if let Some(entry) = replaced {
             schedule_cleanup_named_container(self.container_bin.clone(), self.cli, entry.name);
@@ -773,7 +967,7 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
         {
             let mut warm_sandboxes = self.warm_sandboxes.lock().await;
             warm_sandboxes.insert(
-                request.key.clone(),
+                request.sandbox_id.clone(),
                 WarmSandboxEntry {
                     name: name.clone(),
                     request: request.clone(),
@@ -783,21 +977,32 @@ impl ManagedSandboxBackend for CliContainerSandboxBackend {
             );
         }
 
-        Ok(Arc::new(WarmSandboxHandle {
-            id: format!("warm:{}", request.key),
-            cli: self.cli,
-            container_bin: self.container_bin.clone(),
-            request,
-            warm_sandboxes: Arc::clone(&self.warm_sandboxes),
-        }))
+        Ok(crate::with_process_management(Arc::new(
+            WarmSandboxHandle {
+                id: format!("warm:{}", request.sandbox_id.as_str()),
+                cli: self.cli,
+                container_bin: self.container_bin.clone(),
+                request,
+                warm_sandboxes: Arc::clone(&self.warm_sandboxes),
+            },
+        )))
     }
 
     async fn terminate(&self, request: SandboxRequest) -> Result<()> {
-        if let Some(entry) = self.warm_sandboxes.lock().await.remove(&request.key) {
+        if let Some(entry) = self
+            .warm_sandboxes
+            .lock()
+            .await
+            .remove(request.sandbox_id.as_str())
+        {
             cleanup_named_container(&self.container_bin, self.cli, &entry.name).await?;
         }
-        for container in
-            find_sandbox_containers_for_key(&self.container_bin, self.cli, &request.key).await?
+        for container in find_sandbox_containers_for_id(
+            &self.container_bin,
+            self.cli,
+            request.sandbox_id.as_str(),
+        )
+        .await?
         {
             cleanup_named_container(&self.container_bin, self.cli, &container).await?;
         }
@@ -859,7 +1064,7 @@ impl ManagedSandboxHandle for OneShotSandboxHandle {
         exec_one_shot(
             &self.container_bin,
             &self.request.spec,
-            network_name_for_policy(self.request.spec.network),
+            network_name_for_policy(&self.request.spec.policy.networking),
             command,
         )
         .await
@@ -869,7 +1074,7 @@ impl ManagedSandboxHandle for OneShotSandboxHandle {
         start_one_shot_process(
             &self.container_bin,
             &self.request.spec,
-            network_name_for_policy(self.request.spec.network),
+            network_name_for_policy(&self.request.spec.policy.networking),
             command,
         )
         .await
@@ -895,7 +1100,7 @@ struct WarmSandboxHandle {
     cli: ContainerCliFlavor,
     container_bin: PathBuf,
     request: SandboxRequest,
-    warm_sandboxes: Arc<Mutex<HashMap<SandboxKey, WarmSandboxEntry>>>,
+    warm_sandboxes: Arc<Mutex<HashMap<SandboxId, WarmSandboxEntry>>>,
 }
 
 #[async_trait]
@@ -916,9 +1121,9 @@ impl ManagedSandboxHandle for WarmSandboxHandle {
             &self.warm_sandboxes,
         )
         .await?;
-        touch_warm_sandbox(&self.warm_sandboxes, &self.request.key).await;
+        touch_warm_sandbox(&self.warm_sandboxes, self.request.sandbox_id.as_str()).await;
         let output = exec_warm(&self.container_bin, &name, &self.request.spec, command).await;
-        touch_warm_sandbox(&self.warm_sandboxes, &self.request.key).await;
+        touch_warm_sandbox(&self.warm_sandboxes, self.request.sandbox_id.as_str()).await;
         output
     }
 
@@ -930,14 +1135,14 @@ impl ManagedSandboxHandle for WarmSandboxHandle {
             &self.warm_sandboxes,
         )
         .await?;
-        touch_warm_sandbox(&self.warm_sandboxes, &self.request.key).await;
+        touch_warm_sandbox(&self.warm_sandboxes, self.request.sandbox_id.as_str()).await;
         start_warm_process(&self.container_bin, &name, &self.request.spec, command).await
     }
 
     async fn stop(&self) -> Result<()> {
         let removed = {
             let mut warm_sandboxes = self.warm_sandboxes.lock().await;
-            warm_sandboxes.remove(&self.request.key)
+            warm_sandboxes.remove(self.request.sandbox_id.as_str())
         };
 
         if let Some(entry) = removed
@@ -963,7 +1168,7 @@ impl ManagedSandboxHandle for WarmSandboxHandle {
         let container_id = inspect_running_docker_container(&self.container_bin, &name).await?;
         let mut warm_sandboxes = self.warm_sandboxes.lock().await;
         let entry = warm_sandboxes
-            .get_mut(&self.request.key)
+            .get_mut(self.request.sandbox_id.as_str())
             .ok_or_else(|| anyhow!("warm sandbox disappeared while detaching"))?;
         entry.owned = false;
         Ok(SandboxAttachment::DockerContainer { container_id })
@@ -979,7 +1184,7 @@ impl ManagedSandboxHandle for WarmSandboxHandle {
                     &self.warm_sandboxes,
                 )
                 .await?;
-                touch_warm_sandbox(&self.warm_sandboxes, &self.request.key).await;
+                touch_warm_sandbox(&self.warm_sandboxes, self.request.sandbox_id.as_str()).await;
                 docker_snapshot_container(&self.container_bin, &name).await
             }
             // The Apple `container` CLI exposes `container image save` and a
@@ -990,7 +1195,7 @@ impl ManagedSandboxHandle for WarmSandboxHandle {
             // know to choose Docker for snapshot-using flows.
             ContainerCliFlavor::AppleContainer => bail!(
                 "snapshot is not yet implemented for the apple-container backend; \
-                 use --provider docker for snapshot-using flows"
+                 use --sandbox docker for snapshot-using flows"
             ),
         }
     }
@@ -1016,13 +1221,20 @@ impl ManagedSandboxBackend for LocalProcessSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.spec.policy.validate_basic("local process")?;
+        ensure!(
+            request.spec.policy.networking == SandboxNetworkPolicy::Unrestricted,
+            "local process does not support policy.networking.disabled"
+        );
         if !request.spec.durable_file_systems.is_empty() {
             bail!("local-process sandbox backend does not support durable file systems");
         }
-        Ok(Arc::new(LocalProcessSandboxHandle {
-            id: format!("local:{}", request.key),
-            request,
-        }))
+        Ok(crate::with_process_management(Arc::new(
+            LocalProcessSandboxHandle {
+                id: format!("local:{}", request.sandbox_id.as_str()),
+                request,
+            },
+        )))
     }
 
     async fn attach(
@@ -1128,7 +1340,7 @@ fn resolve_local_workdir(spec: &SandboxSpec, cwd: &str) -> Option<PathBuf> {
 }
 
 fn materialize_durable_file_systems(
-    key: &SandboxKey,
+    sandbox_id: &str,
     file_systems: &[DurableFileSystem],
     configured_root: Option<&Path>,
 ) -> Result<Vec<SandboxMount>> {
@@ -1139,7 +1351,10 @@ fn materialize_durable_file_systems(
     file_systems
         .iter()
         .map(|file_system| {
-            let host_path = root.join(stable_fnv1a_hex(&format!("{}\n{}", key, file_system.name)));
+            let host_path = root.join(stable_fnv1a_hex(&format!(
+                "{}\n{}",
+                sandbox_id, file_system.name
+            )));
             std::fs::create_dir_all(&host_path).with_context(|| {
                 format!(
                     "creating durable file system {} at {}",
@@ -1261,11 +1476,11 @@ pub(crate) fn stable_fnv1a_hex(input: &str) -> String {
 }
 
 async fn touch_warm_sandbox(
-    warm_sandboxes: &Arc<Mutex<HashMap<SandboxKey, WarmSandboxEntry>>>,
-    key: &SandboxKey,
+    warm_sandboxes: &Arc<Mutex<HashMap<SandboxId, WarmSandboxEntry>>>,
+    sandbox_id: &str,
 ) {
     let mut warm_sandboxes = warm_sandboxes.lock().await;
-    if let Some(entry) = warm_sandboxes.get_mut(key) {
+    if let Some(entry) = warm_sandboxes.get_mut(sandbox_id) {
         entry.last_used_at = Instant::now();
     }
 }
@@ -1282,7 +1497,10 @@ async fn create_named_warm_sandbox(
         .arg("--name")
         .arg(name)
         .arg("--label")
-        .arg(format!("{WARM_SANDBOX_KEY_LABEL}={}", request.key))
+        .arg(format!(
+            "{WARM_SANDBOX_KEY_LABEL}={}",
+            request.sandbox_id.as_str()
+        ))
         .arg("--label")
         .arg(format!(
             "{WARM_SANDBOX_SPEC_HASH_LABEL}={}",
@@ -1298,9 +1516,10 @@ async fn create_named_warm_sandbox(
 
     configure_network_args(
         &mut process,
-        request.spec.network,
+        &request.spec.policy.networking,
         Some(DEFAULT_ENABLED_NETWORK_NAME),
     );
+    configure_resource_args(&mut process, request.spec.resources);
     configure_mount_args(&mut process, &request.spec.mounts);
 
     process.arg(&request.spec.image);
@@ -1321,7 +1540,7 @@ async fn create_unique_warm_sandbox(
     request: &SandboxRequest,
 ) -> Result<String> {
     for _ in 0..4 {
-        let name = new_warm_container_name(&request.key);
+        let name = new_warm_container_name(request.sandbox_id.as_str());
         match create_named_warm_sandbox(container_bin, request, &name).await {
             Ok(()) => return Ok(name),
             Err(err) if is_already_exists_error(&err.to_string()) => continue,
@@ -1331,7 +1550,7 @@ async fn create_unique_warm_sandbox(
 
     Err(anyhow!(
         "failed to allocate a unique warm sandbox name for {}",
-        request.key
+        request.sandbox_id.as_str()
     ))
 }
 
@@ -1350,12 +1569,12 @@ async fn find_running_warm_sandbox(
     }
 }
 
-/// Every container labelled for `key`, running or not, so termination also
+/// Every container labelled for `sandbox_id`, running or not, so termination also
 /// clears records left behind by an earlier process.
-async fn find_sandbox_containers_for_key(
+async fn find_sandbox_containers_for_id(
     container_bin: &Path,
     cli: ContainerCliFlavor,
-    key: &SandboxKey,
+    sandbox_id: &str,
 ) -> Result<Vec<String>> {
     match cli {
         ContainerCliFlavor::AppleContainer => {
@@ -1379,17 +1598,17 @@ async fn find_sandbox_containers_for_key(
                         .configuration
                         .labels
                         .get(WARM_SANDBOX_KEY_LABEL)
-                        .is_some_and(|value| value == &key.to_string())
+                        .is_some_and(|value| value == &sandbox_id.to_string())
                 })
                 .map(|container| container.configuration.id)
                 .collect())
         }
         ContainerCliFlavor::Docker => {
-            let key_filter = format!("label={WARM_SANDBOX_KEY_LABEL}={key}");
+            let id_filter = format!("label={WARM_SANDBOX_KEY_LABEL}={sandbox_id}");
             let output = run_container_admin_command(
                 container_bin,
                 WARM_SANDBOX_CLEANUP_TIMEOUT,
-                ["ps", "-aq", "--no-trunc", "--filter", key_filter.as_str()],
+                ["ps", "-aq", "--no-trunc", "--filter", id_filter.as_str()],
             )
             .await?;
             if !output.status.success() {
@@ -1434,7 +1653,7 @@ async fn find_running_apple_container_warm_sandbox(
         let labels = &container.configuration.labels;
         let key_matches = labels
             .get(WARM_SANDBOX_KEY_LABEL)
-            .is_some_and(|value| value == &request.key.to_string());
+            .is_some_and(|value| value == request.sandbox_id.as_str());
         let spec_matches = labels
             .get(WARM_SANDBOX_SPEC_HASH_LABEL)
             .is_some_and(|value| value == &spec_hash);
@@ -1447,7 +1666,10 @@ async fn find_running_docker_warm_sandbox(
     request: &SandboxRequest,
 ) -> Result<Option<String>> {
     let spec_hash = sandbox_spec_hash(&request.spec);
-    let key_filter = format!("label={WARM_SANDBOX_KEY_LABEL}={}", request.key);
+    let key_filter = format!(
+        "label={WARM_SANDBOX_KEY_LABEL}={}",
+        request.sandbox_id.as_str()
+    );
     let spec_filter = format!("label={WARM_SANDBOX_SPEC_HASH_LABEL}={spec_hash}");
     let output = run_container_admin_command(
         container_bin,
@@ -1483,7 +1705,7 @@ async fn ensure_warm_sandbox_ready(
     container_bin: &Path,
     cli: ContainerCliFlavor,
     request: &SandboxRequest,
-    warm_sandboxes: &Arc<Mutex<HashMap<SandboxKey, WarmSandboxEntry>>>,
+    warm_sandboxes: &Arc<Mutex<HashMap<SandboxId, WarmSandboxEntry>>>,
 ) -> Result<String> {
     let healthcheck = SandboxCommand {
         argv: vec!["/bin/true".to_string()],
@@ -1494,14 +1716,14 @@ async fn ensure_warm_sandbox_ready(
     };
 
     let mut warm_sandboxes = warm_sandboxes.lock().await;
-    let (current_name, current_owned) = match warm_sandboxes.get_mut(&request.key) {
+    let (current_name, current_owned) = match warm_sandboxes.get_mut(request.sandbox_id.as_str()) {
         Some(entry) if entry.request.spec == request.spec => {
             entry.last_used_at = Instant::now();
             (entry.name.clone(), entry.owned)
         }
         Some(_) => {
             let stale = warm_sandboxes
-                .remove(&request.key)
+                .remove(request.sandbox_id.as_str())
                 .expect("entry disappeared while locked");
             if stale.owned {
                 schedule_cleanup_named_container(container_bin.to_path_buf(), cli, stale.name);
@@ -1515,7 +1737,7 @@ async fn ensure_warm_sandbox_ready(
                 ),
             };
             warm_sandboxes.insert(
-                request.key.clone(),
+                request.sandbox_id.clone(),
                 WarmSandboxEntry {
                     name: name.clone(),
                     request: request.clone(),
@@ -1535,7 +1757,7 @@ async fn ensure_warm_sandbox_ready(
                 ),
             };
             warm_sandboxes.insert(
-                request.key.clone(),
+                request.sandbox_id.clone(),
                 WarmSandboxEntry {
                     name: name.clone(),
                     request: request.clone(),
@@ -1564,7 +1786,7 @@ async fn ensure_warm_sandbox_ready(
             ),
         };
     warm_sandboxes.insert(
-        request.key.clone(),
+        request.sandbox_id.clone(),
         WarmSandboxEntry {
             name: replacement_name.clone(),
             request: request.clone(),
@@ -1596,7 +1818,8 @@ async fn exec_one_shot(
 
     let mut process = Command::new(container_bin);
     process.arg("run").arg("--rm").arg("--workdir").arg(&cwd);
-    configure_network_args(&mut process, spec.network, network_name);
+    configure_network_args(&mut process, &spec.policy.networking, network_name);
+    configure_resource_args(&mut process, spec.resources);
     configure_mount_args(&mut process, &spec.mounts);
     configure_env_args(&mut process, &command.env);
     process.arg(&spec.image);
@@ -1628,7 +1851,8 @@ async fn start_one_shot_process(
         .arg("--interactive")
         .arg("--workdir")
         .arg(&cwd);
-    configure_network_args(&mut process, spec.network, network_name);
+    configure_network_args(&mut process, &spec.policy.networking, network_name);
+    configure_resource_args(&mut process, spec.resources);
     configure_mount_args(&mut process, &spec.mounts);
     configure_env_args(&mut process, &command.env);
     process.arg(&spec.image);
@@ -1778,18 +2002,28 @@ fn wait_for_child(mut child: Child) -> BoxFuture<'static, crate::Result<i32>> {
 
 fn configure_network_args(
     process: &mut Command,
-    policy: SandboxNetworkPolicy,
+    policy: &SandboxNetworkPolicy,
     network_name: Option<&str>,
 ) {
     match policy {
-        SandboxNetworkPolicy::Disabled => {
+        SandboxNetworkPolicy::Disabled | SandboxNetworkPolicy::Limited { .. } => {
             process.arg("--network").arg("none");
         }
-        SandboxNetworkPolicy::Enabled => {
+        SandboxNetworkPolicy::Unrestricted => {
             if let Some(network_name) = network_name {
                 process.arg("--network").arg(network_name);
             }
         }
+    }
+}
+
+fn configure_resource_args(process: &mut Command, resources: Option<crate::SandboxResourceShape>) {
+    if let Some(resources) = resources {
+        process
+            .arg("--cpus")
+            .arg(resources.vcpu_count.to_string())
+            .arg("--memory")
+            .arg(format!("{}M", resources.memory_mib));
     }
 }
 
@@ -1861,13 +2095,22 @@ async fn cleanup_named_container(
 }
 
 async fn kill_named_container_if_present(container_bin: &Path, name: &str) -> Result<()> {
-    let kill =
-        run_container_admin_command(container_bin, WARM_SANDBOX_CLEANUP_TIMEOUT, ["kill", name])
-            .await?;
+    // Apple container kill waits for VM teardown; delete only removes its metadata.
+    let kill = run_container_admin_command(
+        container_bin,
+        APPLE_CONTAINER_SHUTDOWN_TIMEOUT,
+        ["kill", name],
+    )
+    .await?;
     if !kill.status.success() {
         let stderr = String::from_utf8_lossy(&kill.stderr).trim().to_string();
         if !is_missing_container_error(&stderr) && !is_container_not_running_error(&stderr) {
-            return Err(anyhow!("failed to kill warm sandbox {}: {}", name, stderr));
+            return Err(anyhow!(
+                "failed to kill warm sandbox {} ({}): {}",
+                name,
+                kill.status,
+                stderr
+            ));
         }
     }
     Ok(())
@@ -2059,11 +2302,11 @@ fn schedule_cleanup_named_container(container_bin: PathBuf, cli: ContainerCliFla
 fn missing_container_cli_message(cli: ContainerCliFlavor, container_bin: &Path) -> String {
     match cli {
         ContainerCliFlavor::AppleContainer => format!(
-            "apple-container sandbox backend requires the `{}` CLI; install Apple container CLI or use `--provider local-process`",
+            "apple-container sandbox backend requires the `{}` CLI; install Apple container CLI or use `--sandbox local-process`",
             container_bin.display()
         ),
         ContainerCliFlavor::Docker => format!(
-            "docker sandbox backend requires the `{}` CLI; install Docker or use `--provider local-process`",
+            "docker sandbox backend requires the `{}` CLI; install Docker or use `--sandbox local-process`",
             container_bin.display()
         ),
     }
@@ -2089,6 +2332,8 @@ where
         .join(" ");
     let mut command = Command::new(container_bin);
     command.args(&args).kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     match time::timeout(timeout, command.output()).await {
         Ok(output) => Ok(output?),
         Err(_) => Err(anyhow!(
@@ -2129,13 +2374,13 @@ fn render_command_error(stderr: &[u8]) -> String {
     String::from_utf8_lossy(stderr).trim().to_string()
 }
 
-fn network_name_for_policy(policy: SandboxNetworkPolicy) -> Option<&'static str> {
-    matches!(policy, SandboxNetworkPolicy::Enabled).then_some(DEFAULT_ENABLED_NETWORK_NAME)
+fn network_name_for_policy(policy: &SandboxNetworkPolicy) -> Option<&'static str> {
+    matches!(policy, SandboxNetworkPolicy::Unrestricted).then_some(DEFAULT_ENABLED_NETWORK_NAME)
 }
 
-fn new_warm_container_name(key: &SandboxKey) -> String {
+fn new_warm_container_name(sandbox_id: &str) -> String {
     let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
+    sandbox_id.hash(&mut hasher);
     let hash = hasher.finish();
     let generation = Uuid::new_v4().simple().to_string();
     format!("exo-{hash:016x}-{}", &generation[..8])
@@ -2280,33 +2525,126 @@ async fn docker_load_image(container_bin: &Path, payload: &Bytes) -> Result<Stri
 mod tests {
     use super::*;
 
-    #[test]
-    fn conversation_sandbox_key_uses_thread_id_and_reads_conversation_id() {
-        let key = SandboxKey::ConversationSandbox {
-            thread_id: "thread-1".to_string(),
-            sandbox_id: "sandbox-1".to_string(),
-        };
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn container_admin_commands_have_their_own_process_group() -> Result<()> {
+        let output = run_container_admin_command(
+            Path::new("/bin/sh"),
+            Duration::from_secs(5),
+            ["-c", r#"printf '%s ' "$$"; ps -o pgid= -p "$$""#],
+        )
+        .await?;
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout)?;
+        let ids = output.split_whitespace().collect::<Vec<_>>();
+        assert_eq!(ids.len(), 2, "{output}");
+        assert_eq!(
+            ids[0], ids[1],
+            "cleanup must not share the terminal's process group"
+        );
+        Ok(())
+    }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn container_creation_preserves_omitted_and_explicit_resources() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        let cli = temp.path().join("container");
+        let args = temp.path().join("container.args");
+        std::fs::write(&cli, "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$0.args\"\n")?;
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755))?;
+        for resources in [None, Some(crate::SandboxResourceShape::default())] {
+            let request = SandboxRequest {
+                sandbox_id: "sandbox".into(),
+                scope: ResourceScope::Global,
+                spec: SandboxSpec {
+                    tcp_ports: vec![],
+                    image: "image".into(),
+                    resources,
+                    mounts: vec![],
+                    durable_file_systems: vec![],
+                    policy: SandboxNetworkPolicy::Unrestricted.into(),
+                    default_workdir: "/".into(),
+                },
+                lifecycle: SandboxLifecycleConfig::default(),
+                provider_state: None,
+            };
+            let command = SandboxCommand {
+                argv: vec!["true".into()],
+                env: HashMap::new(),
+                display_argv: None,
+                cwd: None,
+                timeout: None,
+            };
+            std::fs::write(&args, "")?;
+            create_named_warm_sandbox(&cli, &request, "name").await?;
+            assert!(exec_one_shot(&cli, &request.spec, None, &command).await?.ok);
+            assert_eq!(
+                start_one_shot_process(&cli, &request.spec, None, &command)
+                    .await?
+                    .wait
+                    .await?,
+                0
+            );
+            let args = std::fs::read_to_string(&args)?;
+            let expected_count = if resources.is_some() { 3 } else { 0 };
+            assert_eq!(
+                args.lines().filter(|arg| *arg == "--cpus").count(),
+                expected_count
+            );
+            assert_eq!(
+                args.lines().filter(|arg| *arg == "--memory").count(),
+                expected_count
+            );
+            if let Some(resources) = resources {
+                assert_eq!(
+                    args.matches(&format!(
+                        "--cpus\n{}\n--memory\n{}M\n",
+                        resources.vcpu_count, resources.memory_mib
+                    ))
+                    .count(),
+                    3
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn thread_resource_scope_round_trips() {
+        let scope = ResourceScope::Thread {
+            agent_id: crate::Uuid7::now(),
+            thread_id: crate::Uuid7::now(),
+        };
         assert_eq!(
-            serde_json::to_value(&key).unwrap(),
-            serde_json::json!({
-                "ConversationSandbox": {
-                    "thread_id": "thread-1",
-                    "sandbox_id": "sandbox-1"
-                }
-            })
+            serde_json::from_slice::<ResourceScope>(&serde_json::to_vec(&scope).unwrap()).unwrap(),
+            scope
         );
-        assert_eq!(
-            serde_json::from_value::<SandboxKey>(serde_json::json!({
-                "ConversationSandbox": {
-                    "conversation_id": "thread-1",
-                    "sandbox_id": "sandbox-1"
-                }
-            }))
-            .unwrap(),
-            key
-        );
-        assert_eq!(key.to_string(), "thread:thread-1:sandbox-1");
+    }
+
+    #[test]
+    fn raw_sandbox_requests_do_not_require_scope() {
+        let request: SandboxRequest = serde_json::from_value(serde_json::json!({
+            "sandbox_id": "sandbox-1",
+            "spec": {
+                "image": "alpine",
+                "mounts": [],
+                "durable_file_systems": [],
+                "policy": { "networking": { "type": "disabled" }, "credentials": [] },
+                "default_workdir": "/"
+            },
+            "lifecycle": {},
+            "provider_state": null
+        }))
+        .unwrap();
+        assert_eq!(request.sandbox_id, "sandbox-1");
+        assert_eq!(request.scope, ResourceScope::Global);
+        let mut serialized = serde_json::to_value(&request).unwrap();
+        assert_eq!(serialized["scope"], serde_json::json!({"type": "global"}));
+        serialized.as_object_mut().unwrap().remove("sandbox_id");
+        assert!(serde_json::from_value::<SandboxRequest>(serialized).is_err());
     }
 
     #[test]
@@ -2420,16 +2758,18 @@ mod tests {
         fs::set_permissions(&script_path, permissions).expect("chmod fake docker");
 
         let request = SandboxRequest {
-            key: SandboxKey::ConversationSandbox {
-                thread_id: "thread".to_string(),
-                sandbox_id: "sandbox".to_string(),
+            sandbox_id: "sandbox".to_string(),
+            scope: ResourceScope::Thread {
+                agent_id: crate::Uuid7::now(),
+                thread_id: "00000000-0000-7000-8000-000000000001".parse().unwrap(),
             },
             spec: SandboxSpec {
+                tcp_ports: vec![],
                 image: "docker.io/library/ubuntu:24.04".to_string(),
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                policy: SandboxNetworkPolicy::Disabled.into(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2444,7 +2784,10 @@ mod tests {
             .expect("find warm sandbox");
         assert_eq!(name.as_deref(), Some("warm-name"));
 
-        let key_filter = format!("label={WARM_SANDBOX_KEY_LABEL}={}", request.key);
+        let key_filter = format!(
+            "label={WARM_SANDBOX_KEY_LABEL}={}",
+            request.sandbox_id.as_str()
+        );
         let spec_filter = format!("label={WARM_SANDBOX_SPEC_HASH_LABEL}={spec_hash}");
         let args = fs::read_to_string(&args_path).expect("read fake docker args");
         assert_eq!(
@@ -2497,16 +2840,18 @@ mod tests {
             warm_sandboxes: Arc::new(Mutex::new(HashMap::new())),
         };
         let request = SandboxRequest {
-            key: SandboxKey::ConversationSandbox {
-                thread_id: "thread".to_string(),
-                sandbox_id: "sandbox".to_string(),
+            sandbox_id: "sandbox".to_string(),
+            scope: ResourceScope::Thread {
+                agent_id: crate::Uuid7::now(),
+                thread_id: "00000000-0000-7000-8000-000000000001".parse().unwrap(),
             },
             spec: SandboxSpec {
+                tcp_ports: vec![],
                 image: "docker.io/library/ubuntu:24.04".to_string(),
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                policy: SandboxNetworkPolicy::Disabled.into(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2590,16 +2935,18 @@ esac
             warm_sandboxes: Arc::new(Mutex::new(HashMap::new())),
         };
         let request = SandboxRequest {
-            key: SandboxKey::ConversationSandbox {
-                thread_id: "thread".to_string(),
-                sandbox_id: "sandbox".to_string(),
+            sandbox_id: "sandbox".to_string(),
+            scope: ResourceScope::Thread {
+                agent_id: crate::Uuid7::now(),
+                thread_id: "00000000-0000-7000-8000-000000000001".parse().unwrap(),
             },
             spec: SandboxSpec {
+                tcp_ports: vec![],
                 image: "docker.io/library/ubuntu:24.04".to_string(),
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Disabled,
+                policy: SandboxNetworkPolicy::Disabled.into(),
                 default_workdir: "/".to_string(),
             },
             lifecycle: SandboxLifecycleConfig {
@@ -2653,7 +3000,7 @@ esac
         let message = format!("{error:#}");
         assert!(message.contains("apple-container sandbox backend requires"));
         assert!(message.contains("install Apple container CLI"));
-        assert!(message.contains("--provider local-process"));
+        assert!(message.contains("--sandbox local-process"));
     }
 
     #[cfg(unix)]
@@ -2702,16 +3049,18 @@ esac
             warm_sandboxes: Arc::new(Mutex::new(HashMap::new())),
         };
         let request = SandboxRequest {
-            key: SandboxKey::ConversationSandbox {
-                thread_id: "thread".to_string(),
-                sandbox_id: "sandbox".to_string(),
+            sandbox_id: "sandbox".to_string(),
+            scope: ResourceScope::Thread {
+                agent_id: crate::Uuid7::now(),
+                thread_id: "00000000-0000-7000-8000-000000000001".parse().unwrap(),
             },
             spec: SandboxSpec {
+                tcp_ports: vec![],
                 image: "task-image".to_string(),
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Enabled,
+                policy: SandboxNetworkPolicy::Unrestricted.into(),
                 default_workdir: "/task".to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),

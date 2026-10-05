@@ -7,7 +7,6 @@
 # exo
 
 [![CI](https://github.com/exoharness/exo/actions/workflows/ci.yml/badge.svg)](https://github.com/exoharness/exo/actions/workflows/ci.yml)
-[![Integration tests](https://github.com/exoharness/exo/actions/workflows/integration.yml/badge.svg)](https://github.com/exoharness/exo/actions/workflows/integration.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg?logo=rust)](Cargo.toml)
 [![TypeScript](https://img.shields.io/badge/typescript-5.x-3178c6.svg?logo=typescript&logoColor=white)](tsconfig.json)
@@ -47,9 +46,12 @@ In short, we think this is the best way to take advantage of the growing power
 of AI models when building long-lived agents.
 
 For a more complete description of the architectural philosophy read
-[A Systems View of Recursive Self Improvement](exo/docs/RSI.md)
+[A Systems View of Recursive Self Improvement](docs/RSI.md)
 
 <!-- ![Exo playinb pokemon go](docs/images/exo_playing.gif) -->
+
+Write and run a custom agent from a Markdown file with `exo agent run --agent-file`.
+See [managed agents](exoharness/docs/managed-agents.md) for setup, saved agents, and thread resume.
 
 ## Quick Start
 

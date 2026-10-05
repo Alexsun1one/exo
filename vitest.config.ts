@@ -1,8 +1,17 @@
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 // Mirror the tsconfig path aliases so tests can import modules that use them.
 export default defineConfig({
+  test: {
+    exclude: [
+      ...configDefaults.exclude,
+      "**/.exo/**",
+      "**/.local/**",
+      "exoharness/examples/tutorials/**/sample-repo/**",
+      "scratch/**",
+    ],
+  },
   resolve: {
     alias: {
       "@exo/harness/tool": fileURLToPath(
@@ -14,6 +23,21 @@ export default defineConfig({
       "@exo/model-runtime/responses": fileURLToPath(
         new URL(
           "./exoharness/typescript/model-runtime/responses.ts",
+          import.meta.url,
+        ),
+      ),
+      "@exo/model-runtime/cost": fileURLToPath(
+        new URL(
+          "./exoharness/typescript/model-runtime/cost.ts",
+          import.meta.url,
+        ),
+      ),
+      "@exo/codex/app-server": fileURLToPath(
+        new URL("./exoharness/typescript/codex/app-server.ts", import.meta.url),
+      ),
+      "@exo/model-runtime/usage": fileURLToPath(
+        new URL(
+          "./exoharness/typescript/model-runtime/usage.ts",
           import.meta.url,
         ),
       ),

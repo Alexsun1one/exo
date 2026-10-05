@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use exoharness::{
-    E2bConfig, E2bSandboxBackend, ManagedSandboxBackend, ManagedSandboxHandle, SandboxCommand,
-    SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxRequest, SandboxSpec,
+    E2bConfig, E2bSandboxBackend, ManagedSandboxBackend, ManagedSandboxHandle, ResourceScope,
+    SandboxCommand, SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxRequest, SandboxSpec,
     SpritesConfig, SpritesSandboxBackend,
 };
 use futures::io::AsyncReadExt;
@@ -33,18 +33,20 @@ fn live_provider_secret(provider: &str, secret_name: &str) -> Option<String> {
     }
 }
 
-fn make_e2b_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
+fn make_e2b_request(thread_id: exoharness::Uuid7, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
-        key: SandboxKey::ConversationSandbox {
-            thread_id: thread_id.into(),
-            sandbox_id: sandbox_id.into(),
+        sandbox_id: sandbox_id.into(),
+        scope: ResourceScope::Thread {
+            agent_id: exoharness::Uuid7::now(),
+            thread_id,
         },
         spec: SandboxSpec {
+            tcp_ports: vec![],
             image: e2b_template_id(),
             resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            policy: SandboxNetworkPolicy::Unrestricted.into(),
             default_workdir: "/home/user".into(),
         },
         lifecycle: SandboxLifecycleConfig {
@@ -83,18 +85,20 @@ fn sprites_config_from_env() -> Option<SpritesConfig> {
     })
 }
 
-fn make_sprites_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
+fn make_sprites_request(thread_id: exoharness::Uuid7, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
-        key: SandboxKey::ConversationSandbox {
-            thread_id: thread_id.into(),
-            sandbox_id: sandbox_id.into(),
+        sandbox_id: sandbox_id.into(),
+        scope: ResourceScope::Thread {
+            agent_id: exoharness::Uuid7::now(),
+            thread_id,
         },
         spec: SandboxSpec {
+            tcp_ports: vec![],
             image: "default".into(),
             resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            policy: SandboxNetworkPolicy::Unrestricted.into(),
             default_workdir: "/home/sprite".into(),
         },
         lifecycle: SandboxLifecycleConfig {
@@ -112,7 +116,10 @@ async fn e2b_start_process_streams_incrementally() {
     };
 
     let handle = backend
-        .acquire(make_e2b_request("live-e2b-stream", "sandbox-live-stream"))
+        .acquire(make_e2b_request(
+            exoharness::Uuid7::now(),
+            "sandbox-live-stream",
+        ))
         .await
         .expect("acquire E2B sandbox");
     assert_streaming_script(handle, "E2B", "/home/user").await;
@@ -128,7 +135,7 @@ async fn sprites_start_process_streams_incrementally() {
 
     let handle = backend
         .acquire(make_sprites_request(
-            "live-sprites-stream",
+            exoharness::Uuid7::now(),
             "sandbox-live-stream",
         ))
         .await
@@ -145,7 +152,7 @@ async fn e2b_start_process_contract() {
 
     let handle = backend
         .acquire(make_e2b_request(
-            "live-e2b-contract",
+            exoharness::Uuid7::now(),
             "sandbox-live-contract",
         ))
         .await
@@ -167,7 +174,7 @@ async fn sprites_start_process_contract() {
 
     let handle = backend
         .acquire(make_sprites_request(
-            "live-sprites-contract",
+            exoharness::Uuid7::now(),
             "sandbox-live-contract",
         ))
         .await

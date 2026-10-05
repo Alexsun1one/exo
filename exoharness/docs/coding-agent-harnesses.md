@@ -17,8 +17,8 @@ The examples below use `./target/debug/exo`. If you have the binary on your
 The `codex`, `claude-code`, and `cursor` harness presets select the matching
 TypeScript module, sandbox image, and networking defaults.
 
-For `secret set`, `--env` takes the variable name literally. For example, use
-`--env OPENAI_API_KEY`, not `--env $OPENAI_API_KEY`.
+For `vault secret create`, `--token-env` takes the variable name literally. For example, use
+`--token-env OPENAI_API_KEY`, not `--token-env $OPENAI_API_KEY`.
 
 The sandbox image commands use Apple container. It currently requires an Apple
 silicon Mac running macOS 26 or newer.
@@ -38,13 +38,21 @@ container system start
 For upgrades, downgrades, uninstall instructions, and building from source, see
 <https://github.com/apple/container>.
 
+The built-in TypeScript harness constructors resolve bundled runners and modules
+from the source checkout used to build Exo, for both Basic and Exo tool runtimes.
+Keep that checkout installed; embedders can pass an explicit workspace root to
+`TypeScriptHarness::new`.
+
 ## Codex
 
-Register an OpenAI model:
+Usage counts upstream `rawResponse/completed` records, including local replay
+compaction. Codex's remote compaction endpoint does not expose billable usage;
+its context-size estimates are excluded from token and cost totals.
+
+Store an OpenAI credential:
 
 ```bash
-./target/debug/exo secret set openai --env OPENAI_API_KEY
-./target/debug/exo model register gpt-5.5 --secret openai
+./target/debug/exo vault secret create global openai --token-env OPENAI_API_KEY --allow-origin https://api.openai.com
 ```
 
 Build the sandbox image:
@@ -59,21 +67,29 @@ container build \
 Create the agent and start a conversation:
 
 ```bash
-./target/debug/exo --harness codex agent create "TS Codex" \
-  --model gpt-5.5
+cat > ts-codex.md <<'EOF'
+---
+name: "TS Codex"
+harness: codex
+config:
+  model: gpt-5.5
+  credential: openai
+---
+Help the user with their task.
+EOF
+./target/debug/exo agent create ts-codex --file ts-codex.md
 
-./target/debug/exo conversation create ts-codex
-./target/debug/exo conversation mount add ts-codex <conversation> "$PWD" /workspace --rw
-./target/debug/exo repl --agent ts-codex --conversation <conversation>
+./target/debug/exo thread create ts-codex
+./target/debug/exo thread mount create ts-codex <conversation> "$PWD" /workspace --rw
+./target/debug/exo agent run --agent ts-codex --thread <conversation>
 ```
 
 ## Claude Code
 
-Register an Anthropic model:
+Store an Anthropic credential:
 
 ```bash
-./target/debug/exo secret set anthropic --env ANTHROPIC_API_KEY
-./target/debug/exo model register claude-sonnet-4-6 --secret anthropic
+./target/debug/exo vault secret create global anthropic --token-env ANTHROPIC_API_KEY --allow-origin https://api.anthropic.com
 ```
 
 Build the sandbox image:
@@ -88,21 +104,29 @@ container build \
 Create the agent and start a conversation:
 
 ```bash
-./target/debug/exo --harness claude-code agent create "TS Claude Code" \
-  --model claude-sonnet-4-6
+cat > ts-claude-code.md <<'EOF'
+---
+name: "TS Claude Code"
+harness: claude-code
+config:
+  model: claude-sonnet-4-6
+  credential: anthropic
+---
+Help the user with their task.
+EOF
+./target/debug/exo agent create ts-claude-code --file ts-claude-code.md
 
-./target/debug/exo conversation create ts-claude-code
-./target/debug/exo conversation mount add ts-claude-code <conversation> "$PWD" /workspace --rw
-./target/debug/exo repl --agent ts-claude-code --conversation <conversation>
+./target/debug/exo thread create ts-claude-code
+./target/debug/exo thread mount create ts-claude-code <conversation> "$PWD" /workspace --rw
+./target/debug/exo agent run --agent ts-claude-code --thread <conversation>
 ```
 
 ## Cursor
 
-Register a Cursor model:
+Store a Cursor credential:
 
 ```bash
-./target/debug/exo secret set cursor --env CURSOR_API_KEY
-./target/debug/exo model register auto --secret cursor
+./target/debug/exo vault secret create global cursor --token-env CURSOR_API_KEY --allow-origin https://api.cursor.com
 ```
 
 Build the sandbox image:
@@ -118,22 +142,32 @@ container build \
 Create the agent and start a conversation:
 
 ```bash
-./target/debug/exo --harness cursor agent create "TS Cursor" \
-  --model auto
+cat > ts-cursor.md <<'EOF'
+---
+name: "TS Cursor"
+harness: cursor
+config:
+  model: auto
+  credential: cursor
+---
+Help the user with their task.
+EOF
+./target/debug/exo agent create ts-cursor --file ts-cursor.md
 
-./target/debug/exo conversation create ts-cursor
-./target/debug/exo conversation mount add ts-cursor <conversation> "$PWD" /workspace --rw
-./target/debug/exo repl --agent ts-cursor --conversation <conversation>
+./target/debug/exo thread create ts-cursor
+./target/debug/exo thread mount create ts-cursor <conversation> "$PWD" /workspace --rw
+./target/debug/exo agent run --agent ts-cursor --thread <conversation>
 ```
 
 ## Pi
 
-Register a model Pi supports. Pi reads the provider key from the sandbox
+Pi sandbox images must define `HOME` as a writable directory for session and tool files.
+
+Store a credential for a provider Pi supports. Pi reads the provider key from the sandbox
 environment, so the same variable has to be set where exo runs:
 
 ```bash
-./target/debug/exo secret set openai --env OPENAI_API_KEY
-./target/debug/exo model register gpt-5.5 --secret openai
+./target/debug/exo vault secret create global openai --token-env OPENAI_API_KEY --allow-origin https://api.openai.com
 ```
 
 Build the sandbox image:
@@ -148,12 +182,21 @@ container build \
 Create the agent and start a conversation:
 
 ```bash
-./target/debug/exo --harness pi agent create "TS Pi" \
-  --model gpt-5.5
+cat > ts-pi.md <<'EOF'
+---
+name: "TS Pi"
+harness: pi
+config:
+  model: gpt-5.5
+  credential: openai
+---
+Help the user with their task.
+EOF
+./target/debug/exo agent create ts-pi --file ts-pi.md
 
-./target/debug/exo conversation create ts-pi
-./target/debug/exo conversation mount add ts-pi <conversation> "$PWD" /workspace --rw
-./target/debug/exo repl --agent ts-pi --conversation <conversation>
+./target/debug/exo thread create ts-pi
+./target/debug/exo thread mount create ts-pi <conversation> "$PWD" /workspace --rw
+./target/debug/exo agent run --agent ts-pi --thread <conversation>
 ```
 
 An agent model of `provider/model` selects a provider explicitly; a bare name

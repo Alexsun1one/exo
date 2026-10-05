@@ -1,4 +1,7 @@
+import type { Message } from "@braintrust/lingua";
 import type { ToolModuleExport } from "./tool-modules";
+
+export type { Message } from "@braintrust/lingua";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
@@ -12,18 +15,7 @@ export * from "./tool-modules";
 export * from "./adapter-tools";
 export * from "./skill-tools";
 
-export type MessageRole =
-  | "system"
-  | "developer"
-  | "user"
-  | "assistant"
-  | "tool";
-
-export interface Message {
-  role: MessageRole;
-  content: unknown;
-  id?: string | null;
-}
+export type MessageRole = Message["role"];
 
 export interface AgentConfig {
   instructions: Message[];
@@ -35,6 +27,9 @@ export interface AgentConfig {
   enableAgentToolCreation: boolean;
   sandbox: AgentSandboxConfig;
   model: string;
+  credential?: string | null;
+  baseUrl?: string | null;
+  reasoningEffort?: string | null;
   maxOutputTokens?: number | null;
   maxToolRoundTrips?: number | null;
   braintrust?: unknown;
@@ -48,54 +43,98 @@ export interface AgentSandboxConfig {
   scope: "agent" | "conversation";
 }
 
-export type Binding =
-  | {
-      type: "env";
-      name: string;
-      envVar: string;
-      secretId: string;
-    }
-  | {
-      type: "mcp";
-      name: string;
-      serverUrl: string;
-      secretId?: string | null;
-    }
-  | {
-      type: "llm";
-      name: string;
-      model: string;
-      baseUrl?: string | null;
-      secretId?: string | null;
-    };
-
-export interface BindingRecord {
-  id: string;
-  type: "env" | "mcp" | "llm";
-  name: string;
-  createdAt: string;
-  binding: Binding;
-}
-
 export type Secret =
   | {
       type: "key";
       value: string;
     }
   | {
+      type: "github_cli";
+      value: string;
+      account: string;
+    }
+  | {
       type: "oauth";
       accessToken: string;
       refreshToken?: string | null;
+      expiresAt?: number | null;
+      refresh?: {
+        tokenEndpoint: string;
+        clientId: string;
+        clientSecret?: string | null;
+        clientSecretBasic?: boolean;
+        resource: string | null;
+        scopes: string[];
+      } | null;
     };
 
-export interface SecretMetadata {
+export interface VaultRecord {
   id: string;
-  type: "key" | "oauth";
   name: string;
   createdAt: string;
 }
 
+export type CredentialDestination =
+  | { type: "url"; url: string }
+  | { type: "origin"; origin: string };
+
+export interface CredentialPolicy {
+  networking:
+    | { type: "limited"; allowedHosts: string[] }
+    | { type: "destinations"; allowedDestinations: CredentialDestination[] };
+  injectionLocation: { header: boolean };
+}
+
+export interface SecretReference {
+  vaultId: string;
+  secretId: string;
+}
+
+export interface ResolvedSecret {
+  revision: number;
+  secret: Secret;
+}
+
+export interface VaultContext {
+  listVaults(): Promise<Vault[]>;
+  getVault(id: string): Promise<Vault | null>;
+}
+
+export interface Vault {
+  readonly record: VaultRecord;
+  listSecrets(): Promise<SecretMetadata[]>;
+  putSecret(request: {
+    name: string;
+    secret: Secret;
+    policy?: CredentialPolicy;
+  }): Promise<string>;
+  getSecret(id: string): Promise<Secret | null>;
+  resolveSecret(
+    id: string,
+    target: CredentialDestination,
+  ): Promise<ResolvedSecret>;
+  updateSecret(
+    id: string,
+    request: { secret?: Secret; policy?: CredentialPolicy },
+  ): Promise<SecretMetadata>;
+  deleteSecret(id: string): Promise<void>;
+}
+
+export interface SecretMetadata {
+  policy?: CredentialPolicy | null;
+  revision: number;
+  id: string;
+  type: "key" | "oauth" | "github_cli";
+  name: string;
+  createdAt: string;
+}
+
+export type PermissionPolicy = { type: "always_allow" | "always_ask" };
+
 export interface ConversationConfig {
+  permissionPolicy?: PermissionPolicy;
+  toolPolicies?: Record<string, PermissionPolicy>;
+  workdir?: string | null;
   sandboxImage?: string | null;
   sandboxProvider?:
     | "daytona"
@@ -116,6 +155,7 @@ export interface FileSystemMount {
 }
 
 export interface ToolDefinition {
+  strict?: boolean;
   name: string;
   description: string;
   parameters: JsonValue;
@@ -156,12 +196,14 @@ export interface SendRequest {
 }
 
 export interface AgentRecord {
+  vaults: string[];
   id: string;
   slug: string;
   name: string;
 }
 
 export interface ConversationRecord {
+  vaults: string[];
   id: string;
   slug: string;
   name: string;
@@ -213,6 +255,7 @@ export interface AddEventsResult {
 }
 
 export interface NewConversationRequest {
+  vaults?: string[];
   slug?: string | null;
   name?: string | null;
 }
@@ -241,7 +284,7 @@ export interface HistoryMessage {
   content: string;
 }
 
-export interface Agent {
+export interface Agent extends VaultContext {
   readonly record: AgentRecord;
   listConversations(): Promise<Conversation[]>;
   getConversation(id: string): Promise<Conversation | null>;
@@ -272,22 +315,20 @@ export interface Agent {
     path: string;
     value: JsonValue;
   }): Promise<ArtifactVersion>;
-  listBindings(): Promise<BindingRecord[]>;
-  getBinding(id: string): Promise<Binding | null>;
-  listSecrets(): Promise<SecretMetadata[]>;
-  getSecret(id: string): Promise<Secret | null>;
 }
 
-export interface ExoHarness {
+export interface ExoHarness extends VaultContext {
   readonly current: ExoHarnessCurrent;
   listAgents(): Promise<Agent[]>;
   getAgent(id: string): Promise<Agent | null>;
-  newAgent(request: { slug: string; name: string }): Promise<Agent>;
+  newAgent(request: {
+    slug: string;
+    name: string;
+    vaults?: string[];
+  }): Promise<Agent>;
   deleteAgent(id: string): Promise<boolean>;
-  listBindings(): Promise<BindingRecord[]>;
-  getBinding(id: string): Promise<Binding | null>;
-  listSecrets(): Promise<SecretMetadata[]>;
-  getSecret(id: string): Promise<Secret | null>;
+  createVault(name: string): Promise<Vault>;
+  deleteVault(id: string): Promise<void>;
 }
 
 export interface ExoHarnessCurrent {
@@ -296,7 +337,7 @@ export interface ExoHarnessCurrent {
   readonly turn: Turn;
 }
 
-export interface Conversation {
+export interface Conversation extends VaultContext {
   readonly agentId: string;
   readonly record: ConversationRecord;
   startSession(): Promise<string>;
@@ -330,10 +371,6 @@ export interface Conversation {
     path: string;
     value: JsonValue;
   }): Promise<ArtifactVersion>;
-  listBindings(): Promise<BindingRecord[]>;
-  getBinding(id: string): Promise<Binding | null>;
-  listSecrets(): Promise<SecretMetadata[]>;
-  getSecret(id: string): Promise<Secret | null>;
 }
 
 export interface Turn {
@@ -358,13 +395,24 @@ export interface Turn {
   }): Promise<ArtifactVersion>;
 }
 
+export interface NativeMcpServer {
+  name: string;
+  url: string;
+  environmentVariable: string | null;
+  disabledTools: string[];
+  tools: { name: string; exposedName: string }[];
+}
+
 export interface TurnContext {
+  readonly mcpServers: NativeMcpServer[];
+  readonly tools: ToolDefinition[];
   readonly agentConfig: AgentConfig;
   readonly conversationConfig: ConversationConfig;
   readonly request: SendRequest;
   readonly streaming: boolean;
   readonly braintrustParent?: string | null;
   readonly exoharness: ExoHarness;
+  authorizeTool(request: ToolRequest): Promise<void>;
   executeTool(request: ToolRequest): Promise<ToolResult>;
   startSandboxProcess(
     request: SandboxProcessStartRequest,
@@ -373,22 +421,46 @@ export interface TurnContext {
   stream: {
     firstChunk(ttftMs: number): Promise<void>;
     text(text: string): Promise<void>;
+    /** For custom tool events (e.g. RLM); canonical tool events stream after persistence. */
     toolCall(args: {
       toolCallId: string;
       toolName: string;
       arguments: JsonObject;
     }): Promise<void>;
+    /** For custom tool events (e.g. RLM); canonical tool events stream after persistence. */
     toolResult(args: { toolCallId: string; result: ToolResult }): Promise<void>;
   };
 }
 
 export interface TypeScriptHarness {
   tools?: ToolModuleExport;
+  nativeToolApprovals?: boolean;
+  reconcileUnresolvedToolCalls?: boolean;
   runTurn(context: TurnContext): Promise<void>;
+  resumeTurn?(context: TurnContext): Promise<void>;
 }
 
 export function defineHarness(harness: TypeScriptHarness): TypeScriptHarness {
   return harness;
+}
+
+export function validateToolPolicies(
+  context: TurnContext,
+  toolNames: Iterable<string>,
+  nativeToolApprovals = true,
+): void {
+  const { permissionPolicy, toolPolicies } = context.conversationConfig;
+  if (!nativeToolApprovals && permissionPolicy?.type === "always_ask") {
+    throw new Error(
+      "this harness cannot enforce always_ask for all native tools; use always_allow as the default and set supported tool policies individually",
+    );
+  }
+  const known = new Set(toolNames);
+  for (const name of Object.keys(toolPolicies ?? {})) {
+    if (!known.has(name)) {
+      throw new Error(`unknown tool in tool_policies: ${name}`);
+    }
+  }
 }
 
 export function turnMetadata(
@@ -481,7 +553,9 @@ export function toolResultEvent(
 
 export function projectAnthropicMessageToolEvents(
   message: unknown,
-  options: { toolNamePrefix?: string } = {},
+  options: {
+    toolName?: (name: string) => string;
+  } = {},
 ): EventData[] {
   const record = recordOrEmpty(message);
   const payload = recordOrEmpty(record.message);
@@ -500,7 +574,7 @@ export function projectAnthropicMessageToolEvents(
           toolRequestedEvent({
             toolCallId: toolUse.id,
             request: {
-              functionName: `${options.toolNamePrefix ?? ""}${toolUse.name}`,
+              functionName: options.toolName?.(toolUse.name) ?? toolUse.name,
               arguments: isRecord(toolUse.input)
                 ? (toJsonValue(toolUse.input) as JsonObject)
                 : {},
@@ -596,19 +670,60 @@ export async function materializeConversationMessages(
 
 export function materializeEventsToMessages(events: Event[]): Message[] {
   const messages: Message[] = [];
-  const toolCallNames = new Map<string, string>();
-  const pendingToolCallIds: string[] = [];
-
+  const seen = new Set<string>();
+  const pending = new Map<string, string>();
+  const flush = () => {
+    for (const [id, name] of pending) {
+      messages.push(
+        toolResultMessage(id, name, {
+          ok: false,
+          error:
+            "tool execution did not complete before the previous turn ended",
+        }),
+      );
+    }
+    pending.clear();
+  };
   for (const event of events) {
-    extendMaterializedMessages(
-      messages,
-      toolCallNames,
-      pendingToolCallIds,
-      event,
-    );
+    const data = event.data;
+    if (isMessagesEvent(data)) {
+      for (const message of data.messages) {
+        if (message.role !== "tool") flush();
+        if (Array.isArray(message.content)) {
+          for (const part of message.content) {
+            if (part.type === "tool_call") {
+              seen.add(part.tool_call_id);
+              pending.set(part.tool_call_id, part.tool_name);
+            } else if (part.type === "tool_result") {
+              pending.delete(part.tool_call_id);
+            }
+          }
+        }
+        messages.push(message);
+      }
+    } else if (isToolRequestedEvent(data) && !seen.has(data.tool_call_id)) {
+      messages.push({
+        role: "assistant",
+        content: [
+          {
+            type: "tool_call",
+            tool_call_id: data.tool_call_id,
+            tool_name: data.request.function_name,
+            arguments: { type: "valid", value: data.request.arguments },
+          },
+        ],
+      });
+      seen.add(data.tool_call_id);
+      pending.set(data.tool_call_id, data.request.function_name);
+    } else if (isToolResultEvent(data)) {
+      const name = pending.get(data.tool_call_id);
+      if (name) {
+        messages.push(toolResultMessage(data.tool_call_id, name, data.result));
+        pending.delete(data.tool_call_id);
+      }
+    }
   }
-  flushDanglingToolResults(messages, toolCallNames, pendingToolCallIds);
-
+  flush();
   return messages;
 }
 
@@ -750,72 +865,6 @@ function contentText(content: unknown): string {
     .join("");
 }
 
-function extendMaterializedMessages(
-  messages: Message[],
-  toolCallNames: Map<string, string>,
-  pendingToolCallIds: string[],
-  event: Event,
-): void {
-  if (isMessagesEvent(event.data)) {
-    flushDanglingToolResults(messages, toolCallNames, pendingToolCallIds);
-    messages.push(...event.data.messages);
-    return;
-  }
-
-  if (isToolRequestedEvent(event.data)) {
-    toolCallNames.set(
-      event.data.tool_call_id,
-      event.data.request.function_name,
-    );
-    pendingToolCallIds.push(event.data.tool_call_id);
-    return;
-  }
-
-  if (isToolResultEvent(event.data)) {
-    const toolName = toolCallNames.get(event.data.tool_call_id);
-    if (!toolName) {
-      return;
-    }
-    removePendingToolCall(pendingToolCallIds, event.data.tool_call_id);
-    messages.push(
-      toolResultMessage(event.data.tool_call_id, toolName, event.data.result),
-    );
-  }
-}
-
-function flushDanglingToolResults(
-  messages: Message[],
-  toolCallNames: Map<string, string>,
-  pendingToolCallIds: string[],
-): void {
-  while (pendingToolCallIds.length > 0) {
-    const toolCallId = pendingToolCallIds.shift();
-    if (!toolCallId) {
-      continue;
-    }
-    const toolName = toolCallNames.get(toolCallId);
-    if (!toolName) {
-      continue;
-    }
-    messages.push(
-      toolResultMessage(toolCallId, toolName, {
-        ok: false,
-        error: "tool execution did not complete before the previous turn ended",
-      }),
-    );
-  }
-}
-
-function removePendingToolCall(
-  pendingToolCallIds: string[],
-  toolCallId: string,
-): void {
-  const index = pendingToolCallIds.indexOf(toolCallId);
-  if (index >= 0) {
-    pendingToolCallIds.splice(index, 1);
-  }
-}
-
 function isMessagesEvent(
   data: EventData,
 ): data is EventData & { type: "messages"; messages: Message[] } {
@@ -874,4 +923,12 @@ export function asBytes(contents: Uint8Array | string): Uint8Array {
     return new TextEncoder().encode(contents);
   }
   return contents;
+}
+
+export function toJsonObject(value: unknown): JsonObject {
+  const json = toJsonValue(value);
+  if (json === null || typeof json !== "object" || Array.isArray(json)) {
+    throw new Error("Expected a JSON object");
+  }
+  return json;
 }

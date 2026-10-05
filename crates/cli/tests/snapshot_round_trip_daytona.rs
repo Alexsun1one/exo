@@ -33,6 +33,7 @@ async fn daytona_snapshot_and_rewind_round_trip() {
         root: root.path().to_path_buf(),
         secret_backend: SecretBackendChoice::Static([7u8; 32]),
         sandbox_default: SandboxProvider::Daytona,
+        sandbox_policy: None,
         sandbox_backends: vec![SandboxBackendRegistration::daytona(
             DaytonaBackendSpec::with_conventional_secrets(),
         )],
@@ -50,6 +51,7 @@ async fn daytona_snapshot_and_rewind_round_trip() {
 
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "daysnap".into(),
             name: "daysnap".into(),
         })
@@ -57,6 +59,8 @@ async fn daytona_snapshot_and_rewind_round_trip() {
         .expect("agent");
     let conv = agent
         .new_conversation(NewConversationRequest {
+            environment: None,
+            vaults: vec![],
             slug: Some("daysnap-conv".into()),
             name: Some("daysnap".into()),
         })
@@ -66,6 +70,7 @@ async fn daytona_snapshot_and_rewind_round_trip() {
     // Phase 1: create a Daytona sandbox and write v1.
     let sandbox_id = conv
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::Daytona,
             image: String::new(),
@@ -73,6 +78,7 @@ async fn daytona_snapshot_and_rewind_round_trip() {
             default_workdir: Some("/".into()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(300),
         })
@@ -132,8 +138,11 @@ async fn daytona_snapshot_and_rewind_round_trip() {
 }
 
 async fn seed_secret(harness: &BasicExoHarness, name: &str, value: &str) {
-    harness
+    exoharness::vault::global_vault(harness)
+        .await
+        .expect("runtime vault")
         .put_secret(PutSecretRequest {
+            policy: None,
             name: name.into(),
             secret: Secret::Key {
                 value: value.into(),

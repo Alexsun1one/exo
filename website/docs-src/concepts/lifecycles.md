@@ -38,13 +38,23 @@ separate and can be snapshotted or rewound without erasing the event log.
 ## Agent lifecycle
 
 An **agent** is the top-level identity: display name, slug, executor/harness
-config, model binding, sandbox defaults, and agent-scoped artifacts,
+config, model credentials, sandbox defaults, and agent-scoped artifacts,
 bindings, and secrets.
 
 ### Create
 
 ```bash
-exo agent create "My Agent" --model gpt-5.6-terra
+cat > my-agent.md <<'EOF'
+---
+name: "My Agent"
+harness: basic
+config:
+  model: gpt-5.6-terra
+  credential: openai
+---
+Help the user with their task.
+EOF
+exo agent create my-agent --file my-agent.md
 # or via the canonical launcher, which creates exo-agent for you:
 ./exo.sh
 ```
@@ -63,9 +73,7 @@ touches it.
 ### Update
 
 ```bash
-exo agent update <agent> --model <name>
-exo agent update <agent> --networking enabled
-exo agent update <agent> --sandbox-image ubuntu:24.04
+exo agent update <agent> --file agent.md
 ```
 
 Updates rewrite the agent config artifact on disk. **In-process caches may
@@ -115,7 +123,7 @@ you return.
 ### Create
 
 ```bash
-exo conversation create <agent> "Dev"
+exo thread create <agent> "Dev"
 # canonical setup creates conversation slug `dev` automatically
 ```
 
@@ -139,7 +147,7 @@ start_session  →  begin_turn(input)  →  (model + tools…)  →  turn.finish
 Common entry points:
 
 - **REPL / CLI chat** — human messages in an open session
-- **`exo conversation send`** — one-shot prompt
+- **`exo thread send`** — one-shot prompt
 - **Adapter wakeup** — inbound external message becomes a normal turn
   (fresh session, closed when the wakeup completes)
 - **Scheduler** — completed task can wake the conversation with a compact
@@ -167,7 +175,7 @@ executor; the raw log remains queryable.
 ### Fork
 
 ```bash
-exo conversation fork <agent> <conversation> "Fork Name"
+exo thread fork <agent> <conversation> "Fork Name"
 ```
 
 Fork branches a **new** conversation from an existing one (optionally up
@@ -189,7 +197,7 @@ after `/exit`.
 ### Delete
 
 ```bash
-exo conversation delete <agent> <conversation>
+exo thread delete <agent> <conversation>
 ```
 
 Appends a `conversation_deleted` marker, then removes the conversation
@@ -251,13 +259,13 @@ execution there.
 
 ```bash
 # Attach an existing Docker container to a conversation
-exo conversation sandbox attach <agent> <conversation> \
-  --provider docker \
+exo thread sandbox attach <agent> <conversation> \
+  --sandbox docker \
   --external-id <container-id> \
   --default-workdir /workspace
 
 # Later, hand it back
-exo conversation sandbox detach <agent> <conversation> <exo-sandbox-id>
+exo thread sandbox detach <agent> <conversation> <exo-sandbox-id>
 ```
 
 ### Which sandbox does a turn use?
@@ -337,7 +345,7 @@ turn; adapters run continuously and *wake* turns.
 
 ```text
 ./exo.sh
- ├── adapter runner   (`exo … adapters run --watch`)
+ ├── agent service / adapter runner   (`exo serve`)
  │    └── supervisor per enabled adapter
  │         └── worker process (JSONL stdin/stdout)
  ├── scheduler runner
@@ -401,11 +409,11 @@ sender, and reply instructions.
 
 ```bash
 # Started automatically by canonical ./exo.sh; or:
-exo --harness exo adapters run --watch --limit 50
+exo serve --adapter-limit 50
 
-exo adapters list
-# agent tools: create_adapter, list_adapters, disable_adapter,
-#              delete_adapter, send_adapter_message
+# Adapter management is available through these agent tools:
+# create_adapter, list_adapters, disable_adapter, delete_adapter,
+# send_adapter_message
 ```
 
 Health signals: `last_connected_at_ms`, `last_error` on each record;

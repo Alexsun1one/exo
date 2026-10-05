@@ -6,7 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [features]
-default = []
+default = ["smolvm"]
+smolvm = ["executor/smolvm"]
 aws-agentcore = ["executor/aws-agentcore"]
 firecracker = ["executor/firecracker"]
 
@@ -15,16 +16,32 @@ name = "exo"
 path = "src/main.rs"
 
 [dependencies]
+tempfile = "3.23.0"
+actix-web.workspace = true
+reqwest.workspace = true
+url.workspace = true
+rmcp = { workspace = true, features = ["auth", "reqwest"] }
+oauth2.workspace = true
+keyring = "4.0.0-rc.3"
+keyring-core = "0.7.2"
+futures.workspace = true
+async-trait.workspace = true
+exo-managed-agents = { path = "../managed-agents" }
 anyhow.workspace = true
 clap.workspace = true
 cost = { path = "../cost" }
 crossterm.workspace = true
 executor = { path = "../executor" }
+exo-mcp = { path = "../mcp" }
+exoharness = { path = "../exoharness" }
 lingua.workspace = true
 ratatui.workspace = true
 rustyline = "15.0.0"
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
+toml = "0.9"
 shlex.workspace = true
 tabwriter.workspace = true
 tokio = { workspace = true, features = ["signal"] }
@@ -40,5 +57,4 @@ exoharness = { path = "../exoharness", features = [
   "contract-tests",
 ] }
 futures.workspace = true
-tempfile = "3.23.0"
 wiremock = "0.6"

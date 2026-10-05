@@ -3,7 +3,14 @@ use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 4;
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GuestResourceMount {
+    pub device: String,
+    pub path: String,
+    pub read_only: bool,
+}
+
 pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -37,6 +44,12 @@ pub enum GuestRequest<B> {
         env: HashMap<String, String>,
         cwd: String,
     },
+    StartTerminal {
+        argv: Vec<String>,
+        env: HashMap<String, String>,
+        cwd: String,
+        size: TerminalSize,
+    },
     ProcessBridge {
         process_id: String,
         request: B,
@@ -46,6 +59,9 @@ pub enum GuestRequest<B> {
     },
     SyncFilesystem {
         path: String,
+    },
+    MountResources {
+        mounts: Vec<GuestResourceMount>,
     },
     ConfigureNetwork {
         address: Ipv4Addr,
@@ -61,6 +77,13 @@ pub enum GuestProcessRequest {
     Write { data: String },
     CloseStdin,
     Recv { timeout_seconds: Option<f64> },
+    Resize { size: TerminalSize },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct TerminalSize {
+    pub rows: u16,
+    pub cols: u16,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

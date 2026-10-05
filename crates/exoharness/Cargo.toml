@@ -7,21 +7,34 @@ rust-version.workspace = true
 
 [features]
 default = []
+smolvm = ["basic-backend", "dep:smolmachines"]
+http-client = ["dep:reqwest"]
 basic-backend = [
+  "dep:oci-client",
+  "dep:libc",
+  "dep:sha2",
+  "dep:tokio-rustls",
+  "dep:rcgen",
+  "dep:hyper-util",
+  "dep:hyper",
+  "dep:http-body-util",
+  "dep:hickory-proto",
+  "http-client",
   "dep:aes-gcm",
   "dep:actix-web",
   "dep:base64",
   "dep:object_store",
-  "dep:reqwest",
+  "dep:oauth2",
   "dep:tokio",
   "dep:tokio-stream",
   "dep:tokio-tungstenite",
   "dep:tokio-util",
   "dep:tracing",
-  "dep:url",
+  "dep:tempfile",
 ]
+egress = ["basic-backend"]
 firecracker = [
-  "basic-backend",
+  "egress",
   "dep:docker_credential",
   "dep:exo-firecracker-protocol",
   "dep:flate2",
@@ -56,18 +69,25 @@ bytes.workspace = true
 chrono.workspace = true
 docker_credential = { workspace = true, optional = true }
 exo-firecracker-protocol = { path = "../firecracker-protocol", optional = true }
-flate2 = { workspace = true, optional = true }
+flate2 = { workspace = true, optional = true, features = ["zlib-rs"] }
 futures.workspace = true
+hickory-proto = { version = "0.25.2", default-features = false, optional = true }
+http-body-util = { version = "0.1.3", optional = true }
+hyper = { version = "1.8.1", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1.20", features = ["tokio"], optional = true }
 ipnet = { workspace = true, optional = true }
 keyring = { version = "4.0.0-rc.3", optional = true }
 keyring-core = { version = "0.7.2", optional = true }
 libc = { workspace = true, optional = true }
 lingua.workspace = true
 object_store = { workspace = true, optional = true }
+oauth2 = { workspace = true, optional = true }
 oci-client = { workspace = true, optional = true }
+rcgen = { version = "0.14.7", optional = true }
 reqwest = { workspace = true, optional = true }
 rustix = { workspace = true, optional = true, features = ["fs"] }
 semver = "1"
+smolmachines = { version = "=1.20.0", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2 = { workspace = true, optional = true }
@@ -84,6 +104,10 @@ tokio = { version = "1.52.1", default-features = false, features = [
   "sync",
   "time",
 ], optional = true }
+tokio-rustls = { version = "0.26.4", default-features = false, features = [
+  "ring",
+  "tls12",
+], optional = true }
 tokio-stream = { workspace = true, optional = true }
 tokio-tungstenite = { version = "0.26.2", default-features = false, features = [
   "connect",
@@ -91,11 +115,13 @@ tokio-tungstenite = { version = "0.26.2", default-features = false, features = [
 ], optional = true }
 tokio-util = { workspace = true, optional = true, features = ["compat", "rt"] }
 tracing = { workspace = true, optional = true }
-url = { workspace = true, optional = true }
+url.workspace = true
 uuid = { workspace = true, features = ["serde", "v4", "v7", "js"] }
 zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
+wiremock = "0.6"
+sha2.workspace = true
 tempfile = "3.23.0"
 tokio = { version = "1.52.1", features = [
   "fs",
@@ -104,5 +130,10 @@ tokio = { version = "1.52.1", features = [
   "rt",
   "sync",
   "time",
+  "test-util",
 ] }
 tracing-subscriber.workspace = true
+
+[[example]]
+name = "firecracker-bridge"
+required-features = ["firecracker"]

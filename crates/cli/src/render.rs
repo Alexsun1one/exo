@@ -28,8 +28,7 @@ const PRIMARY_ARGUMENT_KEYS: [&str; 3] = ["command", "cmd", "code"];
 pub(crate) enum Verbosity {
     /// Only user and assistant text; tool activity is hidden entirely.
     Minimal,
-    /// One line per tool call (name plus its primary argument) and one line
-    /// per tool result.
+    /// One line per tool call with its primary argument and result status.
     #[default]
     Compact,
     /// Every tool call argument and result field, fully expanded.
@@ -395,7 +394,10 @@ pub(crate) fn compact_result_status(result: &Value) -> String {
         {
             return format!("✗ exit {code}");
         }
-        if object.get("error").is_some_and(|error| !error.is_null()) {
+        if object.get("error").is_some_and(|error| !error.is_null())
+            || object.get("is_error").and_then(Value::as_bool) == Some(true)
+            || exo_mcp::tool_result_is_error(result)
+        {
             return "✗ error".to_string();
         }
     }
@@ -442,7 +444,8 @@ fn render_value_inline(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TranscriptFold, Verbosity, render_message_lines, render_tool_call, render_tool_result,
+        TranscriptFold, Verbosity, compact_result_status, render_message_lines, render_tool_call,
+        render_tool_result,
     };
     use lingua::Message;
     use lingua::universal::{
@@ -528,6 +531,20 @@ mod tests {
             render_tool_result("shell", &json!({"error": "boom"}), Verbosity::Compact),
             Some("← shell ✗ error".to_string())
         );
+    }
+
+    #[test]
+    fn native_tool_errors_are_not_displayed_as_success() {
+        for key in ["is_error", "isError"] {
+            assert_eq!(
+                compact_result_status(&json!({ key: true, "content": "denied" })),
+                "✗ error"
+            );
+            assert_eq!(
+                compact_result_status(&json!({ key: false, "content": "ok" })),
+                "✓"
+            );
+        }
     }
 
     #[test]

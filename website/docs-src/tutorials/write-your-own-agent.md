@@ -209,14 +209,21 @@ export default defineHarness({
 ```bash
 pnpm install   # once, for the TypeScript runtime
 
-exo secret set openai --env OPENAI_API_KEY
-exo model register gpt-5.5 --secret openai
+exo vault secret create global openai --token-env OPENAI_API_KEY --allow-origin https://api.openai.com
 
-exo --harness typescript agent create "Sysmon" \
-  --module exoharness/examples/typescript/sysmon-harness.ts \
-  --model gpt-5.5
-exo conversation create sysmon "Sysmon Test"
-exo repl --agent sysmon --conversation sysmon-test
+cat > sysmon.md <<'EOF'
+---
+name: "Sysmon"
+harness: exoharness/examples/typescript/sysmon-harness.ts
+config:
+  model: gpt-5.5
+  credential: openai
+---
+Help the user with their task.
+EOF
+exo agent create sysmon --file sysmon.md
+exo thread create sysmon "Sysmon Test"
+exo agent run --agent sysmon --thread sysmon-test
 ```
 
 A real exchange (via `conversation send`):
@@ -249,9 +256,9 @@ tool.
 - Give a tool per-agent configuration with `initializationParameters`
   (see `tools/uppercase.ts`).
 - Ship tools as separate modules and load them with
-  `--tool-module <path>` / `toolModulePaths` instead of defining them inline.
+  the spec's `tools` list instead of defining them inline.
 - Let the agent create its own tools at runtime by enabling
-  `enableAgentToolCreation` — the built-in `install_agent_tool` writes tool
+  `tool_creation: true` in the spec — the built-in `install_agent_tool` writes tool
   modules to `.exo/agent-tools/`.
 - Read [Executors & Harnesses](../concepts/executors) for how this
   module relates to the exoharness underneath it.

@@ -46,6 +46,7 @@ async fn teleport_docker_sandbox_to_daytona_keeps_files() {
         root: root.path().to_path_buf(),
         secret_backend: SecretBackendChoice::Static([7u8; 32]),
         sandbox_default: SandboxProvider::Docker,
+        sandbox_policy: None,
         sandbox_backends: vec![
             SandboxBackendRegistration::docker(),
             SandboxBackendRegistration::daytona(DaytonaBackendSpec::with_conventional_secrets()),
@@ -65,6 +66,7 @@ async fn teleport_docker_sandbox_to_daytona_keeps_files() {
 
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "teleport".into(),
             name: "teleport".into(),
         })
@@ -72,6 +74,8 @@ async fn teleport_docker_sandbox_to_daytona_keeps_files() {
         .expect("agent");
     let conv = agent
         .new_conversation(NewConversationRequest {
+            environment: None,
+            vaults: vec![],
             slug: Some("teleport-conv".into()),
             name: Some("teleport".into()),
         })
@@ -81,6 +85,7 @@ async fn teleport_docker_sandbox_to_daytona_keeps_files() {
     // 1. Create a Docker sandbox and write a marker file.
     let sandbox_id = conv
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::Docker,
             image: "docker.io/library/ubuntu:24.04".into(),
@@ -88,6 +93,7 @@ async fn teleport_docker_sandbox_to_daytona_keeps_files() {
             default_workdir: Some("/".into()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(false),
             idle_seconds: Some(300),
         })
@@ -143,6 +149,7 @@ async fn teleport_docker_sandbox_to_daytona_keeps_files() {
     let mount_dir = TempDir::new().expect("mount dir");
     let mounted_id = conv
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::Docker,
             image: "docker.io/library/ubuntu:24.04".into(),
@@ -155,6 +162,7 @@ async fn teleport_docker_sandbox_to_daytona_keeps_files() {
                 internal: None,
             }]),
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(false),
             idle_seconds: Some(300),
         })
@@ -189,8 +197,11 @@ async fn teleport_docker_sandbox_to_daytona_keeps_files() {
 }
 
 async fn seed_secret(harness: &BasicExoHarness, name: &str, value: &str) {
-    harness
+    exoharness::vault::global_vault(harness)
+        .await
+        .expect("runtime vault")
         .put_secret(PutSecretRequest {
+            policy: None,
             name: name.into(),
             secret: Secret::Key {
                 value: value.into(),

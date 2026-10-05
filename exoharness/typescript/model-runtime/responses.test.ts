@@ -5,11 +5,11 @@ import {
   AnthropicRuntime,
   ChatCompletionsRuntime,
   isAnthropicModel,
-  isOpenRouterBinding,
+  isOpenRouterModel,
   modelRequiresResponsesApi,
   responseToLinguaEvents,
   responseToolCalls,
-  runtimeFromModelBinding,
+  runtimeFromModelConfig,
   ResponsesRuntime,
 } from "./responses";
 
@@ -40,13 +40,13 @@ describe("model runtime dispatch", () => {
 
   it("dispatches chat-only models away from Responses", () => {
     expect(
-      runtimeFromModelBinding(undefined, {
+      runtimeFromModelConfig(undefined, {
         model: "deepseek-chat",
         apiKey: "key",
       }),
     ).toBeInstanceOf(ChatCompletionsRuntime);
     expect(
-      runtimeFromModelBinding(undefined, {
+      runtimeFromModelConfig(undefined, {
         model: "gpt-5.4",
         apiKey: "key",
       }),
@@ -58,7 +58,7 @@ describe("model runtime dispatch", () => {
     expect(isAnthropicModel("gpt-5.4")).toBe(false);
     expect(isAnthropicModel("us.anthropic.claude-sonnet-4-6")).toBe(false);
     expect(
-      runtimeFromModelBinding(undefined, {
+      runtimeFromModelConfig(undefined, {
         model: "claude-sonnet-4-6",
         apiKey: "key",
       }),
@@ -66,13 +66,13 @@ describe("model runtime dispatch", () => {
   });
 
   it("routes OpenRouter bindings through chat completions by base URL", () => {
-    expect(
-      isOpenRouterBinding({ baseUrl: "https://openrouter.ai/api/v1" }),
-    ).toBe(true);
-    expect(isOpenRouterBinding({ baseUrl: null })).toBe(false);
+    expect(isOpenRouterModel({ baseUrl: "https://openrouter.ai/api/v1" })).toBe(
+      true,
+    );
+    expect(isOpenRouterModel({ baseUrl: null })).toBe(false);
     // A Responses-looking model name over OpenRouter still uses chat completions.
     expect(
-      runtimeFromModelBinding(undefined, {
+      runtimeFromModelConfig(undefined, {
         model: "openai/gpt-5-pro",
         apiKey: "key",
         baseUrl: "https://openrouter.ai/api/v1",
@@ -82,6 +82,28 @@ describe("model runtime dispatch", () => {
 });
 
 describe("response tool-call parsing", () => {
+  it("keeps usage when a response has only tool calls", () => {
+    const response = {
+      model: "model",
+      output: [
+        {
+          type: "function_call",
+          call_id: "call",
+          name: "shell",
+          arguments: '{"command":"pwd"}',
+        },
+      ],
+      usage: { input_tokens: 12, output_tokens: 3 },
+    } as unknown as Response;
+    expect(responseToLinguaEvents(response)).toMatchObject([
+      {
+        type: "messages",
+        usage: { model: "model", prompt_tokens: 12, completion_tokens: 3 },
+      },
+      { type: "tool_requested", tool_call_id: "call" },
+    ]);
+  });
+
   it("attaches response usage to message events", () => {
     const response = {
       id: "resp_1",

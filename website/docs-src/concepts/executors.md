@@ -16,6 +16,7 @@ one with `--harness`:
 | `codex` | Backs OpenAI Codex with durable exoharness sessions |
 | `claude-code` | Backs Claude Code with durable exoharness sessions |
 | `cursor` | Backs the Cursor SDK with durable exoharness sessions |
+| `pi` | Backs Pi with durable exoharness sessions |
 | `<module.ts>` | Any TypeScript module path implementing the harness interface |
 
 ## The executor loop
@@ -40,9 +41,17 @@ executor.
 The `typescript` harness runs a module that owns the turn loop:
 
 ```bash
-exo --harness typescript agent create "TS Basic" \
-  --module exoharness/examples/typescript/basic-harness.ts \
-  --model gpt-5.5
+cat > ts-basic.md <<'EOF'
+---
+name: "TS Basic"
+harness: exoharness/examples/typescript/basic-harness.ts
+config:
+  model: gpt-5.5
+  credential: openai
+---
+Help the user with their task.
+EOF
+exo agent create ts-basic --file ts-basic.md
 ```
 
 This is the main extension point for building your own agent — see the
@@ -55,3 +64,15 @@ as the canonical conversation state and run the native agent runtimes
 inside exoharness-managed sandboxes. The payoff: sessions you can stop,
 resume, fork, and rewind across runs, regardless of which coding agent is
 driving.
+
+If the service restarts during a turn, `basic` resumes from saved model,
+tool, and approval events. Codex first reconnects to a live native turn;
+if the native process is gone, it resumes the saved Codex thread or starts
+a new thread with the Exo conversation history. Recovery fails when a
+tool call's outcome cannot be established, including a native tool still
+in progress when Exo reconnects. A custom TypeScript harness can implement
+`resumeTurn` and declare `reconcileUnresolvedToolCalls: true` if it can
+establish the outcome of unresolved calls. RLM and other TypeScript
+harnesses, including Claude Code, Cursor, and Pi, currently end the
+interrupted turn as failed. You can start a new turn on the same
+conversation afterward.
