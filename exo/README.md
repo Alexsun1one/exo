@@ -60,7 +60,13 @@ dev> hello! what can you do?
 ln -s "$PWD/exo/scripts/exo-cli" ~/bin/exo-cli
 ```
 
-Then from any directory under `~/projects`:
+Relaunch the stack with your workspace mounted:
+
+```bash
+./exo.sh --agent-cli-mount "$HOME/projects"
+```
+
+Keep that flag on subsequent launches. Then from any directory under `~/projects`:
 
 ```bash
 cd ~/projects/some-repo
@@ -93,7 +99,7 @@ path is:
 
    ```bash
    export DISCORD_BOT_TOKEN="..."
-   ./target/debug/exo secret set discord-bot-token --env DISCORD_BOT_TOKEN
+   ./target/debug/exo vault secret create global discord-bot-token --token-env DISCORD_BOT_TOKEN
    ```
 
 5. Create or confirm the adapter:
@@ -179,7 +185,7 @@ Detached restart output is written to
 When `./exo.sh --control` is running, it also acts
 as the foreground REPL supervisor. Guardian builds write
 `.exo/exo-control.restart`; the control wrapper sees that marker, restarts only
-the child `exo repl`, and keeps your terminal open.
+the child `exo agent run`, and keeps your terminal open.
 
 ## Setting up the identity
 
@@ -222,7 +228,7 @@ Installable tools live in `.exo/tools/`. Their `exo-tool.json` contains exactly
 definition, schemas, handler, and initialization contract. Lockfile entries
 contain only `id`, `source`, `initialization`, and `installPath`.
 
-The `exo tools list` and `exo tools get <id>` operator commands are read-only.
+Declare tool modules in the agent spec; inspect them with `exo agent get NAME`.
 Configured library modules remain supported. The legacy `install_agent_tool`,
 `uninstall_agent_tool`, and `.exo/agent-tools/` paths require
 `enable_agent_tool_creation: true`, which is off by default.
@@ -314,10 +320,10 @@ This will:
 The adapter runner starts by default. Use `--no-adapters` to skip it, or
 `--adapters` to force it on when an environment override disabled it.
 
-You can list configured adapters with:
+The agent spec lists its declared adapter attachments:
 
 ```bash
-target/debug/exo --harness exo adapters list
+target/debug/exo agent get exo-agent
 ```
 
 See the sections below for more details on individual adapter configuration.
@@ -370,7 +376,7 @@ If you want a conversation to have its own sandbox, use `sandboxScope: "conversa
 
 ```bash
 ./exo.sh --conversation isolated-dev --sandbox-scope conversation
-exo --harness exo conversation update exo-agent isolated-dev --sandbox-scope conversation
+exo thread --harness exo update exo-agent isolated-dev --sandbox-scope conversation
 ```
 
 Scheduled tasks also default to `sandboxMode: "agent"`. A task can explicitly use

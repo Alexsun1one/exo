@@ -1,34 +1,30 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use async_trait::async_trait;
 
 use crate::{
-    AgentConfig, BraintrustRuntimeConfig, ConversationConfig, ExecutionStreamEvent, ModelClient,
-    ModelRequest, ModelResponse, ToolDefinition,
+    AgentConfig, ConversationConfig, ExecutionStreamEvent, ModelClient, ModelRequest,
+    ToolDefinition, ToolRuntime,
 };
 use anyhow::{Context as AnyhowContext, anyhow, bail};
 use exoharness::{
-    AgentHandle, BasicExoHarness, BasicExoHarnessConfig, ConversationHandle, EventData, EventId,
-    ExoHarness, FileSystemMountMode, Result, ToolCallId, ToolRequest, ToolResult, TurnHandle,
+    AgentHandle, ConversationHandle, EventData, EventId, FileSystemMountMode, Result, ToolCallId,
+    ToolRequest, ToolResult, TurnHandle,
 };
 use lingua::Message;
 use lingua::universal::{ToolContentPart, ToolResultContentPart};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 
-use crate::execution_tracing::{LlmExecutionTrace, TurnExecutionTrace};
-use crate::harness_executor::{ExecutorHarnessRuntime, ExecutorStreamMode, HarnessExecutor};
-use crate::harness_facade::{SharedHarness, SharedHarnessBacked};
+use crate::execution_tracing::TurnExecutionTrace;
+use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
 use crate::harness_helpers::{
-    ResolvedModelBinding, assistant_message, assistant_messages_text,
-    materialize_conversation_messages, messages_to_history_messages, messages_to_transcript,
-    resolve_model_binding, system_message, to_lingua_value, user_message,
+    ResolvedModel, assistant_message, assistant_messages_text, materialize_conversation_messages,
+    messages_to_history_messages, messages_to_transcript, resolve_model, system_message,
+    to_lingua_value, user_message,
 };
 use crate::harness_js_repl::JsReplState;
-use crate::harness_runtime::RouterModelClient;
+use crate::model_execution::{ModelStreamOutput, complete_model_round};
 use crate::shared::try_send_stream_event;
 
 const RLM_STDOUT_PREVIEW_CHARS: usize = 12_000;
@@ -36,21 +32,8 @@ const RLM_RESULT_PREVIEW_CHARS: usize = 12_000;
 const RLM_CONTEXT_PREVIEW_CHARS: usize = 400;
 
 pub struct RlmExecutor<M> {
-    model: Arc<M>,
-}
-
-impl<M> Clone for RlmExecutor<M> {
-    fn clone(&self) -> Self {
-        Self {
-            model: Arc::clone(&self.model),
-        }
-    }
-}
-
-impl<M> RlmExecutor<M> {
-    pub fn new(model: Arc<M>) -> Self {
-        Self { model }
-    }
+    pub(crate) model: Arc<M>,
+    pub(crate) tools: Arc<dyn ToolRuntime>,
 }
 
 impl<M> RlmExecutor<M>
@@ -59,18 +42,19 @@ where
 {
     async fn run_turn_loop(
         &self,
+        agent: &dyn AgentHandle,
         conversation: &dyn ConversationHandle,
         turn: &dyn TurnHandle,
         agent_config: &AgentConfig,
         conversation_config: &ConversationConfig,
         query_text: &str,
         turn_trace: Option<&dyn TurnExecutionTrace>,
-        event_tx: Option<&mpsc::UnboundedSender<Result<ExecutionStreamEvent>>>,
+        stream_mode: ExecutorStreamMode<'_>,
     ) -> Result<()> {
         let context_messages = materialize_conversation_messages(conversation)
             .await
             .context("failed to materialize conversation messages for RLM context")?;
-        let model_binding = resolve_model_binding(conversation, &agent_config.model).await?;
+        let model_binding = resolve_model(conversation, agent_config).await?;
         let context_text = messages_to_transcript(&context_messages);
         let history_messages = messages_to_history_messages(&context_messages);
         let mut js_state = JsReplState::new(&context_text, &history_messages)?;
@@ -104,37 +88,31 @@ where
                 bail!("RLM turn exceeded the configured round budget");
             }
 
+            let external_tools = self.tools.definitions();
+            let external_names: Vec<_> = external_tools
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect();
             let request = ModelRequest {
                 model: model_binding.model.clone(),
-                api_key: model_binding.api_key.clone(),
+                api_key: Some(model_binding.api_key.clone()),
                 base_url: model_binding.base_url.clone(),
                 messages: history.clone(),
-                tools: build_rlm_tool_definitions(),
+                tools: build_rlm_tool_definitions()
+                    .into_iter()
+                    .chain(external_tools)
+                    .collect(),
                 max_output_tokens: agent_config.max_output_tokens,
             };
-            let llm_trace = match turn_trace {
-                Some(turn_trace) => turn_trace.start_llm_round(&request, round as usize).await,
-                None => None,
-            };
-            let response = if let Some(event_tx) = event_tx {
-                self.complete_streaming(request, event_tx, llm_trace)
-                    .await?
-            } else {
-                match self.model.complete(request).await {
-                    Ok(response) => {
-                        if let Some(llm_trace) = llm_trace {
-                            llm_trace.finish_success(&response, None).await;
-                        }
-                        response
-                    }
-                    Err(error) => {
-                        if let Some(llm_trace) = llm_trace {
-                            llm_trace.finish_error(&error).await;
-                        }
-                        return Err(error);
-                    }
-                }
-            };
+            let response = complete_model_round(
+                self.model.as_ref(),
+                request,
+                round as usize,
+                stream_mode,
+                ModelStreamOutput::Internal,
+                turn_trace,
+            )
+            .await?;
 
             append_custom_event(
                 turn,
@@ -158,7 +136,7 @@ where
 
             let mut tool_messages = Vec::with_capacity(response.tool_calls.len());
             for tool_call in response.tool_calls {
-                if let Some(event_tx) = event_tx {
+                if let ExecutorStreamMode::Enabled(event_tx) = stream_mode {
                     try_send_stream_event(
                         event_tx,
                         ExecutionStreamEvent::ToolCall {
@@ -187,15 +165,44 @@ where
                 )
                 .await?;
 
-                let result = match self
-                    .execute_tool_call(
-                        &mut js_state,
-                        agent_config,
-                        &model_binding,
+                let tool_result = async {
+                    crate::permissions::authorize(
+                        conversation,
+                        turn,
+                        self.tools.permission_policy(
+                            &conversation_config.permissions,
+                            &tool_call.request.function_name,
+                        ),
+                        None,
+                        None,
+                        false,
                         &tool_call.request,
+                        stream_mode,
                     )
-                    .await
-                {
+                    .await?;
+                    if external_names.contains(&tool_call.request.function_name) {
+                        self.tools
+                            .execute(
+                                agent,
+                                conversation,
+                                Some(turn),
+                                agent_config,
+                                conversation_config,
+                                &tool_call.request,
+                            )
+                            .await
+                    } else {
+                        self.execute_tool_call(
+                            &mut js_state,
+                            agent_config,
+                            &model_binding,
+                            &tool_call.request,
+                        )
+                        .await
+                    }
+                }
+                .await;
+                let result = match tool_result {
                     Ok(result) => {
                         if let Some(tool_trace) = tool_trace {
                             tool_trace.finish_success(&result).await;
@@ -219,7 +226,7 @@ where
                     },
                 )
                 .await?;
-                if let Some(event_tx) = event_tx {
+                if let ExecutorStreamMode::Enabled(event_tx) = stream_mode {
                     try_send_stream_event(
                         event_tx,
                         ExecutionStreamEvent::ToolResult {
@@ -246,71 +253,11 @@ where
         }
     }
 
-    async fn complete_streaming(
-        &self,
-        request: ModelRequest,
-        event_tx: &mpsc::UnboundedSender<Result<ExecutionStreamEvent>>,
-        llm_trace: Option<Box<dyn LlmExecutionTrace>>,
-    ) -> Result<ModelResponse> {
-        let started_at = Instant::now();
-        let mut stream = match self.model.complete_stream(request).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                if let Some(llm_trace) = llm_trace {
-                    llm_trace.finish_error(&error).await;
-                }
-                return Err(error);
-            }
-        };
-        let mut ttft = None;
-        loop {
-            let chunk = match stream.next_chunk().await {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    if let Some(llm_trace) = llm_trace {
-                        llm_trace.finish_error(&error).await;
-                    }
-                    return Err(error);
-                }
-            };
-            let Some(chunk) = chunk else {
-                break;
-            };
-            if chunk.is_keep_alive() {
-                continue;
-            }
-            if ttft.is_none() {
-                let first_chunk = started_at.elapsed();
-                ttft = Some(first_chunk);
-                try_send_stream_event(
-                    event_tx,
-                    ExecutionStreamEvent::FirstChunk { ttft: first_chunk },
-                );
-            }
-            // RLM root-model text is executor control traffic rather than user-facing output.
-            // The final persisted assistant message is emitted after the loop finishes, so
-            // streaming these raw chunks would leak control syntax like FINAL(...).
-        }
-        let response = match stream.finish().await {
-            Ok(response) => response,
-            Err(error) => {
-                if let Some(llm_trace) = llm_trace {
-                    llm_trace.finish_error(&error).await;
-                }
-                return Err(error);
-            }
-        };
-        if let Some(llm_trace) = llm_trace {
-            llm_trace.finish_success(&response, ttft).await;
-        }
-        Ok(response)
-    }
-
     async fn execute_tool_call(
         &self,
         js_state: &mut JsReplState,
         agent_config: &AgentConfig,
-        model_binding: &ResolvedModelBinding,
+        model_binding: &ResolvedModel,
         request: &ToolRequest,
     ) -> Result<ToolResult> {
         match request.function_name.as_str() {
@@ -352,7 +299,7 @@ where
         &self,
         js_state: &mut JsReplState,
         agent_config: &AgentConfig,
-        model_binding: &ResolvedModelBinding,
+        model_binding: &ResolvedModel,
         prompt: &str,
         target_var: Option<String>,
     ) -> Result<ToolResult> {
@@ -372,7 +319,7 @@ where
     async fn run_subquery(
         &self,
         agent_config: &AgentConfig,
-        model_binding: &ResolvedModelBinding,
+        model_binding: &ResolvedModel,
         prompt: &str,
     ) -> Result<String> {
         let mut messages = agent_config.instructions.clone();
@@ -385,7 +332,7 @@ where
             .model
             .complete(ModelRequest {
                 model: model_binding.model.clone(),
-                api_key: model_binding.api_key.clone(),
+                api_key: Some(model_binding.api_key.clone()),
                 base_url: model_binding.base_url.clone(),
                 messages,
                 tools: Vec::new(),
@@ -406,34 +353,48 @@ impl<M> HarnessExecutor for RlmExecutor<M>
 where
     M: ModelClient + 'static,
 {
-    type Prepared = String;
+    fn name(&self) -> &'static str {
+        "rlm"
+    }
 
-    fn prepare_request(&self, request: &crate::SendRequest) -> Result<Self::Prepared> {
-        Ok(messages_to_transcript(&request.input))
+    async fn prepare_conversation(
+        &self,
+        agent: &dyn AgentHandle,
+        conversation: &dyn ConversationHandle,
+        agent_config: &AgentConfig,
+        conversation_config: &ConversationConfig,
+    ) -> Result<()> {
+        conversation_config.permissions.validate_tool_names(
+            build_rlm_tool_definitions()
+                .iter()
+                .chain(self.tools.definitions().iter())
+                .map(|tool| tool.name.as_str()),
+        )?;
+        self.tools
+            .prepare_conversation(agent, conversation, agent_config, conversation_config)
+            .await
     }
 
     async fn execute_turn(
         &self,
-        _agent: &dyn AgentHandle,
-        conversation: &dyn ConversationHandle,
+        agent: &dyn AgentHandle,
+        conversation: Arc<dyn ConversationHandle>,
         turn: Arc<dyn TurnHandle>,
         agent_config: &AgentConfig,
         conversation_config: &ConversationConfig,
-        prepared: &Self::Prepared,
+        request: &crate::SendRequest,
         stream_mode: ExecutorStreamMode<'_>,
         turn_trace: Option<&dyn TurnExecutionTrace>,
     ) -> Result<()> {
         self.run_turn_loop(
-            conversation,
+            agent,
+            conversation.as_ref(),
             turn.as_ref(),
             agent_config,
             conversation_config,
-            prepared,
+            &messages_to_transcript(&request.input),
             turn_trace,
-            match stream_mode {
-                ExecutorStreamMode::Disabled => None,
-                ExecutorStreamMode::Enabled(event_tx) => Some(event_tx),
-            },
+            stream_mode,
         )
         .await
     }
@@ -687,6 +648,7 @@ The prompt string in `context` is the external environment. It is formatted as a
 fn build_rlm_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
+            strict: None,
             name: "repl_execute".to_string(),
             description: "Execute JavaScript in the persistent REPL namespace. The variable `context` is always available and persistent values should live on `globalThis`.".to_string(),
             parameters: json!({
@@ -702,6 +664,7 @@ fn build_rlm_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            strict: None,
             name: "subquery".to_string(),
             description: "Ask a direct sub-LLM question over a prompt string and optionally store the result in a JavaScript variable.".to_string(),
             parameters: json!({
@@ -721,6 +684,7 @@ fn build_rlm_tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            strict: None,
             name: "subquery_variable".to_string(),
             description: "Ask a direct sub-LLM question using the string value of a JavaScript variable as external context, and optionally store the answer in another variable.".to_string(),
             parameters: json!({
@@ -751,58 +715,4 @@ fn clamp_preview(value: &str, max_chars: usize) -> String {
         return value.to_string();
     }
     value.chars().take(max_chars).collect()
-}
-
-pub struct RlmHarness<M> {
-    inner: SharedHarness<ExecutorHarnessRuntime<RlmExecutor<M>>>,
-}
-
-impl<M> RlmHarness<M> {
-    pub fn new(exoharness: Arc<dyn ExoHarness>, model: Arc<M>) -> Self
-    where
-        M: ModelClient + 'static,
-    {
-        let runtime = ExecutorHarnessRuntime::new(RlmExecutor::new(model), None);
-        Self {
-            inner: SharedHarness::new(exoharness, runtime),
-        }
-    }
-}
-
-impl RlmHarness<RouterModelClient> {
-    pub fn from_exoharness(
-        exoharness: Arc<dyn ExoHarness>,
-        runtime_config: Option<BraintrustRuntimeConfig>,
-        env: HashMap<String, String>,
-    ) -> Self {
-        let model = Arc::new(RouterModelClient::new(env));
-        let runtime = ExecutorHarnessRuntime::new(RlmExecutor::new(model), runtime_config);
-
-        Self {
-            inner: SharedHarness::new(exoharness, runtime),
-        }
-    }
-
-    pub async fn from_config(
-        exo_config: BasicExoHarnessConfig,
-        runtime_config: Option<BraintrustRuntimeConfig>,
-        env: HashMap<String, String>,
-    ) -> Result<Self> {
-        Ok(Self::from_exoharness(
-            Arc::new(BasicExoHarness::new(exo_config).await?),
-            runtime_config,
-            env,
-        ))
-    }
-}
-
-impl<M> SharedHarnessBacked for RlmHarness<M>
-where
-    M: ModelClient + 'static,
-{
-    type Runtime = ExecutorHarnessRuntime<RlmExecutor<M>>;
-
-    fn shared_harness(&self) -> &SharedHarness<Self::Runtime> {
-        &self.inner
-    }
 }

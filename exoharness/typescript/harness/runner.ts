@@ -11,8 +11,6 @@ import {
   type AgentRecord,
   type Artifact,
   type ArtifactVersion,
-  type Binding,
-  type BindingRecord,
   type Conversation,
   type ConversationConfig,
   type ConversationRecord,
@@ -33,12 +31,20 @@ import {
   type SendRequest,
   type Secret,
   type SecretMetadata,
+  type CredentialDestination,
+  type CredentialPolicy,
+  type Vault,
+  type VaultContext,
+  type ToolDefinition,
   type ToolRequest,
   type ToolResult,
   type Turn,
   type TurnContext,
+  type NativeMcpServer,
   type TurnRecord,
   type TypeScriptHarness,
+  type PermissionPolicy,
+  validateToolPolicies,
 } from "./index";
 
 interface RawAgentConfig {
@@ -57,12 +63,24 @@ interface RawAgentConfig {
     scope: "agent" | "conversation";
   };
   model: string;
+  credential?: string | null;
+  base_url?: string | null;
+  reasoning_effort?: string | null;
   max_output_tokens?: number | null;
   max_tool_round_trips?: number | null;
   braintrust?: unknown;
 }
 
 interface RawConversationConfig {
+  permissions: {
+    permission_policy: PermissionPolicy;
+    tool_policies: Record<string, PermissionPolicy>;
+  };
+  environment?: {
+    config: {
+      default_workdir?: string;
+    };
+  };
   sandbox_image?: string | null;
   sandbox_provider?:
     | "daytona"
@@ -91,12 +109,14 @@ interface RawToolRequest {
 }
 
 interface RawAgentRecord {
+  vaults?: string[];
   id: string;
   slug: string;
   name: string;
 }
 
 interface RawConversationRecord {
+  vaults?: string[];
   id: string;
   slug: string;
   name: string;
@@ -120,49 +140,48 @@ interface RawArtifact extends RawArtifactVersion {
   contents: number[];
 }
 
-type RawBinding =
-  | {
-      type: "env";
-      name: string;
-      env_var: string;
-      secret_id: string;
-    }
-  | {
-      type: "mcp";
-      name: string;
-      server_url: string;
-      secret_id?: string | null;
-    }
-  | {
-      type: "llm";
-      name: string;
-      model: string;
-      base_url?: string | null;
-      secret_id?: string | null;
-    };
-
-interface RawBindingRecord {
-  id: string;
-  type: "env" | "mcp" | "llm";
-  name: string;
-  created_at: string;
-  binding: RawBinding;
-}
-
 type RawSecret =
   | {
       type: "key";
       value: string;
     }
   | {
+      type: "github_cli";
+      value: string;
+      account: string;
+    }
+  | {
       type: "oauth";
       access_token: string;
       refresh_token?: string | null;
+      expires_at?: number | null;
+      refresh?: {
+        token_endpoint: string;
+        client_id: string;
+        client_secret?: string | null;
+        client_secret_basic?: boolean;
+        resource: string | null;
+        scopes: string[];
+      } | null;
     };
 
-interface RawSecretMetadata {
+interface RawVaultRecord {
   id: string;
-  type: "key" | "oauth";
+  name: string;
+  created_at: string;
+}
+interface RawCredentialPolicy {
+  networking:
+    | { type: "limited"; allowed_hosts: string[] }
+    | { type: "destinations"; allowed_destinations: CredentialDestination[] };
+  injection_location: { header: boolean };
+}
+
+interface RawSecretMetadata {
+  policy?: RawCredentialPolicy | null;
+  revision: number;
+  id: string;
+  type: "key" | "oauth" | "github_cli";
   name: string;
   created_at: string;
 }
@@ -197,6 +216,8 @@ interface RawEvent {
 }
 
 interface RawTypeScriptInitPayload {
+  mcp_servers: NativeMcpServer[];
+  tools: ToolDefinition[];
   agent: RawAgentRecord;
   conversation: RawConversationHandleInfo;
   turn: RawTurnHandleInfo;
@@ -204,10 +225,12 @@ interface RawTypeScriptInitPayload {
   conversation_config: RawConversationConfig;
   request: RawSendRequest;
   streaming: boolean;
+  recovering: boolean;
   braintrust_parent?: string | null;
 }
 
 type RawRuntimeRequest =
+  | { type: "authorize_tool"; request: RawToolRequest }
   | { type: "execute_tool"; request: RawToolRequest }
   | {
       type: "start_sandbox_process";
@@ -250,21 +273,71 @@ type RawRuntimeEvent =
       message: string;
     };
 
+type RawResourceScope =
+  | { type: "global" }
+  | { type: "agent"; agent_id: string }
+  | { type: "thread"; agent_id: string; thread_id: string };
+
 type RawExoRequest =
+  | { type: "list_vaults"; scope: RawResourceScope }
+  | { type: "get_vault"; scope: RawResourceScope; vault_id: string }
+  | { type: "create_vault"; name: string }
+  | { type: "delete_vault"; vault_id: string }
+  | { type: "vault_list_secrets"; scope: RawResourceScope; vault_id: string }
+  | {
+      type: "vault_get_secret";
+      scope: RawResourceScope;
+      vault_id: string;
+      secret_id: string;
+    }
+  | {
+      type: "vault_put_secret";
+      scope: RawResourceScope;
+      vault_id: string;
+      request: {
+        name: string;
+        secret: RawSecret;
+        policy?: RawCredentialPolicy;
+      };
+    }
+  | {
+      type: "vault_update_secret";
+      scope: RawResourceScope;
+      vault_id: string;
+      secret_id: string;
+      secret?: RawSecret;
+      policy?: RawCredentialPolicy;
+    }
+  | {
+      type: "vault_delete_secret";
+      scope: RawResourceScope;
+      vault_id: string;
+      secret_id: string;
+    }
+  | {
+      type: "vault_resolve_secret";
+      scope: RawResourceScope;
+      vault_id: string;
+      secret_id: string;
+      target: CredentialDestination;
+    }
   | { type: "list_agents" }
   | { type: "get_agent"; agent_id: string }
-  | { type: "new_agent"; request: { slug: string; name: string } }
+  | {
+      type: "new_agent";
+      request: { slug: string; name: string; vaults?: string[] };
+    }
   | { type: "delete_agent"; agent_id: string }
-  | { type: "list_bindings" }
-  | { type: "get_binding"; binding_id: string }
-  | { type: "list_secrets" }
-  | { type: "get_secret"; secret_id: string }
   | { type: "list_conversations"; agent_id: string }
   | { type: "get_conversation"; agent_id: string; conversation_id: string }
   | {
       type: "new_conversation";
       agent_id: string;
-      request: { slug?: string | null; name?: string | null };
+      request: {
+        slug?: string | null;
+        name?: string | null;
+        vaults?: string[];
+      };
     }
   | { type: "delete_conversation"; agent_id: string; conversation_id: string }
   | { type: "agent_list_artifacts"; agent_id: string }
@@ -278,10 +351,6 @@ type RawExoRequest =
       agent_id: string;
       request: { path: string; contents: number[] };
     }
-  | { type: "agent_list_bindings"; agent_id: string }
-  | { type: "agent_get_binding"; agent_id: string; binding_id: string }
-  | { type: "agent_list_secrets"; agent_id: string }
-  | { type: "agent_get_secret"; agent_id: string; secret_id: string }
   | {
       type: "conversation_start_session";
       agent_id: string;
@@ -350,28 +419,6 @@ type RawExoRequest =
       request: { path: string; contents: number[] };
     }
   | {
-      type: "conversation_list_bindings";
-      agent_id: string;
-      conversation_id: string;
-    }
-  | {
-      type: "conversation_get_binding";
-      agent_id: string;
-      conversation_id: string;
-      binding_id: string;
-    }
-  | {
-      type: "conversation_list_secrets";
-      agent_id: string;
-      conversation_id: string;
-    }
-  | {
-      type: "conversation_get_secret";
-      agent_id: string;
-      conversation_id: string;
-      secret_id: string;
-    }
-  | {
       type: "turn_add_events";
       agent_id: string;
       conversation_id: string;
@@ -408,8 +455,11 @@ type RawExoResponse =
   | { type: "artifact_versions"; artifacts: RawArtifactVersion[] }
   | { type: "artifact"; artifact: RawArtifact | null }
   | { type: "artifact_version"; artifact: RawArtifactVersion }
-  | { type: "bindings"; bindings: RawBindingRecord[] }
-  | { type: "binding"; binding: RawBinding | null }
+  | { type: "resolved_secret"; secret: RawSecret; revision: number }
+  | { type: "vault"; vault: RawVaultRecord | null }
+  | { type: "vaults"; vaults: RawVaultRecord[] }
+  | { type: "secret_metadata"; metadata: RawSecretMetadata }
+  | { type: "secret_id"; secret_id: string }
   | { type: "secrets"; secrets: RawSecretMetadata[] }
   | { type: "secret"; secret: RawSecret | null }
   | { type: "turn"; turn: RawTurnHandleInfo }
@@ -845,6 +895,9 @@ function toAgentConfig(raw: RawAgentConfig): AgentConfig {
       scope: raw.sandbox.scope,
     },
     model: raw.model,
+    credential: raw.credential,
+    baseUrl: raw.base_url,
+    reasoningEffort: raw.reasoning_effort ?? null,
     maxOutputTokens: raw.max_output_tokens ?? null,
     maxToolRoundTrips: raw.max_tool_round_trips ?? null,
     braintrust: raw.braintrust,
@@ -853,6 +906,9 @@ function toAgentConfig(raw: RawAgentConfig): AgentConfig {
 
 function toConversationConfig(raw: RawConversationConfig): ConversationConfig {
   return {
+    permissionPolicy: raw.permissions.permission_policy,
+    toolPolicies: raw.permissions.tool_policies,
+    workdir: raw.environment?.config.default_workdir,
     sandboxImage: raw.sandbox_image ?? null,
     sandboxProvider: raw.sandbox_provider ?? null,
     shellProgram: raw.shell_program ?? null,
@@ -888,6 +944,7 @@ function toRawToolRequest(request: ToolRequest): RawToolRequest {
 
 function toAgentRecord(raw: RawAgentRecord): AgentRecord {
   return {
+    vaults: raw.vaults ?? [],
     id: raw.id,
     slug: raw.slug,
     name: raw.name,
@@ -896,6 +953,7 @@ function toAgentRecord(raw: RawAgentRecord): AgentRecord {
 
 function toConversationRecord(raw: RawConversationRecord): ConversationRecord {
   return {
+    vaults: raw.vaults ?? [],
     id: raw.id,
     slug: raw.slug,
     name: raw.name,
@@ -927,44 +985,10 @@ function toArtifact(raw: RawArtifact): Artifact {
   };
 }
 
-function toBindingRecord(raw: RawBindingRecord): BindingRecord {
-  return {
-    id: raw.id,
-    type: raw.type,
-    name: raw.name,
-    createdAt: raw.created_at,
-    binding: toBinding(raw.binding),
-  };
-}
-
-function toBinding(raw: RawBinding): Binding {
-  if (raw.type === "env") {
-    return {
-      type: "env",
-      name: raw.name,
-      envVar: raw.env_var,
-      secretId: raw.secret_id,
-    };
-  }
-  if (raw.type === "mcp") {
-    return {
-      type: "mcp",
-      name: raw.name,
-      serverUrl: raw.server_url,
-      secretId: raw.secret_id ?? null,
-    };
-  }
-  return {
-    type: "llm",
-    name: raw.name,
-    model: raw.model,
-    baseUrl: raw.base_url ?? null,
-    secretId: raw.secret_id ?? null,
-  };
-}
-
 function toSecretMetadata(raw: RawSecretMetadata): SecretMetadata {
   return {
+    revision: raw.revision,
+    policy: raw.policy ? toCredentialPolicy(raw.policy) : null,
     id: raw.id,
     type: raw.type,
     name: raw.name,
@@ -973,16 +997,50 @@ function toSecretMetadata(raw: RawSecretMetadata): SecretMetadata {
 }
 
 function toSecret(raw: RawSecret): Secret {
-  if (raw.type === "key") {
-    return {
-      type: "key",
-      value: raw.value,
-    };
+  if (raw.type === "key" || raw.type === "github_cli") {
+    return raw;
   }
   return {
     type: "oauth",
     accessToken: raw.access_token,
     refreshToken: raw.refresh_token ?? null,
+    expiresAt: raw.expires_at ?? null,
+    refresh: raw.refresh
+      ? {
+          tokenEndpoint: raw.refresh.token_endpoint,
+          clientId: raw.refresh.client_id,
+          clientSecret: raw.refresh.client_secret,
+          clientSecretBasic: raw.refresh.client_secret_basic,
+          resource: raw.refresh.resource,
+          scopes: raw.refresh.scopes,
+        }
+      : null,
+  };
+}
+
+function toRawCredentialPolicy(policy: CredentialPolicy): RawCredentialPolicy {
+  return {
+    networking:
+      policy.networking.type === "limited"
+        ? { type: "limited", allowed_hosts: policy.networking.allowedHosts }
+        : {
+            type: "destinations",
+            allowed_destinations: policy.networking.allowedDestinations,
+          },
+    injection_location: policy.injectionLocation,
+  };
+}
+
+function toCredentialPolicy(policy: RawCredentialPolicy): CredentialPolicy {
+  return {
+    networking:
+      policy.networking.type === "limited"
+        ? { type: "limited", allowedHosts: policy.networking.allowed_hosts }
+        : {
+            type: "destinations",
+            allowedDestinations: policy.networking.allowed_destinations,
+          },
+    injectionLocation: policy.injection_location,
   };
 }
 
@@ -1062,12 +1120,14 @@ function toRawAddEventsRequest(request: AddEventsRequest): {
 }
 
 function toRawNewConversationRequest(request?: NewConversationRequest): {
+  vaults?: string[];
   slug?: string | null;
   name?: string | null;
 } {
   return {
     slug: request?.slug ?? null,
     name: request?.name ?? null,
+    vaults: request?.vaults,
   };
 }
 
@@ -1086,6 +1146,7 @@ function toRawForkConversationRequest(request?: ForkConversationRequest): {
 function createAgent(client: ProtocolClient, raw: RawAgentRecord): Agent {
   const record = toAgentRecord(raw);
   const agent: Agent = {
+    ...createVaultContext(client, { type: "agent", agent_id: record.id }),
     record,
 
     async listConversations(): Promise<Conversation[]> {
@@ -1210,52 +1271,6 @@ function createAgent(client: ProtocolClient, raw: RawAgentRecord): Agent {
         contents: JSON.stringify(args.value, null, 2),
       });
     },
-
-    async listBindings(): Promise<BindingRecord[]> {
-      const payload = await client.requestExo({
-        type: "agent_list_bindings",
-        agent_id: record.id,
-      });
-      if (payload.type !== "bindings") {
-        throw new Error(`expected bindings payload, got ${payload.type}`);
-      }
-      return payload.bindings.map(toBindingRecord);
-    },
-
-    async getBinding(id: string): Promise<Binding | null> {
-      const payload = await client.requestExo({
-        type: "agent_get_binding",
-        agent_id: record.id,
-        binding_id: id,
-      });
-      if (payload.type !== "binding") {
-        throw new Error(`expected binding payload, got ${payload.type}`);
-      }
-      return payload.binding ? toBinding(payload.binding) : null;
-    },
-
-    async listSecrets(): Promise<SecretMetadata[]> {
-      const payload = await client.requestExo({
-        type: "agent_list_secrets",
-        agent_id: record.id,
-      });
-      if (payload.type !== "secrets") {
-        throw new Error(`expected secrets payload, got ${payload.type}`);
-      }
-      return payload.secrets.map(toSecretMetadata);
-    },
-
-    async getSecret(id: string): Promise<Secret | null> {
-      const payload = await client.requestExo({
-        type: "agent_get_secret",
-        agent_id: record.id,
-        secret_id: id,
-      });
-      if (payload.type !== "secret") {
-        throw new Error(`expected secret payload, got ${payload.type}`);
-      }
-      return payload.secret ? toSecret(payload.secret) : null;
-    },
   };
   return agent;
 }
@@ -1265,6 +1280,7 @@ function createExoHarness(
   current: ExoHarnessCurrent,
 ): ExoHarness {
   return {
+    ...createVaultContext(client, { type: "global" }),
     current,
 
     async listAgents(): Promise<Agent[]> {
@@ -1308,42 +1324,21 @@ function createExoHarness(
       return payload.value;
     },
 
-    async listBindings(): Promise<BindingRecord[]> {
-      const payload = await client.requestExo({ type: "list_bindings" });
-      if (payload.type !== "bindings") {
-        throw new Error(`expected bindings payload, got ${payload.type}`);
+    async createVault(name: string): Promise<Vault> {
+      const payload = await client.requestExo({ type: "create_vault", name });
+      if (payload.type !== "vault" || !payload.vault) {
+        throw new Error("server did not return the new vault");
       }
-      return payload.bindings.map(toBindingRecord);
+      return createVault(client, payload.vault, { type: "global" });
     },
-
-    async getBinding(id: string): Promise<Binding | null> {
+    async deleteVault(id: string): Promise<void> {
       const payload = await client.requestExo({
-        type: "get_binding",
-        binding_id: id,
+        type: "delete_vault",
+        vault_id: id,
       });
-      if (payload.type !== "binding") {
-        throw new Error(`expected binding payload, got ${payload.type}`);
+      if (payload.type !== "bool" || !payload.value) {
+        throw new Error("vault deletion failed");
       }
-      return payload.binding ? toBinding(payload.binding) : null;
-    },
-
-    async listSecrets(): Promise<SecretMetadata[]> {
-      const payload = await client.requestExo({ type: "list_secrets" });
-      if (payload.type !== "secrets") {
-        throw new Error(`expected secrets payload, got ${payload.type}`);
-      }
-      return payload.secrets.map(toSecretMetadata);
-    },
-
-    async getSecret(id: string): Promise<Secret | null> {
-      const payload = await client.requestExo({
-        type: "get_secret",
-        secret_id: id,
-      });
-      if (payload.type !== "secret") {
-        throw new Error(`expected secret payload, got ${payload.type}`);
-      }
-      return payload.secret ? toSecret(payload.secret) : null;
     },
   };
 }
@@ -1356,6 +1351,11 @@ function createConversation(
   const conversation: Conversation = {
     agentId: raw.agent_id,
     record,
+    ...createVaultContext(client, {
+      type: "thread",
+      agent_id: raw.agent_id,
+      thread_id: record.id,
+    }),
 
     async startSession(): Promise<string> {
       const payload = await client.requestExo({
@@ -1505,56 +1505,6 @@ function createConversation(
         contents: JSON.stringify(args.value, null, 2),
       });
     },
-
-    async listBindings(): Promise<BindingRecord[]> {
-      const payload = await client.requestExo({
-        type: "conversation_list_bindings",
-        agent_id: raw.agent_id,
-        conversation_id: record.id,
-      });
-      if (payload.type !== "bindings") {
-        throw new Error(`expected bindings payload, got ${payload.type}`);
-      }
-      return payload.bindings.map(toBindingRecord);
-    },
-
-    async getBinding(id: string): Promise<Binding | null> {
-      const payload = await client.requestExo({
-        type: "conversation_get_binding",
-        agent_id: raw.agent_id,
-        conversation_id: record.id,
-        binding_id: id,
-      });
-      if (payload.type !== "binding") {
-        throw new Error(`expected binding payload, got ${payload.type}`);
-      }
-      return payload.binding ? toBinding(payload.binding) : null;
-    },
-
-    async listSecrets(): Promise<SecretMetadata[]> {
-      const payload = await client.requestExo({
-        type: "conversation_list_secrets",
-        agent_id: raw.agent_id,
-        conversation_id: record.id,
-      });
-      if (payload.type !== "secrets") {
-        throw new Error(`expected secrets payload, got ${payload.type}`);
-      }
-      return payload.secrets.map(toSecretMetadata);
-    },
-
-    async getSecret(id: string): Promise<Secret | null> {
-      const payload = await client.requestExo({
-        type: "conversation_get_secret",
-        agent_id: raw.agent_id,
-        conversation_id: record.id,
-        secret_id: id,
-      });
-      if (payload.type !== "secret") {
-        throw new Error(`expected secret payload, got ${payload.type}`);
-      }
-      return payload.secret ? toSecret(payload.secret) : null;
-    },
   };
   return conversation;
 }
@@ -1643,12 +1593,20 @@ function createTurnContext(
   });
 
   const context: TurnContext = {
+    tools: init.tools,
+    mcpServers: init.mcp_servers,
     agentConfig,
     conversationConfig,
     request,
     streaming,
     braintrustParent: init.braintrust_parent ?? null,
     exoharness,
+    async authorizeTool(request): Promise<void> {
+      await client.requestRuntime({
+        type: "authorize_tool",
+        request: toRawToolRequest(request),
+      });
+    },
     async executeTool(request): Promise<ToolResult> {
       const payload = await client.requestRuntime({
         type: "execute_tool",
@@ -1669,13 +1627,6 @@ function createTurnContext(
     ): Promise<EventData[]> {
       const events: EventData[] = [];
       for (const toolCall of toolCalls) {
-        if (streaming) {
-          await context.stream.toolCall({
-            toolCallId: toolCall.toolCallId,
-            toolName: toolCall.request.functionName,
-            arguments: toolCall.request.arguments,
-          });
-        }
         let result: ToolResult;
         try {
           result = await context.executeTool(toolCall.request);
@@ -1684,12 +1635,6 @@ function createTurnContext(
             ok: false,
             error: runnerErrorMessage(error),
           };
-        }
-        if (streaming) {
-          await context.stream.toolResult({
-            toolCallId: toolCall.toolCallId,
-            result,
-          });
         }
         events.push(toolResultEvent(toolCall.toolCallId, result));
       }
@@ -1765,6 +1710,33 @@ function runnerErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+async function hasUnresolvedToolCalls(context: TurnContext): Promise<boolean> {
+  const pending = new Map<string, number>();
+  let cursor: string | null = null;
+  do {
+    const page = await context.exoharness.current.conversation.getEvents({
+      cursor,
+      direction: "asc",
+      limit: 100,
+      turnId: context.exoharness.current.turn.record.id,
+      types: ["tool_requested", "tool_result"],
+    });
+    for (const event of page.events) {
+      const id = event.data.tool_call_id;
+      if (typeof id !== "string") continue;
+      if (event.data.type === "tool_requested") {
+        pending.set(id, (pending.get(id) ?? 0) + 1);
+      } else if (event.data.type === "tool_result") {
+        const count = pending.get(id) ?? 0;
+        if (count <= 1) pending.delete(id);
+        else pending.set(id, count - 1);
+      }
+    }
+    cursor = page.cursor ?? null;
+  } while (cursor);
+  return pending.size > 0;
+}
+
 async function main(): Promise<void> {
   const client = new ProtocolClient();
   const modulePath = process.argv[2];
@@ -1789,7 +1761,34 @@ async function main(): Promise<void> {
     }
     const context = createTurnContext(client, init);
     try {
-      await harness.runTurn(context);
+      if (harness.nativeToolApprovals !== true) {
+        validateToolPolicies(
+          context,
+          [
+            ...context.tools.map((tool) => tool.name),
+            ...(context.conversationConfig.shellProgram ? ["shell"] : []),
+          ],
+          false,
+        );
+      }
+      if (init.recovering) {
+        if (!harness.resumeTurn) {
+          throw new Error(
+            "this TypeScript harness cannot safely resume an unfinished turn",
+          );
+        }
+        if (
+          harness.reconcileUnresolvedToolCalls !== true &&
+          (await hasUnresolvedToolCalls(context))
+        ) {
+          throw new Error(
+            "this TypeScript harness cannot safely resume an unresolved tool call",
+          );
+        }
+        await harness.resumeTurn(context);
+      } else {
+        await harness.runTurn(context);
+      }
       await client.done();
     } catch (error) {
       await client.fail(error);
@@ -1801,3 +1800,153 @@ async function main(): Promise<void> {
 void main().catch(() => {
   process.exitCode = 1;
 });
+
+function toRawSecret(secret: Secret): RawSecret {
+  return secret.type === "key" || secret.type === "github_cli"
+    ? secret
+    : {
+        type: "oauth",
+        access_token: secret.accessToken,
+        refresh_token: secret.refreshToken,
+        expires_at: secret.expiresAt,
+        refresh: secret.refresh
+          ? {
+              token_endpoint: secret.refresh.tokenEndpoint,
+              client_id: secret.refresh.clientId,
+              client_secret: secret.refresh.clientSecret,
+              client_secret_basic: secret.refresh.clientSecretBasic,
+              resource: secret.refresh.resource,
+              scopes: secret.refresh.scopes,
+            }
+          : null,
+      };
+}
+
+function createVault(
+  client: ProtocolClient,
+  raw: RawVaultRecord,
+  scope: RawResourceScope,
+): Vault {
+  return {
+    record: { id: raw.id, name: raw.name, createdAt: raw.created_at },
+    async listSecrets() {
+      const payload = await client.requestExo({
+        type: "vault_list_secrets",
+        scope,
+        vault_id: raw.id,
+      });
+      if (payload.type !== "secrets") {
+        throw new Error(`expected secrets payload, got ${payload.type}`);
+      }
+      return payload.secrets.map(toSecretMetadata);
+    },
+    async getSecret(id) {
+      const payload = await client.requestExo({
+        type: "vault_get_secret",
+        scope,
+        vault_id: raw.id,
+        secret_id: id,
+      });
+      if (payload.type !== "secret") {
+        throw new Error(`expected secret payload, got ${payload.type}`);
+      }
+      return payload.secret ? toSecret(payload.secret) : null;
+    },
+    async putSecret(request) {
+      if (!request?.secret) {
+        throw new Error("putSecret requires { name, secret, policy? }");
+      }
+      const payload = await client.requestExo({
+        type: "vault_put_secret",
+        scope,
+        vault_id: raw.id,
+        request: {
+          name: request.name,
+          secret: toRawSecret(request.secret),
+          policy: request.policy
+            ? toRawCredentialPolicy(request.policy)
+            : undefined,
+        },
+      });
+      if (payload.type !== "secret_id") {
+        throw new Error(`expected secret_id payload, got ${payload.type}`);
+      }
+      return payload.secret_id;
+    },
+    async resolveSecret(id, target) {
+      const payload = await client.requestExo({
+        type: "vault_resolve_secret",
+        scope,
+        vault_id: raw.id,
+        secret_id: id,
+        target,
+      });
+      if (payload.type !== "resolved_secret") {
+        throw new Error(
+          `expected resolved_secret payload, got ${payload.type}`,
+        );
+      }
+      return { secret: toSecret(payload.secret), revision: payload.revision };
+    },
+    async updateSecret(id, request) {
+      if (!request?.secret && !request?.policy) {
+        throw new Error(
+          "updateSecret requires { secret?, policy? } with at least one field",
+        );
+      }
+      const payload = await client.requestExo({
+        type: "vault_update_secret",
+        scope,
+        vault_id: raw.id,
+        secret_id: id,
+        secret: request.secret ? toRawSecret(request.secret) : undefined,
+        policy: request.policy
+          ? toRawCredentialPolicy(request.policy)
+          : undefined,
+      });
+      if (payload.type !== "secret_metadata") {
+        throw new Error(
+          `expected secret_metadata payload, got ${payload.type}`,
+        );
+      }
+      return toSecretMetadata(payload.metadata);
+    },
+    async deleteSecret(id) {
+      const payload = await client.requestExo({
+        type: "vault_delete_secret",
+        scope,
+        vault_id: raw.id,
+        secret_id: id,
+      });
+      if (payload.type !== "bool" || !payload.value) {
+        throw new Error("secret deletion failed");
+      }
+    },
+  };
+}
+
+function createVaultContext(
+  client: ProtocolClient,
+  scope: RawResourceScope,
+): VaultContext {
+  return {
+    async listVaults() {
+      const payload = await client.requestExo({ type: "list_vaults", scope });
+      if (payload.type !== "vaults") {
+        throw new Error(`expected vaults payload, got ${payload.type}`);
+      }
+      return payload.vaults.map((record) => createVault(client, record, scope));
+    },
+    async getVault(id) {
+      const payload = await client.requestExo({
+        type: "get_vault",
+        scope,
+        vault_id: id,
+      });
+      if (payload.type !== "vault") {
+        throw new Error(`expected vault payload, got ${payload.type}`);
+      }
+      return payload.vault ? createVault(client, payload.vault, scope) : null;
+    },
+  };
+}

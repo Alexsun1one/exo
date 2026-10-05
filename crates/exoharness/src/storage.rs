@@ -6,6 +6,7 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
+use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -16,16 +17,36 @@ use crate::Result;
 #[derive(Clone)]
 pub(crate) struct BasicObjectStore {
     store: Arc<dyn ObjectStore>,
+    #[cfg(test)]
+    fail_json_put_after: Arc<std::sync::Mutex<Option<usize>>>,
 }
 
 impl BasicObjectStore {
+    pub(crate) fn in_memory() -> Self {
+        Self {
+            store: Arc::new(InMemory::new()),
+            #[cfg(test)]
+            fail_json_put_after: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
     pub(crate) async fn local_filesystem(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         fs::create_dir_all(&root).await?;
         let store = LocalFileSystem::new_with_prefix(&root)?;
         Ok(Self {
             store: Arc::new(store),
+            #[cfg(test)]
+            fail_json_put_after: Arc::new(std::sync::Mutex::new(None)),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_json_put_after(&self, successful_puts: usize) {
+        *self
+            .fail_json_put_after
+            .lock()
+            .expect("fault counter poisoned") = Some(successful_puts);
     }
 
     pub(crate) async fn put_json<T: Serialize>(
@@ -33,6 +54,20 @@ impl BasicObjectStore {
         key: impl AsRef<Path>,
         value: &T,
     ) -> Result<()> {
+        #[cfg(test)]
+        {
+            let mut remaining = self
+                .fail_json_put_after
+                .lock()
+                .expect("fault counter poisoned");
+            if let Some(count) = *remaining {
+                if count == 0 {
+                    *remaining = None;
+                    anyhow::bail!("injected JSON object write failure");
+                }
+                *remaining = Some(count - 1);
+            }
+        }
         let path = object_path(key.as_ref())?;
         let bytes = serde_json::to_vec_pretty(value)?;
         self.store.put(&path, Bytes::from(bytes).into()).await?;
@@ -105,6 +140,20 @@ impl BasicObjectStore {
             .await?;
         keys.sort();
         Ok(keys)
+    }
+
+    pub(crate) async fn list_directories(&self, prefix: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+        let prefix = object_prefix(prefix.as_ref())?;
+        let mut directories = self
+            .store
+            .list_with_delimiter(Some(&prefix))
+            .await?
+            .common_prefixes
+            .into_iter()
+            .map(|path| PathBuf::from(path.to_string()))
+            .collect::<Vec<_>>();
+        directories.sort();
+        Ok(directories)
     }
 
     /// Delete the object at exactly `key`, tolerating absence. Unlike

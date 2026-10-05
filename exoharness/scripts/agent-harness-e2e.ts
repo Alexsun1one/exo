@@ -203,7 +203,7 @@ async function main(): Promise<void> {
 async function runHarnessChecks(
   harness: HarnessDefinition,
 ): Promise<HarnessCheckResult> {
-  registerSecretAndModel(harness);
+  createCredential(harness);
   const agent = createAgent(harness);
   const history = runHistoryReplayCheck(harness, agent);
   const sandbox = args.sandbox ? runSandboxEscapeCheck(harness, agent) : null;
@@ -213,36 +213,66 @@ async function runHarnessChecks(
   return { agent, history, sandbox, braintrust };
 }
 
-function registerSecretAndModel(harness: HarnessDefinition): void {
-  runExo(["secret", "set", harness.secret, "--env", harness.envName]);
-  runExo(["model", "register", harness.model, "--secret", harness.secret]);
+function createCredential(harness: HarnessDefinition): void {
+  runExo([
+    "vault",
+    "secret",
+    "create",
+    "global",
+    harness.secret,
+    "--token-env",
+    harness.envName,
+    "--allow-origin",
+    harness.secret === "anthropic"
+      ? "https://api.anthropic.com"
+      : harness.secret === "cursor"
+        ? "https://api.cursor.com"
+        : "https://api.openai.com",
+  ]);
+}
+
+function saveAgentSpec(
+  harness: HarnessDefinition,
+  slug: string,
+  networking = true,
+): string {
+  const tracing = args.braintrust ? braintrustConfig() : null;
+  const definition = {
+    name: slug,
+    harness: resolve(repoRoot, harness.module),
+    config: {
+      model: harness.model,
+      credential: harness.secret,
+      braintrust: tracing
+        ? {
+            org_name: tracing.org,
+            project: { kind: "name", value: tracing.project },
+          }
+        : null,
+    },
+    sandbox: {
+      provider: process.platform === "darwin" ? "apple_container" : "docker",
+      image: harness.image,
+      enable_networking: networking,
+    },
+  };
+  const file = join(root, `${slug}.md`);
+  writeFileSync(
+    file,
+    `---\n${JSON.stringify(definition)}\n---\nFollow the user's instructions.\n`,
+  );
+  return file;
 }
 
 function createAgent(harness: HarnessDefinition): AgentRef {
   const slug = `e2e-${harness.key}-${runId}`;
-  const commandArgs = [
-    "--harness",
-    "typescript",
+  const output = runExo([
     "agent",
     "create",
     slug,
-    "--module",
-    harness.module,
-    "--model",
-    harness.model,
-    "--sandbox-image",
-    harness.image,
-  ];
-  if (args.braintrust) {
-    const config = braintrustConfig();
-    commandArgs.push(
-      "--braintrust-org",
-      config.org,
-      "--braintrust-project",
-      config.project,
-    );
-  }
-  const output = runExo(commandArgs);
+    "--file",
+    saveAgentSpec(harness, slug),
+  ]);
   return { slug, id: parseCreatedId(output, "agent") };
 }
 
@@ -258,18 +288,24 @@ function runHistoryReplayCheck(
   writeFileSync(join(workspace, "tool-marker.txt"), `${toolMarker}\n`);
 
   const conversation = `history-${harness.key}-${runId}`;
-  runExo(["conversation", "create", agent.slug, "--slug", conversation]);
+  runExo(["thread", "create", agent.slug, "--slug", conversation]);
   runExo([
-    "conversation",
+    "thread",
     "mount",
-    "add",
+    "create",
     agent.slug,
     conversation,
     workspace,
     "/workspace",
     "--rw",
   ]);
-  runExo(["agent", "update", agent.slug, "--networking", "enabled"]);
+  runExo([
+    "agent",
+    "update",
+    agent.slug,
+    "--file",
+    saveAgentSpec(harness, agent.slug),
+  ]);
 
   const codeWord = `${harness.key}-blue-lantern-${runId}`;
   runChat(
@@ -312,7 +348,7 @@ function runHistoryReplayCheck(
   const firstTurnEndedId = firstTurnEndedEventId(agent.slug, conversation);
   const fork = `fork-${harness.key}-${runId}`;
   runExo([
-    "conversation",
+    "thread",
     "fork",
     agent.slug,
     conversation,
@@ -358,18 +394,24 @@ function runFilesystemSandboxCheck(
   writeFileSync(join(outside, "secret.txt"), `${outsideMarker}\n`);
 
   const conversation = `sandbox-${harness.key}-${runId}`;
-  runExo(["conversation", "create", agent.slug, "--slug", conversation]);
+  runExo(["thread", "create", agent.slug, "--slug", conversation]);
   runExo([
-    "conversation",
+    "thread",
     "mount",
-    "add",
+    "create",
     agent.slug,
     conversation,
     workspace,
     "/workspace",
     "--rw",
   ]);
-  runExo(["agent", "update", agent.slug, "--networking", "enabled"]);
+  runExo([
+    "agent",
+    "update",
+    agent.slug,
+    "--file",
+    saveAgentSpec(harness, agent.slug),
+  ]);
 
   const outsideSecret = join(outside, "secret.txt");
   const outsideWrite = join(outside, "escape.txt");
@@ -444,18 +486,24 @@ function runNetworkDisabledCheck(
     join(tmpdir(), `exo-${harness.key}-network-workspace-`),
   );
   const conversation = `network-${harness.key}-${runId}`;
-  runExo(["conversation", "create", agent.slug, "--slug", conversation]);
+  runExo(["thread", "create", agent.slug, "--slug", conversation]);
   runExo([
-    "conversation",
+    "thread",
     "mount",
-    "add",
+    "create",
     agent.slug,
     conversation,
     workspace,
     "/workspace",
     "--rw",
   ]);
-  runExo(["agent", "update", agent.slug, "--networking", "disabled"]);
+  runExo([
+    "agent",
+    "update",
+    agent.slug,
+    "--file",
+    saveAgentSpec(harness, agent.slug, false),
+  ]);
 
   let failedText: string | null = null;
   try {
@@ -511,7 +559,7 @@ function conversationEvents(
   extraArgs: string[],
 ): ConversationEventsResult {
   return parseJson<ConversationEventsResult>(
-    runExo(["conversation", "events", agent, conversation, ...extraArgs]),
+    runExo(["thread", "events", agent, conversation, ...extraArgs]),
   );
 }
 
@@ -521,7 +569,7 @@ function runChat(
   prompt: string,
   options: CommandOptions = {},
 ): string {
-  return runExo(["conversation", "send", agent, conversation, prompt], {
+  return runExo(["thread", "send", agent, conversation, prompt], {
     timeoutMs: options.timeoutMs ?? args.timeoutMs,
   });
 }
@@ -597,7 +645,13 @@ function resolveExoBin(): string {
 function runExo(commandArgs: string[], options: CommandOptions = {}): string {
   return run(
     exoBin,
-    ["--root", root, "--env-file-if-exists", ".env", ...commandArgs],
+    [
+      commandArgs[0],
+      "--root",
+      root,
+      ...(existsSync(join(repoRoot, ".env")) ? ["--env-file", ".env"] : []),
+      ...commandArgs.slice(1),
+    ],
     options,
   );
 }

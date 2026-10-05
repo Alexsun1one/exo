@@ -143,7 +143,10 @@ impl E2bSandboxBackend {
         template_id: &str,
     ) -> Result<E2bSandboxCreated> {
         let mut metadata = HashMap::new();
-        metadata.insert(WARM_SANDBOX_KEY_LABEL.to_string(), request.key.to_string());
+        metadata.insert(
+            WARM_SANDBOX_KEY_LABEL.to_string(),
+            request.sandbox_id.clone(),
+        );
         metadata.insert(
             WARM_SANDBOX_SPEC_HASH_LABEL.to_string(),
             spec_hash.to_string(),
@@ -156,7 +159,10 @@ impl E2bSandboxBackend {
             timeout: timeout_secs,
             auto_pause,
             secure: self.secure,
-            allow_internet_access: !matches!(request.spec.network, SandboxNetworkPolicy::Disabled),
+            allow_internet_access: !matches!(
+                request.spec.policy.networking,
+                SandboxNetworkPolicy::Disabled
+            ),
             metadata,
         };
 
@@ -228,9 +234,10 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.spec.policy.validate_basic("e2b")?;
         reject_host_mounts(&request)?;
         let spec_hash = sandbox_spec_hash(&request.spec);
-        let key_label = request.key.to_string();
+        let key_label = request.sandbox_id.clone();
         let template_id = resolve_template_id(&request.spec, &self.template_id);
 
         if let Some(existing) = self
@@ -245,25 +252,25 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
                     .await?;
                 envd_access_token = connected.envd_access_token;
             }
-            return Ok(Arc::new(E2bSandboxHandle {
-                id: format!("e2b:{}", request.key),
+            return Ok(crate::with_process_management(Arc::new(E2bSandboxHandle {
+                id: format!("e2b:{}", request.sandbox_id.as_str()),
                 sandbox_id: existing.sandbox_id,
                 envd_access_token,
                 request,
                 backend: self.handle_backend(),
-            }));
+            })));
         }
 
         let sandbox = self
             .create_sandbox(&request, &spec_hash, &template_id)
             .await?;
-        Ok(Arc::new(E2bSandboxHandle {
-            id: format!("e2b:{}", request.key),
+        Ok(crate::with_process_management(Arc::new(E2bSandboxHandle {
+            id: format!("e2b:{}", request.sandbox_id.as_str()),
             sandbox_id: sandbox.sandbox_id,
             envd_access_token: sandbox.envd_access_token,
             request,
             backend: self.handle_backend(),
-        }))
+        })))
     }
 
     async fn attach(
@@ -279,6 +286,7 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         request: SandboxRequest,
         payload: SnapshotPayload,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.spec.policy.validate_basic("e2b")?;
         reject_host_mounts(&request)?;
         if payload.format != SnapshotFormat::E2bRef {
             bail!(
@@ -293,13 +301,13 @@ impl ManagedSandboxBackend for E2bSandboxBackend {
         let sandbox = self
             .create_sandbox(&request, &spec_hash, &manifest.snapshot_id)
             .await?;
-        Ok(Arc::new(E2bSandboxHandle {
-            id: format!("e2b-restored:{}", request.key),
+        Ok(crate::with_process_management(Arc::new(E2bSandboxHandle {
+            id: format!("e2b-restored:{}", request.sandbox_id.as_str()),
             sandbox_id: sandbox.sandbox_id,
             envd_access_token: sandbox.envd_access_token,
             request,
             backend: self.handle_backend(),
-        }))
+        })))
     }
 }
 

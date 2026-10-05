@@ -18,9 +18,11 @@ use std::process::{Command, Stdio};
 use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, SystemTime};
 
+use crate::SandboxImageConfiguration;
 use anyhow::{Context, Result, anyhow, bail};
 use docker_credential::{CredentialRetrievalError, DockerCredential};
 use flate2::read::MultiGzDecoder;
+use futures::{StreamExt, TryStreamExt, stream};
 use oci_client::manifest::OciDescriptor;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
@@ -28,8 +30,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::{Builder as TempBuilder, NamedTempFile};
 use tokio::io::AsyncWriteExt;
+use tracing::Instrument;
 
-const MATERIALIZER_VERSION: u32 = 4;
+const MATERIALIZER_VERSION: u32 = 5;
 const EXT4_MAGIC_OFFSET: u64 = 1024 + 0x38;
 const EXT4_MAGIC: [u8; 2] = [0x53, 0xef];
 const GUEST_UID: u32 = 10_001;
@@ -39,6 +42,8 @@ const GUEST_GID: u32 = 10_001;
 // image whose content cannot fit in that filesystem could never materialize,
 // so rejecting it early costs no legitimate image anything.
 const MAX_IMAGE_LAYERS: usize = 512;
+const MAX_LAYER_DOWNLOADS: usize = 4;
+const LAYER_WRITE_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_LAYER_WHITEOUTS: usize = 65_536;
 const MAX_WHITEOUT_PATH_BYTES: usize = 16 * 1024 * 1024;
 // A crashed materialization leaves image-build-*/local-image-*/.tmp* entries
@@ -49,10 +54,33 @@ const STALE_TEMPORARY_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 // https://github.com/docker/docker-credential-helpers/blob/main/credentials/error.go#L10-L52
 const HELPER_CREDENTIALS_NOT_FOUND: &str = "credentials not found in native keychain";
 
+#[test]
+fn runtime_configuration_survives_materialization_metadata() {
+    let configuration: OciImageConfiguration = serde_json::from_str(
+        r#"{
+        "architecture": "arm64", "os": "linux", "config": {
+            "Entrypoint": ["/bin/sh", "-c"], "Cmd": ["exec server"],
+            "Env": ["HOME=/home/exo"], "WorkingDir": "/home/exo",
+            "Healthcheck": {"Test": ["CMD", "/bin/true"], "Timeout": 1000000000}
+        }
+    }"#,
+    )
+    .unwrap();
+    let restored: SandboxImageConfiguration =
+        serde_json::from_slice(&serde_json::to_vec(&configuration.config).unwrap()).unwrap();
+    assert_eq!(restored.entrypoint.unwrap(), ["/bin/sh", "-c"]);
+    assert_eq!(restored.cmd.unwrap(), ["exec server"]);
+    assert_eq!(restored.env.unwrap(), ["HOME=/home/exo"]);
+    assert_eq!(restored.working_dir.as_deref(), Some("/home/exo"));
+    assert_eq!(restored.healthcheck.unwrap().test, ["CMD", "/bin/true"]);
+}
+
 #[derive(Debug, Deserialize)]
 struct OciImageConfiguration {
     architecture: String,
     os: String,
+    #[serde(default)]
+    config: SandboxImageConfiguration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -70,6 +98,7 @@ struct CachedImageMetadata {
     source_digest: String,
     manifest_digest: String,
     platform: String,
+    configuration: SandboxImageConfiguration,
 }
 
 #[derive(Debug, Clone)]
@@ -84,6 +113,11 @@ enum Whiteout {
     Opaque(PathBuf),
 }
 
+#[tracing::instrument(
+    name = "firecracker.resolve_image",
+    skip_all,
+    fields(cache_hit = tracing::field::Empty, registry_lookup = false)
+)]
 pub(super) async fn resolve_image(
     state_root: &Path,
     source: &str,
@@ -124,10 +158,13 @@ pub(super) async fn resolve_image(
     if let Some(source_digest) = immutable_reference_digest(&reference)? {
         let cache_dir = cache_image_dir(&cache_root, &platform, source_digest)?;
         if cache_dir.try_exists()? {
+            tracing::Span::current().record("cache_hit", true);
             return validate_cache_entry(&cache_dir, source_digest, None, &platform);
         }
     }
 
+    tracing::Span::current().record("cache_hit", false);
+    tracing::Span::current().record("registry_lookup", true);
     let auth = registry_auth(&reference)?;
 
     let client = Client::default();
@@ -151,6 +188,7 @@ pub(super) async fn resolve_image(
     // LimitedAsyncWriter under declared-size and cumulative budgets.
     let (manifest, manifest_digest, config_json, list_digest) = client
         .pull_manifest_and_config_and_list_digest(&reference, &auth)
+        .instrument(tracing::info_span!("firecracker.registry_manifest"))
         .await
         .with_context(|| format!("resolving OCI image manifest for {source}"))?;
     let source_digest = list_digest.unwrap_or_else(|| manifest_digest.clone());
@@ -160,6 +198,7 @@ pub(super) async fn resolve_image(
     validate_platform(&image_config)?;
     let cache_dir = cache_image_dir(&cache_root, &platform, &source_digest)?;
     if cache_dir.try_exists()? {
+        tracing::Span::current().record("cache_hit", true);
         return validate_cache_entry(
             &cache_dir,
             &source_digest,
@@ -203,20 +242,32 @@ pub(super) async fn resolve_image(
         }
     }
 
-    let mut layers = Vec::with_capacity(manifest.layers.len());
-    for descriptor in &manifest.layers {
-        let path = pull_blob(
-            &client,
-            &reference,
-            descriptor,
-            &cache_root.join("blobs/sha256"),
-        )
-        .await?;
-        layers.push(CachedLayer {
-            path,
-            media_type: descriptor.media_type.clone(),
-        });
+    let blob_root = cache_root.join("blobs/sha256");
+    let layer_count = manifest.layers.len();
+    let (layer_sender, mut layer_receiver) = tokio::sync::mpsc::channel(1);
+    let layers = stream::iter(manifest.layers)
+        .map(|descriptor| {
+            let (client, reference, blob_root) = (&client, &reference, &blob_root);
+            async move {
+                let path = pull_blob(client, reference, &descriptor, blob_root).await?;
+                Ok::<_, anyhow::Error>(CachedLayer {
+                    path,
+                    media_type: descriptor.media_type,
+                })
+            }
+        })
+        .buffered(MAX_LAYER_DOWNLOADS);
+    let downloads = async move {
+        futures::pin_mut!(layers);
+        while let Some(layer) = layers.try_next().await? {
+            layer_sender
+                .send(layer)
+                .await
+                .context("Firecracker image extraction stopped before download completed")?;
+        }
+        Ok::<_, anyhow::Error>(())
     }
+    .instrument(tracing::info_span!("firecracker.image.download_layers"));
 
     let metadata = CachedImageMetadata {
         materializer_version: MATERIALIZER_VERSION,
@@ -224,11 +275,19 @@ pub(super) async fn resolve_image(
         source_digest: source_digest.clone(),
         manifest_digest: manifest_digest.clone(),
         platform: platform.clone(),
+        configuration: image_config.config,
     };
     let build_cache_root = cache_root.clone();
     let build_cache_dir = cache_dir.clone();
     let build_source = source.to_string();
-    tokio::task::spawn_blocking(move || {
+    let span = tracing::Span::current();
+    let build = tokio::task::spawn_blocking(move || {
+        let _entered = span.enter();
+        let layers = (0..layer_count).map(|_| {
+            layer_receiver
+                .blocking_recv()
+                .context("OCI layer download ended before the image was complete")
+        });
         build_and_publish_image(
             &build_cache_root,
             &build_cache_dir,
@@ -237,9 +296,13 @@ pub(super) async fn resolve_image(
             metadata,
             image_size_gib,
         )
-    })
-    .await
-    .context("joining Firecracker image materialization")?
+    });
+    let (_, image) = tokio::try_join!(downloads, async {
+        build
+            .await
+            .context("joining Firecracker image materialization")?
+    })?;
+    Ok(image)
 }
 
 // Empty allowlist means unrestricted (the default). Entries match either the
@@ -292,6 +355,14 @@ fn cache_local_image(
     validate_allowed_local_image(state_root, &source, allowed_local_images)?;
     validate_ext4_image(&source)?;
     let metadata = fs::metadata(&source)?;
+    let configuration = match File::open(source.with_extension("config.json")) {
+        Ok(file) => serde_json::from_reader::<_, SandboxImageConfiguration>(file.take(65_536))
+            .context("decoding local Firecracker image configuration")?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            SandboxImageConfiguration::default()
+        }
+        Err(error) => return Err(error).context("reading local Firecracker image configuration"),
+    };
     let identity = format!(
         "{}:{}:{}:{}:{}:{}:{}",
         metadata.dev(),
@@ -302,7 +373,10 @@ fn cache_local_image(
         metadata.ctime(),
         metadata.ctime_nsec()
     );
-    let digest = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    let mut hasher = Sha256::new();
+    hasher.update(identity.as_bytes());
+    hasher.update(serde_json::to_vec(&configuration)?);
+    let digest = format!("{:x}", hasher.finalize());
     let local_root = state_root
         .join("images")
         .join(format!("v{MATERIALIZER_VERSION}"))
@@ -333,6 +407,10 @@ fn cache_local_image(
     })?;
     fs::set_permissions(&staged, Permissions::from_mode(0o444))?;
     validate_ext4_image(&staged)?;
+    fs::write(
+        temporary.path().join("rootfs.config.json"),
+        serde_json::to_vec(&configuration)?,
+    )?;
     let temporary_path = temporary.keep();
     match fs::rename(&temporary_path, &cache_dir) {
         Ok(()) => {}
@@ -524,6 +602,11 @@ fn docker_config_path() -> Option<PathBuf> {
         .map(|directory| directory.join("config.json"))
 }
 
+#[tracing::instrument(
+    name = "firecracker.image.download_layer",
+    skip_all,
+    fields(bytes = descriptor.size, cache_hit = false)
+)]
 async fn pull_blob(
     client: &Client,
     reference: &Reference,
@@ -533,6 +616,7 @@ async fn pull_blob(
     let digest = sha256_hex(&descriptor.digest)?;
     let destination = blob_root.join(digest);
     if destination.try_exists()? {
+        tracing::Span::current().record("cache_hit", true);
         validate_cached_blob(&destination, descriptor)?;
         return Ok(destination);
     }
@@ -546,9 +630,12 @@ async fn pull_blob(
     })?;
     // The registry stream is untrusted: hold it to the manifest's declared size
     // while it is written so a lying registry cannot fill the host disk. The
-    // digest check below still rejects any blob whose content is wrong.
+    // OCI client's streaming digest check rejects blobs with incorrect content.
     let mut output = LimitedAsyncWriter {
-        inner: tokio::fs::File::from_std(temporary.reopen()?),
+        inner: tokio::io::BufWriter::with_capacity(
+            LAYER_WRITE_BUFFER_BYTES,
+            tokio::fs::File::from_std(temporary.reopen()?),
+        ),
         remaining: u64::try_from(descriptor.size).context("negative OCI layer size")?,
     };
     client
@@ -556,9 +643,9 @@ async fn pull_blob(
         .await
         .with_context(|| format!("pulling OCI layer {}", descriptor.digest))?;
     output.inner.flush().await?;
-    output.inner.sync_all().await?;
+    output.inner.get_ref().sync_all().await?;
     drop(output);
-    validate_blob(temporary.path(), descriptor)?;
+    validate_cached_blob(temporary.path(), descriptor)?;
     fs::set_permissions(temporary.path(), Permissions::from_mode(0o600))?;
     match fs::hard_link(temporary.path(), &destination) {
         Ok(()) => Ok(destination),
@@ -630,16 +717,6 @@ fn validate_cached_blob(path: &Path, descriptor: &OciDescriptor) -> Result<()> {
     Ok(())
 }
 
-fn validate_blob(path: &Path, descriptor: &OciDescriptor) -> Result<()> {
-    validate_cached_blob(path, descriptor)?;
-    let expected = sha256_hex(&descriptor.digest)?;
-    let actual = sha256_hex_of_file(path)?;
-    if actual != expected {
-        bail!("OCI layer digest mismatch: expected sha256:{expected}, got sha256:{actual}");
-    }
-    Ok(())
-}
-
 pub(super) fn sha256_hex_of_file(path: &Path) -> Result<String> {
     let mut input = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -647,11 +724,12 @@ pub(super) fn sha256_hex_of_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+#[tracing::instrument(name = "firecracker.image.materialize", skip_all)]
 fn build_and_publish_image(
     cache_root: &Path,
     cache_dir: &Path,
     source: &str,
-    layers: Vec<CachedLayer>,
+    layers: impl Iterator<Item = Result<CachedLayer>>,
     metadata: CachedImageMetadata,
     image_size_gib: u64,
 ) -> Result<PathBuf> {
@@ -674,8 +752,9 @@ fn build_and_publish_image(
     // filesystem, so a tree with more inodes than this could never fit the
     // generated ext4 anyway; rejecting early bounds host inode consumption.
     let inode_budget = (image_bytes / 16384).max(65_536);
-    for layer in &layers {
-        apply_layer(&rootfs, layer, image_bytes.saturating_mul(2))?;
+    for layer in layers {
+        let layer = layer?;
+        apply_layer(&rootfs, &layer, image_bytes.saturating_mul(2))?;
         // Content that cannot fit in the ext4 image would only fail in
         // mkfs.ext4 later; checking after each layer bounds how much host
         // disk and how many host inodes an oversized image can consume in
@@ -711,11 +790,14 @@ fn build_and_publish_image(
     // code runs inside the Lima bridge process, whose inherited stdout is the
     // length-prefixed bridge protocol, and any stray byte from a child would
     // corrupt its framing.
-    let output = Command::new(mkfs)
-        .args([OsStr::new("-q"), OsStr::new("-F"), OsStr::new("-d")])
-        .arg(&rootfs)
-        .arg(&image)
-        .output()
+    let output = tracing::info_span!("firecracker.image.mkfs")
+        .in_scope(|| {
+            Command::new(mkfs)
+                .args([OsStr::new("-q"), OsStr::new("-F"), OsStr::new("-d")])
+                .arg(&rootfs)
+                .arg(&image)
+                .output()
+        })
         .context("running mkfs.ext4 for Firecracker OCI image")?;
     if !output.status.success() {
         bail!(
@@ -730,6 +812,10 @@ fn build_and_publish_image(
     fs::set_permissions(&image, Permissions::from_mode(0o444))?;
     validate_ext4_image(&image)?;
 
+    fs::write(
+        temporary.path().join("rootfs.config.json"),
+        serde_json::to_vec(&metadata.configuration)?,
+    )?;
     fs::write(
         temporary.path().join("metadata.json"),
         serde_json::to_vec_pretty(&metadata)?,
@@ -770,6 +856,7 @@ fn build_and_publish_image(
     )
 }
 
+#[tracing::instrument(name = "firecracker.image.extract_layer", skip_all)]
 fn apply_layer(rootfs: &Path, layer: &CachedLayer, decompressed_budget: u64) -> Result<()> {
     // OCI whiteouts describe deletions from lower layers. Applying every
     // whiteout before unpacking the same layer preserves replacement entries and
@@ -845,6 +932,7 @@ fn apply_layer(rootfs: &Path, layer: &CachedLayer, decompressed_budget: u64) -> 
     Ok(())
 }
 
+#[tracing::instrument(name = "firecracker.image.scan_whiteouts", skip_all)]
 fn collect_whiteouts(layer: &CachedLayer, decompressed_budget: u64) -> Result<Vec<Whiteout>> {
     let reader = layer_reader(&layer.path, &layer.media_type, decompressed_budget)?;
     let mut archive = tar::Archive::new(reader);
@@ -994,6 +1082,7 @@ struct DirectoryTreeUsage {
 // overcounted. Used to bound host disk and inodes consumed by extraction,
 // since only mkfs.ext4 enforces the image size and it runs after all layers
 // already landed on the host filesystem.
+#[tracing::instrument(name = "firecracker.image.check_extracted_size", skip_all)]
 fn directory_tree_usage(path: &Path) -> Result<DirectoryTreeUsage> {
     let mut seen = HashSet::new();
     let mut usage = DirectoryTreeUsage::default();
@@ -1323,6 +1412,62 @@ mod tests {
     use super::*;
     use tar::{Builder, EntryType, Header};
 
+    #[tokio::test]
+    async fn buffered_registry_download_checks_digest_and_size() {
+        use oci_client::client::{ClientConfig, ClientProtocol};
+        use tokio::io::AsyncReadExt;
+
+        for (body, declared_size, accepted) in [
+            (b"valid".as_slice(), 5, true),
+            (b"wrong".as_slice(), 5, false),
+            (b"valid-extra".as_slice(), 5, false),
+            (b"short".as_slice(), 10, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let reference: Reference = format!("{}/image:latest", listener.local_addr().unwrap())
+                .parse()
+                .unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                    assert!(request.len() < 8192);
+                }
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                socket.write_all(body).await.unwrap();
+            });
+            let client = Client::new(ClientConfig {
+                protocol: ClientProtocol::Http,
+                ..ClientConfig::default()
+            });
+            let descriptor = OciDescriptor {
+                digest: format!("sha256:{:x}", Sha256::digest(b"valid")),
+                size: declared_size,
+                ..OciDescriptor::default()
+            };
+            let mut writer = LimitedAsyncWriter {
+                inner: tokio::io::BufWriter::with_capacity(2, Vec::new()),
+                remaining: declared_size as u64,
+            };
+            let result = client.pull_blob(&reference, &descriptor, &mut writer).await;
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
+            if accepted {
+                assert_eq!(writer.inner.into_inner(), b"valid");
+            }
+            server.await.unwrap();
+        }
+    }
+
     fn append_file_with_mode(
         builder: &mut Builder<Vec<u8>>,
         path: &str,
@@ -1374,6 +1519,38 @@ mod tests {
             path,
             media_type: "application/vnd.oci.image.layer.v1.tar".to_string(),
         }
+    }
+
+    #[test]
+    fn failed_layer_download_does_not_publish_a_partial_image() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache_root = directory.path().join("cache");
+        fs::create_dir(&cache_root).unwrap();
+        let cache_dir = cache_root.join("image");
+        let layer = write_layer(directory.path(), "base.tar", &[("file", b"content")]);
+        let layers = [Ok(layer), Err(anyhow::anyhow!("download failed"))];
+        let metadata = CachedImageMetadata {
+            materializer_version: MATERIALIZER_VERSION,
+            source: "example.com/image:latest".to_string(),
+            source_digest: String::new(),
+            manifest_digest: String::new(),
+            platform: "linux/amd64".to_string(),
+            configuration: SandboxImageConfiguration::default(),
+        };
+
+        let error = build_and_publish_image(
+            &cache_root,
+            &cache_dir,
+            &metadata.source.clone(),
+            layers.into_iter(),
+            metadata,
+            1,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "download failed");
+        assert!(!cache_dir.exists());
+        assert_eq!(fs::read_dir(cache_root).unwrap().count(), 0);
     }
 
     #[test]
@@ -1606,7 +1783,7 @@ mod tests {
         let digest = format!("sha256:{}", "a".repeat(64));
         assert_eq!(
             cache_image_dir(Path::new("/cache"), "linux-arm64", &digest).unwrap(),
-            Path::new("/cache/v4/linux-arm64").join("a".repeat(64))
+            Path::new("/cache/v5/linux-arm64").join("a".repeat(64))
         );
         assert!(cache_image_dir(Path::new("/cache"), "linux-arm64", "latest").is_err());
     }

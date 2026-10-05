@@ -1,10 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
 import {
   buildShellToolDefinitions,
+  validateToolPolicies,
   createShellToolInstance,
   createToolRegistry,
   initializeTool,
@@ -15,6 +16,8 @@ import {
   registerLibraryTools,
   registerLibraryToolModulePath,
   registerTools,
+  assistantTextMessage,
+  messagesEvent,
   materializeEventsToMessages,
   toolResultMessage,
   toolResultEvent,
@@ -26,10 +29,26 @@ import {
   type Tool,
   type ToolResult,
   type TurnContext,
+  type Vault,
 } from "./index";
+import { resolveModel, sandboxCwd } from "../model-runtime/shared";
 import { ircTool } from "../../examples/typescript/tools/irc";
 import { uppercaseTool } from "../../examples/typescript/tools/uppercase";
 import { installToolSource, readToolRegistry } from "./tool-registry";
+
+it("uses the environment working directory before the first mount", () => {
+  const context = fakeTurnContext({
+    conversationConfig: {
+      workdir: "/environment",
+      mounts: [{ hostPath: "/host", mountPath: "/mounted", mode: "rw" }],
+    },
+  });
+  expect(sandboxCwd(context)).toBe("/environment");
+  context.conversationConfig.workdir = null;
+  expect(sandboxCwd(context)).toBe("/mounted");
+  context.conversationConfig.mounts = [];
+  expect(sandboxCwd(context)).toBe("/");
+});
 
 describe("HarnessToolRegistry", () => {
   it("returns registered tool definitions", () => {
@@ -82,7 +101,7 @@ describe("HarnessToolRegistry", () => {
     expect(executionContexts[0].toolCallId).toBe("call_1");
   });
 
-  it("emits stream events around tool execution when streaming", async () => {
+  it("returns tool result events without publishing stream progress", async () => {
     const streamEvents: EventData[] = [];
     const context = fakeTurnContext({
       streaming: true,
@@ -92,7 +111,7 @@ describe("HarnessToolRegistry", () => {
       fakeTool("echo", async (args) => ({ echoed: args.value })),
     );
 
-    await registry.executePending([
+    const events = await registry.executePending([
       {
         toolCallId: "call_1",
         request: {
@@ -102,21 +121,12 @@ describe("HarnessToolRegistry", () => {
       },
     ]);
 
-    expect(streamEvents).toEqual([
-      {
-        type: "tool_call_streamed",
-        toolCallId: "call_1",
-        toolName: "echo",
-        arguments: { value: "hello" },
-      },
-      {
-        type: "tool_result_streamed",
-        toolCallId: "call_1",
-        result: wrappedToolResult("call_1", "echo", "library", 1, {
-          echoed: "hello",
-        }),
-      },
+    expect(events).toEqual([
+      wrappedToolResultEvent("call_1", "echo", "library", 1, {
+        echoed: "hello",
+      }),
     ]);
+    expect(streamEvents).toEqual([]);
   });
 
   it("throws for unregistered tools", async () => {
@@ -233,6 +243,28 @@ describe("HarnessToolRegistry", () => {
 });
 
 describe("materializeEventsToMessages", () => {
+  it("leaves RLM diagnostics out of conversation replay", () => {
+    const data = [
+      {
+        type: "custom",
+        event_type: "rlm_model_response",
+        payload: { messages: [assistantTextMessage("FINAL(secret)")] },
+      },
+      messagesEvent([assistantTextMessage("answer")]),
+    ];
+    expect(
+      materializeEventsToMessages(
+        data.map((data, index) => ({
+          id: String(index),
+          conversationId: "thread",
+          turnId: "turn",
+          createdAt: "2026-09-29T00:00:00Z",
+          data,
+        })),
+      ),
+    ).toEqual([assistantTextMessage("answer")]);
+  });
+
   it("synthesizes results for dangling tool calls before later messages", () => {
     const events: Event[] = [
       {
@@ -298,6 +330,11 @@ describe("materializeEventsToMessages", () => {
       }),
       { role: "user", content: "try again" },
     ]);
+    expect(
+      materializeEventsToMessages(
+        events.filter((event) => event.data.type !== "tool_requested"),
+      ),
+    ).toEqual(materializeEventsToMessages(events));
   });
 });
 
@@ -829,7 +866,7 @@ describe("agent tool loading", () => {
         tools: [{ id: "broken" }],
       });
       await fs.writeFile(path.join(tempdir, "tools.lock.json"), lockfile);
-      expect(readToolRegistry(tempdir)).rejects.toThrow(
+      await expect(readToolRegistry(tempdir)).rejects.toThrow(
         "invalid tool lockfile",
       );
       expect(
@@ -960,8 +997,21 @@ describe("agent tool loading", () => {
 
       const context = fakeTurnContext();
       const registry = createToolRegistry(context);
-      await registerAgentToolsFromDirectoryIfExists(registry, context);
+      const errors: string[] = [];
+      const errorLog = vi
+        .spyOn(console, "error")
+        .mockImplementation((message: unknown) => {
+          errors.push(String(message));
+        });
+      try {
+        await registerAgentToolsFromDirectoryIfExists(registry, context);
+      } finally {
+        errorLog.mockRestore();
+      }
 
+      expect(errors).toHaveLength(2);
+      expect(errors[0]).toContain("a-broken.ts");
+      expect(errors[1]).toContain("tool is already registered: reverse_text");
       expect(registry.get("reverse_text")?.source).toBe("agent");
       await expect(
         registry.executePending([
@@ -1310,6 +1360,8 @@ function fakeTurnContext(
   const streamEvents = options.streamEvents ?? [];
   let artifactIndex = 0;
   return {
+    tools: [],
+    mcpServers: [],
     agentConfig: {
       instructions: [],
       harness: "typescript",
@@ -1367,6 +1419,7 @@ function fakeTurnContext(
         },
       },
     },
+    authorizeTool: async () => {},
     executeTool: options.executeTool ?? (async () => null),
     async startSandboxProcess() {
       throw new Error("not implemented");
@@ -1400,3 +1453,162 @@ function fakeTurnContext(
     },
   } as unknown as TurnContext;
 }
+
+it("does not execute a TypeScript tool after its approval is denied", async () => {
+  const context = fakeTurnContext();
+  let executed = false;
+  context.authorizeTool = async () => {
+    throw new Error("tool denied");
+  };
+  const registry = createToolRegistry(context).register({
+    source: "library",
+    definition: {
+      name: "write",
+      description: "Write a file",
+      parameters: {
+        type: "object",
+        properties: {},
+        additionalProperties: false,
+      },
+    },
+    handler: {
+      async execute() {
+        executed = true;
+        return { ok: true };
+      },
+    },
+  });
+  const events = await registry.executePending([
+    { toolCallId: "denied", request: { functionName: "write", arguments: {} } },
+  ]);
+  expect(executed).toBe(false);
+  expect(JSON.stringify(events)).toContain("tool denied");
+});
+
+describe("tool policy validation", () => {
+  it("accepts runtime shell approvals when native approvals are unsupported", () => {
+    const context = fakeTurnContext({
+      conversationConfig: {
+        shellProgram: "/bin/sh",
+        mounts: [],
+        toolPolicies: { shell: { type: "always_ask" } },
+      },
+    });
+    expect(() => validateToolPolicies(context, ["shell"], false)).not.toThrow();
+    context.conversationConfig.permissionPolicy = { type: "always_ask" };
+    expect(() => validateToolPolicies(context, ["shell"], false)).toThrow(
+      "cannot enforce always_ask",
+    );
+  });
+
+  it("checks exact native and registered tool names", () => {
+    const context = fakeTurnContext({
+      conversationConfig: {
+        mounts: [],
+        toolPolicies: { Bash: { type: "always_ask" } },
+      },
+    });
+    expect(() => validateToolPolicies(context, ["claude.Bash"])).toThrow(
+      "unknown tool in tool_policies: Bash",
+    );
+    context.conversationConfig.toolPolicies = {
+      "claude.Bash": { type: "always_ask" },
+    };
+    expect(() => validateToolPolicies(context, ["claude.Bash"])).not.toThrow();
+    context.conversationConfig.toolPolicies = {
+      custom_tool: { type: "always_ask" },
+    };
+    expect(() => validateToolPolicies(context, ["custom_tool"])).not.toThrow();
+  });
+});
+
+it("resolves model credentials from attached vaults without shadowing IDs or ignoring grants", async () => {
+  const context = fakeTurnContext();
+  const originalId = "01900000-0000-7000-8000-000000000001";
+  const resolve = vi.fn(
+    async () =>
+      ({
+        revision: 2,
+        secret: { type: "key", value: "vault-key" },
+      }) satisfies import("./index").ResolvedSecret,
+  );
+  const vault: Vault = {
+    record: { id: "vault", name: "personal", createdAt: "2026-01-01" },
+    listSecrets: async () => [
+      {
+        id: originalId,
+        name: "openai",
+        revision: 2,
+        type: "key",
+        createdAt: "2026-01-01",
+        policy: {
+          networking: {
+            type: "destinations",
+            allowedDestinations: [
+              { type: "origin", origin: "https://api.openai.com" },
+            ],
+          },
+          injectionLocation: { header: true },
+        },
+      },
+    ],
+    resolveSecret: resolve,
+    getSecret: async () => {
+      throw new Error("scoped keys must use resolveSecret");
+    },
+    putSecret: async () => {
+      throw new Error("unexpected write");
+    },
+    updateSecret: async () => {
+      throw new Error("unexpected write");
+    },
+    deleteSecret: async () => {
+      throw new Error("unexpected delete");
+    },
+  };
+  const shadow: Vault = {
+    ...vault,
+    listSecrets: async () => [
+      {
+        id: "01900000-0000-7000-8000-000000000002",
+        name: originalId,
+        revision: 1,
+        type: "key",
+        createdAt: "2026-01-01",
+      },
+    ],
+    getSecret: async () => {
+      throw new Error("ID must not resolve by name");
+    },
+  };
+  context.exoharness.current.conversation.listVaults = async () => [
+    vault,
+    shadow,
+  ];
+  context.agentConfig.model = "gpt-5-unregistered";
+  context.agentConfig.credential = originalId;
+  expect(await resolveModel(context)).toMatchObject({
+    model: "gpt-5-unregistered",
+    apiKey: "vault-key",
+  });
+  expect(resolve).toHaveBeenCalledOnce();
+  context.agentConfig.credential = "openai";
+  expect((await resolveModel(context)).apiKey).toBe("vault-key");
+  expect(resolve).toHaveBeenLastCalledWith(originalId, {
+    type: "origin",
+    origin: "https://api.openai.com",
+  });
+  context.agentConfig.baseUrl = "https://other.example/v1";
+  resolve.mockRejectedValueOnce(new Error("not authorized"));
+  await expect(resolveModel(context)).rejects.toThrow("not authorized");
+  expect(resolve).toHaveBeenLastCalledWith(originalId, {
+    type: "origin",
+    origin: "https://other.example",
+  });
+  context.agentConfig.credential = "missing";
+  await expect(resolveModel(context)).rejects.toThrow(
+    "not found in the selected vaults",
+  );
+  context.agentConfig.credential = null;
+  await expect(resolveModel(context)).rejects.toThrow("config.credential");
+});

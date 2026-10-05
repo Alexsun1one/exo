@@ -1,7 +1,6 @@
 import {
   materializeEventsToMessages,
   messageText,
-  stringifyValue,
   toJsonValue,
   turnMetadata,
   type EventData,
@@ -26,11 +25,13 @@ export interface TextDeltaTraceState {
   ttftMs: number | null;
 }
 
-export interface ResolvedLlmBinding {
-  name: string;
+export interface SandboxModel {
   model: string;
-  apiKey?: string;
   baseUrl?: string | null;
+}
+
+export interface ResolvedModel extends SandboxModel {
+  apiKey: string;
 }
 
 export class AsyncQueue<T> {
@@ -226,46 +227,54 @@ export class WarmJsonlSandboxWorker<TRequest, TEvent> {
   }
 }
 
-export async function resolveLlmBinding(
-  context: TurnContext,
-): Promise<ResolvedLlmBinding> {
-  const name = context.agentConfig.model;
-  const metadata = (
-    await context.exoharness.current.conversation.listBindings()
-  )
-    .filter((binding) => binding.type === "llm")
-    .filter((binding) => binding.name === name)
-    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))[0];
-  if (!metadata) {
-    throw new Error(
-      `model is not registered: ${name}; run \`exo model register ${name} --secret <secret>\``,
-    );
-  }
-  const binding = await context.exoharness.current.conversation.getBinding(
-    metadata.id,
-  );
-  if (!binding || binding.type !== "llm") {
-    throw new Error(`registered model binding disappeared: ${name}`);
-  }
-  let apiKey: string | undefined;
-  if (binding.secretId) {
-    const secret = await context.exoharness.current.conversation.getSecret(
-      binding.secretId,
-    );
-    if (!secret) {
-      throw new Error(`model secret does not exist for ${name}`);
-    }
-    if (secret.type !== "key") {
-      throw new Error(`model secret must be a key secret for ${name}`);
-    }
-    apiKey = secret.value;
-  }
+export function resolveSandboxModel(context: TurnContext): SandboxModel {
   return {
-    name,
-    model: binding.model,
-    apiKey,
-    baseUrl: binding.baseUrl ?? null,
+    model: context.agentConfig.model,
+    baseUrl: context.agentConfig.baseUrl,
   };
+}
+
+export async function resolveModel(
+  context: TurnContext,
+  defaultBaseUrl = context.agentConfig.model.toLowerCase().startsWith("claude")
+    ? "https://api.anthropic.com"
+    : "https://api.openai.com/v1",
+): Promise<ResolvedModel> {
+  const name = context.agentConfig.credential;
+  if (!name) {
+    throw new Error(
+      "agent config.credential must name a credential in a selected vault",
+    );
+  }
+  const idText = name.replace(/^urn:uuid:/i, "").replace(/^\{(.*)\}$/, "$1");
+  const id =
+    /^(?:[0-9a-f]{32}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i.test(
+      idText,
+    )
+      ? idText.replaceAll("-", "").toLowerCase()
+      : null;
+  const vaults = await context.exoharness.current.conversation.listVaults();
+  for (const vault of vaults.reverse()) {
+    const metadata = (await vault.listSecrets()).find((secret) =>
+      id === null
+        ? secret.name === name
+        : secret.id.replaceAll("-", "").toLowerCase() === id,
+    );
+    if (!metadata) continue;
+    const origin = new URL(context.agentConfig.baseUrl ?? defaultBaseUrl)
+      .origin;
+    const { secret } = await vault.resolveSecret(metadata.id, {
+      type: "origin",
+      origin,
+    });
+    return {
+      ...resolveSandboxModel(context),
+      apiKey: secret.type === "oauth" ? secret.accessToken : secret.value,
+    };
+  }
+  throw new Error(
+    `model credential ${name} was not found in the selected vaults`,
+  );
 }
 
 export function markFirstTextDelta(state: TextDeltaTraceState): number | null {
@@ -278,7 +287,11 @@ export function markFirstTextDelta(state: TextDeltaTraceState): number | null {
 }
 
 export function sandboxCwd(context: TurnContext): string {
-  return context.conversationConfig.mounts[0]?.mountPath ?? "/";
+  return (
+    context.conversationConfig.workdir ??
+    context.conversationConfig.mounts[0]?.mountPath ??
+    "/"
+  );
 }
 
 export function mountSummary(context: TurnContext): string {
@@ -301,37 +314,9 @@ export function instructionsText(messages: Message[]): string | null {
 export async function appendEvents(
   context: TurnContext,
   events: EventData[],
-  options: { defaultToolName?: string } = {},
 ): Promise<void> {
-  if (events.length === 0) {
-    return;
-  }
-  await context.exoharness.current.turn.addEvents(events);
-  if (!context.streaming) {
-    return;
-  }
-
-  for (const event of events) {
-    if (event.type === "tool_requested") {
-      await context.stream.toolCall({
-        toolCallId: String(event.tool_call_id),
-        toolName: String(
-          (event.request as { function_name?: unknown } | undefined)
-            ?.function_name ??
-            options.defaultToolName ??
-            "tool",
-        ),
-        arguments: asJsonObject(
-          (event.request as { arguments?: unknown } | undefined)?.arguments,
-        ),
-      });
-    } else if (event.type === "tool_result") {
-      await context.stream.toolResult({
-        toolCallId: String(event.tool_call_id),
-        result: toJsonValue(event.result ?? null),
-      });
-    }
-  }
+  if (events.length > 0)
+    await context.exoharness.current.turn.addEvents(events);
 }
 
 export async function materializePriorConversationMessages(
@@ -435,27 +420,6 @@ export async function appendAndTraceObservedToolEvents(
       activeToolCalls.delete(event.tool_call_id);
     }
   }
-}
-
-export function shellToolSucceeded(result: JsonValue): boolean {
-  const exitCode = asRecord(result).exit_code;
-  return typeof exitCode === "number" ? exitCode === 0 : true;
-}
-
-export function shellToolResultText(result: JsonValue): string {
-  const record = asRecord(result);
-  if (
-    typeof record.stdout === "string" ||
-    typeof record.stderr === "string" ||
-    typeof record.exit_code === "number"
-  ) {
-    return [
-      `exit_code: ${record.exit_code ?? "unknown"}`,
-      `stdout:\n${record.stdout ?? ""}`,
-      `stderr:\n${record.stderr ?? ""}`,
-    ].join("\n");
-  }
-  return stringifyValue(result);
 }
 
 export function pickEnv(

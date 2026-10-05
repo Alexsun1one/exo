@@ -1,3 +1,6 @@
+use exoharness::vault::{
+    CredentialDestination, ResolvedSecret, VaultContext, VaultHandle, VaultId, VaultRecord,
+};
 use std::collections::VecDeque;
 use std::ops::Bound;
 use std::sync::{Arc, Mutex};
@@ -6,7 +9,7 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use exoharness::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
-    ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingRecord, BindingType,
+    ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingRecord,
     ConversationHandle, ConversationId, ConversationRecord, CreateSandboxRequest, Event, EventData,
     EventQuery, EventQueryDirection, EventStream, ExoHarness, ForkConversationRequest,
     ForkSandboxRequest, GetEventsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
@@ -60,6 +63,7 @@ async fn send_appends_user_and_assistant_messages() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("ping")],
+            ..Default::default()
         })
         .await
         .expect("begin turn should succeed");
@@ -76,11 +80,14 @@ async fn send_appends_user_and_assistant_messages() {
     HarnessExecutor::execute_turn(
         &executor,
         agent.as_ref(),
-        conversation.as_ref(),
+        Arc::clone(&conversation),
         Arc::clone(&turn),
         &default_agent_config(),
         &ConversationConfig::default(),
-        &(),
+        &crate::SendRequest {
+            input: Vec::new(),
+            session_id: None,
+        },
         ExecutorStreamMode::Disabled,
         None,
     )
@@ -106,11 +113,16 @@ async fn send_appends_user_and_assistant_messages() {
         events[0].session_id.expect("session id")
     );
     assert!(matches!(events[0].data, EventData::SessionStarted));
-    assert!(matches!(events[1].data, EventData::TurnStarted));
+    assert!(matches!(events[1].data, EventData::TurnStarted { .. }));
     assert!(matches!(events[2].data, EventData::Messages { .. }));
     assert!(matches!(events[3].data, EventData::Messages { .. }));
-    assert!(matches!(events[4].data, EventData::TurnEnded));
-    assert_eq!(latest_event_id, events[4].id);
+    assert!(matches!(
+        &events[4].data,
+        EventData::Custom { event_type, .. }
+            if event_type == crate::harness_executor::RUNTIME_TURN_COMPLETED
+    ));
+    assert!(matches!(events[5].data, EventData::TurnEnded));
+    assert_eq!(latest_event_id, events[5].id);
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -174,6 +186,7 @@ async fn send_executes_tool_round_trip() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("run it")],
+            ..Default::default()
         })
         .await
         .expect("begin turn should succeed");
@@ -181,11 +194,14 @@ async fn send_executes_tool_round_trip() {
     HarnessExecutor::execute_turn(
         &executor,
         agent.as_ref(),
-        conversation.as_ref(),
+        Arc::clone(&conversation),
         Arc::clone(&turn),
         &agent_config,
         &conversation_config,
-        &(),
+        &crate::SendRequest {
+            input: Vec::new(),
+            session_id: None,
+        },
         ExecutorStreamMode::Disabled,
         None,
     )
@@ -290,6 +306,7 @@ async fn send_records_tool_result_when_tool_execution_fails() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("run it")],
+            ..Default::default()
         })
         .await
         .expect("begin turn should succeed");
@@ -297,7 +314,7 @@ async fn send_records_tool_result_when_tool_execution_fails() {
     HarnessExecutor::execute_turn(
         &executor,
         agent.as_ref(),
-        conversation.as_ref(),
+        Arc::clone(&conversation),
         Arc::clone(&turn),
         &default_agent_config(),
         &ConversationConfig {
@@ -305,7 +322,10 @@ async fn send_records_tool_result_when_tool_execution_fails() {
             mounts: Vec::new(),
             ..Default::default()
         },
-        &(),
+        &crate::SendRequest {
+            input: Vec::new(),
+            session_id: None,
+        },
         ExecutorStreamMode::Disabled,
         None,
     )
@@ -336,7 +356,7 @@ async fn send_records_tool_result_when_tool_execution_fails() {
                     && result
                         == &json!({
                             "ok": false,
-                            "error": "sandbox quota exceeded",
+                            "error": "executing tool: sandbox quota exceeded",
                         })
             }
             _ => false,
@@ -392,6 +412,7 @@ async fn send_stream_emits_chunks_and_persists_final_response() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("stream it")],
+            ..Default::default()
         })
         .await
         .expect("begin turn should succeed");
@@ -409,11 +430,14 @@ async fn send_stream_emits_chunks_and_persists_final_response() {
     HarnessExecutor::execute_turn(
         &executor,
         agent.as_ref(),
-        conversation.as_ref(),
+        Arc::clone(&conversation),
         Arc::clone(&turn),
         &default_agent_config(),
         &ConversationConfig::default(),
-        &(),
+        &crate::SendRequest {
+            input: Vec::new(),
+            session_id: None,
+        },
         ExecutorStreamMode::Enabled(&event_tx),
         None,
     )
@@ -446,6 +470,9 @@ async fn send_stream_emits_chunks_and_persists_final_response() {
                         chunk_text.push_str(&content);
                     }
                 }
+            }
+            ExecutionStreamEvent::ApprovalRequested { .. } => {
+                panic!("default policy should not prompt")
             }
             ExecutionStreamEvent::ToolCall { .. } => {}
             ExecutionStreamEvent::ToolResult { .. } => {}
@@ -591,7 +618,7 @@ impl ToolRuntime for FailingToolRuntime {
         _config: &ConversationConfig,
         _request: &ToolRequest,
     ) -> Result<ToolResult> {
-        Err(anyhow!(self.message.clone()))
+        Err(anyhow!(self.message.clone()).context("executing tool"))
     }
 }
 
@@ -630,12 +657,15 @@ impl FakeExoHarness {
         Self {
             state: Arc::new(Mutex::new(FakeState {
                 agent: AgentRecord {
+                    vaults: vec![],
                     id: agent_id,
                     slug: "agent".to_string(),
                     name: "Agent".to_string(),
                 },
                 conversation: FakeConversationState {
                     record: ConversationRecord {
+                        environment: None,
+                        vaults: vec![],
                         id: conversation_id,
                         slug: "conversation".to_string(),
                         name: "Conversation".to_string(),
@@ -650,6 +680,18 @@ impl FakeExoHarness {
 
 #[async_trait]
 impl ExoHarness for FakeExoHarness {
+    async fn list_environments(&self) -> Result<Vec<exoharness::EnvironmentDefinition>> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn put_environment(&self, _environment: exoharness::EnvironmentDefinition) -> Result<()> {
+        Err(anyhow!("not implemented"))
+    }
+
+    async fn delete_environment(&self, _name: &str) -> Result<bool> {
+        Err(anyhow!("not implemented"))
+    }
+
     async fn list_agents(&self) -> Result<Vec<Arc<dyn AgentHandle>>> {
         let state = self.state.lock().expect("state poisoned");
         Ok(vec![Arc::new(FakeAgentHandle {
@@ -678,7 +720,7 @@ impl ExoHarness for FakeExoHarness {
     }
 
     async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
-        Ok(vec![test_model_binding_record()])
+        Ok(vec![])
     }
 
     async fn put_binding(&self, _binding: Binding) -> Result<exoharness::BindingId> {
@@ -686,21 +728,14 @@ impl ExoHarness for FakeExoHarness {
     }
 
     async fn get_binding(&self, _id: &exoharness::BindingId) -> Result<Option<Binding>> {
-        Ok(Some(test_model_binding()))
+        Ok(None)
     }
 
-    async fn list_secrets(&self) -> Result<Vec<SecretMetadata>> {
-        Ok(vec![test_secret_metadata()])
-    }
-
-    async fn put_secret(&self, _secret: PutSecretRequest) -> Result<exoharness::SecretId> {
+    async fn create_vault(&self, _name: &str) -> Result<Arc<dyn VaultHandle>> {
         Err(anyhow!("not implemented"))
     }
-
-    async fn get_secret(&self, _id: &exoharness::SecretId) -> Result<Option<Secret>> {
-        Ok(Some(Secret::Key {
-            value: "test-key".to_string(),
-        }))
+    async fn delete_vault(&self, _id: &VaultId) -> Result<()> {
+        Err(anyhow!("not implemented"))
     }
 }
 
@@ -752,32 +787,6 @@ impl AgentHandle for FakeAgentHandle {
 
     async fn delete_conversation(&self, _id: &ConversationId) -> Result<bool> {
         Err(anyhow!("not implemented"))
-    }
-
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
-        Ok(vec![test_model_binding_record()])
-    }
-
-    async fn put_binding(&self, _binding: Binding) -> Result<exoharness::BindingId> {
-        Err(anyhow!("not implemented"))
-    }
-
-    async fn get_binding(&self, _id: &exoharness::BindingId) -> Result<Option<Binding>> {
-        Ok(Some(test_model_binding()))
-    }
-
-    async fn list_secrets(&self) -> Result<Vec<SecretMetadata>> {
-        Ok(vec![test_secret_metadata()])
-    }
-
-    async fn put_secret(&self, _secret: PutSecretRequest) -> Result<exoharness::SecretId> {
-        Err(anyhow!("not implemented"))
-    }
-
-    async fn get_secret(&self, _id: &exoharness::SecretId) -> Result<Option<Secret>> {
-        Ok(Some(Secret::Key {
-            value: "test-key".to_string(),
-        }))
     }
 
     async fn write_artifact(&self, _request: WriteArtifactRequest) -> Result<ArtifactVersion> {
@@ -920,7 +929,7 @@ impl ConversationHandle for FakeConversationHandle {
             &self.state,
             session_id,
             Some(turn_id),
-            EventData::TurnStarted,
+            EventData::TurnStarted { user_id: None },
         ));
         if !request.input.is_empty() {
             latest_event_id = Some(append_event(
@@ -1060,32 +1069,6 @@ impl ConversationHandle for FakeConversationHandle {
 
     async fn list_artifacts(&self) -> Result<Vec<ArtifactVersion>> {
         Ok(Vec::new())
-    }
-
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
-        Ok(vec![test_model_binding_record()])
-    }
-
-    async fn put_binding(&self, _binding: Binding) -> Result<exoharness::BindingId> {
-        Err(anyhow!("not implemented"))
-    }
-
-    async fn get_binding(&self, _id: &exoharness::BindingId) -> Result<Option<Binding>> {
-        Ok(Some(test_model_binding()))
-    }
-
-    async fn list_secrets(&self) -> Result<Vec<SecretMetadata>> {
-        Ok(vec![test_secret_metadata()])
-    }
-
-    async fn put_secret(&self, _secret: PutSecretRequest) -> Result<exoharness::SecretId> {
-        Err(anyhow!("not implemented"))
-    }
-
-    async fn get_secret(&self, _id: &exoharness::SecretId) -> Result<Option<Secret>> {
-        Ok(Some(Secret::Key {
-            value: "test-key".to_string(),
-        }))
     }
 }
 
@@ -1302,29 +1285,15 @@ fn assistant_message(text: &str) -> Message {
     }
 }
 
-fn test_model_binding_record() -> BindingRecord {
-    let id = Uuid7::now();
-    BindingRecord {
-        id,
-        r#type: BindingType::Llm,
-        name: "test-model".to_string(),
-        created_at: id.timestamp().expect("uuid7 timestamp"),
-        binding: test_model_binding(),
-    }
-}
-
-fn test_model_binding() -> Binding {
-    Binding::Llm {
-        name: "test-model".to_string(),
-        model: "test-model".to_string(),
-        base_url: None,
-        secret_id: Some(Uuid7::now()),
-    }
-}
-
 fn test_secret_metadata() -> SecretMetadata {
-    let id = Uuid7::now();
+    let id = "01900000-0000-7000-8000-000000000001".parse().unwrap();
     SecretMetadata {
+        policy: Some(
+            CredentialDestination::origin("https://api.openai.com")
+                .unwrap()
+                .into(),
+        ),
+        revision: 1,
         id,
         r#type: SecretType::Key,
         name: "test-secret".to_string(),
@@ -1334,6 +1303,10 @@ fn test_secret_metadata() -> SecretMetadata {
 
 fn default_agent_config() -> AgentConfig {
     AgentConfig {
+        credential: Some("test-secret".into()),
+        base_url: None,
+        reasoning_effort: None,
+        resources: Vec::new(),
         instructions: Vec::new(),
         harness: crate::AgentHarnessKind::Basic,
         typescript: None,
@@ -1349,5 +1322,93 @@ fn default_agent_config() -> AgentConfig {
         max_output_tokens: None,
         max_tool_round_trips: Some(4),
         braintrust: None,
+    }
+}
+
+struct FakeVault {
+    record: VaultRecord,
+}
+fn fake_vault() -> Arc<dyn VaultHandle> {
+    let metadata = test_secret_metadata();
+    Arc::new(FakeVault {
+        record: VaultRecord {
+            id: metadata.id,
+            name: "runtime".into(),
+            created_at: metadata.created_at,
+        },
+    })
+}
+#[async_trait]
+impl VaultHandle for FakeVault {
+    fn record(&self) -> &VaultRecord {
+        &self.record
+    }
+    async fn list_secrets(&self) -> Result<Vec<SecretMetadata>> {
+        Ok(vec![test_secret_metadata()])
+    }
+    async fn put_secret(&self, _request: PutSecretRequest) -> Result<exoharness::SecretId> {
+        Err(anyhow!("not implemented"))
+    }
+    async fn get_secret(&self, _id: &exoharness::SecretId) -> Result<Option<Secret>> {
+        Ok(Some(Secret::Key {
+            value: "test-key".into(),
+        }))
+    }
+    async fn update_secret(
+        &self,
+        _id: &exoharness::SecretId,
+        _request: exoharness::UpdateSecretRequest,
+    ) -> Result<SecretMetadata> {
+        Err(anyhow!("not implemented"))
+    }
+    async fn delete_secret(&self, _id: &exoharness::SecretId) -> Result<()> {
+        Err(anyhow!("not implemented"))
+    }
+    async fn resolve_secret(
+        &self,
+        _id: &exoharness::SecretId,
+        target: &CredentialDestination,
+    ) -> Result<ResolvedSecret> {
+        let metadata = test_secret_metadata();
+        anyhow::ensure!(
+            metadata.policy.as_ref().unwrap().permits(target),
+            "unauthorized destination"
+        );
+        Ok(ResolvedSecret {
+            revision: metadata.revision,
+            secret: Secret::Key {
+                value: "test-key".into(),
+            },
+        })
+    }
+}
+
+#[async_trait]
+impl VaultContext for FakeExoHarness {
+    async fn list_vaults(&self) -> Result<Vec<Arc<dyn VaultHandle>>> {
+        Ok(vec![fake_vault()])
+    }
+    async fn get_vault(&self, _id: &VaultId) -> Result<Option<Arc<dyn VaultHandle>>> {
+        Ok(Some(fake_vault()))
+    }
+}
+
+#[async_trait]
+impl VaultContext for FakeAgentHandle {
+    async fn list_vaults(&self) -> Result<Vec<Arc<dyn VaultHandle>>> {
+        Ok(vec![fake_vault()])
+    }
+    async fn get_vault(&self, _id: &VaultId) -> Result<Option<Arc<dyn VaultHandle>>> {
+        Ok(Some(fake_vault()))
+    }
+}
+
+#[async_trait]
+impl VaultContext for FakeConversationHandle {
+    async fn list_vaults(&self) -> Result<Vec<Arc<dyn VaultHandle>>> {
+        Ok(vec![fake_vault()])
+    }
+    async fn get_vault(&self, _id: &VaultId) -> Result<Option<Arc<dyn VaultHandle>>> {
+        Ok(Some(fake_vault()))
     }
 }

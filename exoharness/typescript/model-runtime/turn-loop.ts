@@ -6,6 +6,7 @@ import {
   registerLegacyAgentToolsFromDirectoryIfExists,
   registerLibraryToolModulePath,
   turnMetadata,
+  validateToolPolicies,
   type BuiltInToolName,
   type EventData,
   type HarnessToolRegistry,
@@ -15,14 +16,14 @@ import {
 import {
   responseToLinguaEvents,
   responseToolCalls,
-  runtimeFromModelBinding,
+  runtimeFromModelConfig,
   type NativeResponsesRequest,
   type ResponsesRuntimeLike,
   type TraceParent,
 } from "@exo/model-runtime/responses";
 import { ensureTable } from "@exo/model-runtime/cost";
 
-import { resolveLlmBinding } from "./shared";
+import { resolveModel } from "./shared";
 
 export interface ResponsesTurnLoopOptions {
   instructions?: (context: TurnContext) => Message[] | Promise<Message[]>;
@@ -37,8 +38,8 @@ export async function runResponsesHarnessTurn(
   options: ResponsesTurnLoopOptions = {},
 ): Promise<void> {
   await ensureTable(); // load the price table once so cost is ready when events are built
-  const modelBinding = await resolveLlmBinding(context);
-  const runtime = runtimeFromModelBinding(context.agentConfig, modelBinding);
+  const modelBinding = await resolveModel(context);
+  const runtime = runtimeFromModelConfig(context.agentConfig, modelBinding);
   await runtime.runTurn(context, (turnParent) =>
     runResponsesTurnLoop(
       runtime,
@@ -124,6 +125,25 @@ async function runResponsesTurnLoop(
     if (options.registerTools) {
       await options.registerTools(tools, context);
     }
+    for (const definition of context.tools) {
+      tools.register({
+        authorization: "runtime",
+        definition,
+        source: "built_in",
+        handler: {
+          execute: (args) =>
+            context.executeTool({
+              functionName: definition.name,
+              arguments: args,
+            }),
+        },
+      });
+    }
+    const definitions = tools.definitions();
+    validateToolPolicies(
+      context,
+      definitions.map((tool) => tool.name),
+    );
     const messages = await materializePromptMessages(
       conversation,
       options.instructions
@@ -133,7 +153,7 @@ async function runResponsesTurnLoop(
     const request: NativeResponsesRequest = {
       model,
       messages,
-      tools: tools.definitions(),
+      tools: definitions,
       maxOutputTokens: context.agentConfig.maxOutputTokens,
       metadata: turnMetadata(context),
     };

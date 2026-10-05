@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use exoharness::{
-    E2bConfig, E2bSandboxBackend, ManagedSandboxBackend, SandboxCommand, SandboxKey,
+    E2bConfig, E2bSandboxBackend, ManagedSandboxBackend, ResourceScope, SandboxCommand,
     SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy, SandboxRequest,
     SandboxSpec, SnapshotFormat, SnapshotPayload,
 };
@@ -14,18 +14,20 @@ use serde_json::{Value, json};
 use wiremock::matchers::{method, path};
 use wiremock::{Match, Mock, MockServer, Request, ResponseTemplate};
 
-fn make_request(thread_id: &str, sandbox_id: &str) -> SandboxRequest {
+fn make_request(thread_id: exoharness::Uuid7, sandbox_id: &str) -> SandboxRequest {
     SandboxRequest {
-        key: SandboxKey::ConversationSandbox {
-            thread_id: thread_id.into(),
-            sandbox_id: sandbox_id.into(),
+        sandbox_id: sandbox_id.into(),
+        scope: ResourceScope::Thread {
+            agent_id: exoharness::Uuid7::now(),
+            thread_id,
         },
         spec: SandboxSpec {
+            tcp_ports: vec![],
             image: "base".into(),
             resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            policy: SandboxNetworkPolicy::Unrestricted.into(),
             default_workdir: "/home/user".into(),
         },
         lifecycle: SandboxLifecycleConfig {
@@ -93,7 +95,7 @@ async fn acquire_posts_to_sandboxes_with_metadata() {
         .await;
 
     backend
-        .acquire(make_request("conv-1", "sandbox-1"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-1"))
         .await
         .expect("acquire should succeed");
 
@@ -117,7 +119,7 @@ async fn acquire_rejects_host_mounts() {
     let server = MockServer::start().await;
     let backend = backend_for_mock(&server);
 
-    let mut request = make_request("conv-2", "sandbox-2");
+    let mut request = make_request(exoharness::Uuid7::now(), "sandbox-2");
     request.spec.mounts.push(SandboxMount {
         host_path: PathBuf::from("/tmp/foo"),
         guest_path: "/workspace".into(),
@@ -156,11 +158,11 @@ async fn acquire_reuses_running_sandbox_without_connect() {
         .await;
 
     let handle = backend
-        .acquire(make_request("conv-3", "sandbox-3"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-3"))
         .await
         .expect("acquire should reuse running sandbox");
 
-    assert_eq!(handle.id(), "e2b:thread:conv-3:sandbox-3");
+    assert_eq!(handle.id(), "e2b:sandbox-3");
 
     let requests = server.received_requests().await.unwrap_or_default();
     assert!(
@@ -190,7 +192,7 @@ async fn acquire_connects_paused_sandbox() {
         .await;
 
     backend
-        .acquire(make_request("conv-4", "sandbox-4"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-4"))
         .await
         .expect("acquire should connect paused sandbox");
 }
@@ -211,7 +213,7 @@ async fn acquire_list_metadata_query_is_not_double_url_encoded() {
         .await;
 
     backend
-        .acquire(make_request("conv-colons", "sandbox-colons"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox:colons"))
         .await
         .expect("acquire should find sandbox by metadata");
 
@@ -225,8 +227,7 @@ async fn acquire_list_metadata_query_is_not_double_url_encoded() {
         "metadata filter must not double-encode ':' in sandbox keys; got {query}"
     );
     assert!(
-        query.contains("thread%3Aconv-colons%3Asandbox-colons")
-            || query.contains("thread:conv-colons:sandbox-colons"),
+        query.contains("sandbox%3Acolons") || query.contains("sandbox:colons"),
         "expected sandbox key in metadata query; got {query}"
     );
     assert!(
@@ -254,7 +255,7 @@ async fn acquire_creates_when_metadata_list_is_empty() {
         .await;
 
     backend
-        .acquire(make_request("conv-5", "sandbox-5"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-5"))
         .await
         .expect("acquire should create when no metadata match");
 }
@@ -278,7 +279,7 @@ async fn stop_calls_pause_not_delete() {
         .await;
 
     let handle = backend
-        .acquire(make_request("conv-6", "sandbox-6"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-6"))
         .await
         .unwrap();
     handle.stop().await.expect("stop should pause");
@@ -313,7 +314,7 @@ async fn snapshot_returns_e2b_snapshot_payload() {
         .await;
 
     let handle = backend
-        .acquire(make_request("conv-7", "sandbox-7"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-7"))
         .await
         .unwrap();
     let payload = handle.snapshot().await.expect("snapshot ok");
@@ -348,7 +349,7 @@ async fn acquire_from_snapshot_uses_snapshot_template_id() {
     };
 
     backend
-        .acquire_from_snapshot(make_request("conv-8", "sandbox-8"), payload)
+        .acquire_from_snapshot(make_request(exoharness::Uuid7::now(), "sandbox-8"), payload)
         .await
         .expect("restore ok");
 
@@ -374,7 +375,7 @@ async fn acquire_from_snapshot_rejects_wrong_format() {
         bytes: Bytes::from_static(b"\x00"),
     };
     let error = match backend
-        .acquire_from_snapshot(make_request("conv-9", "sandbox-9"), payload)
+        .acquire_from_snapshot(make_request(exoharness::Uuid7::now(), "sandbox-9"), payload)
         .await
     {
         Ok(_) => panic!("expected format mismatch error"),
@@ -412,7 +413,7 @@ async fn exec_uses_envd_process_start() {
         .await;
 
     let handle = backend
-        .acquire(make_request("conv-10", "sandbox-10"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-10"))
         .await
         .unwrap();
     let output = handle
@@ -467,7 +468,7 @@ async fn start_process_streams_envd_process_stdout() {
         .await;
 
     let handle = backend
-        .acquire(make_request("conv-stream", "sandbox-stream"))
+        .acquire(make_request(exoharness::Uuid7::now(), "sandbox-stream"))
         .await
         .unwrap();
     let mut process = handle

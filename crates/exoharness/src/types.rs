@@ -17,10 +17,42 @@ use lingua::{Message, universal::UniversalStreamChunk};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::vault::{CredentialPolicy, SecretReference, VaultContext, VaultHandle, VaultId};
 use crate::{Result, Uuid7};
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResourceScope {
+    #[default]
+    Global,
+    Agent {
+        agent_id: AgentId,
+    },
+    Thread {
+        agent_id: AgentId,
+        thread_id: ThreadId,
+    },
+}
+
+impl ResourceScope {
+    pub fn agent_id(self) -> Option<AgentId> {
+        match self {
+            Self::Global => None,
+            Self::Agent { agent_id } | Self::Thread { agent_id, .. } => Some(agent_id),
+        }
+    }
+}
+
 #[async_trait]
-pub trait ExoHarness: Send + Sync {
+pub trait ExoHarness: VaultContext {
+    fn with_caller(&self, _caller: crate::access::Caller) -> Result<Arc<dyn ExoHarness>> {
+        anyhow::bail!("this provider does not support caller-scoped execution")
+    }
+
+    async fn list_environments(&self) -> Result<Vec<crate::EnvironmentDefinition>>;
+    async fn put_environment(&self, environment: crate::EnvironmentDefinition) -> Result<()>;
+    async fn delete_environment(&self, name: &str) -> Result<bool>;
+
     async fn list_agents(&self) -> Result<Vec<Arc<dyn AgentHandle>>>;
     async fn get_agent(&self, id: &AgentId) -> Result<Option<Arc<dyn AgentHandle>>>;
     async fn new_agent(&self, request: NewAgentRequest) -> Result<Arc<dyn AgentHandle>>;
@@ -30,9 +62,8 @@ pub trait ExoHarness: Send + Sync {
     async fn put_binding(&self, binding: Binding) -> Result<BindingId>;
     async fn get_binding(&self, id: &BindingId) -> Result<Option<Binding>>;
 
-    async fn list_secrets(&self) -> Result<Vec<SecretMetadata>>;
-    async fn put_secret(&self, request: PutSecretRequest) -> Result<SecretId>;
-    async fn get_secret(&self, id: &SecretId) -> Result<Option<Secret>>;
+    async fn create_vault(&self, name: &str) -> Result<Arc<dyn VaultHandle>>;
+    async fn delete_vault(&self, id: &VaultId) -> Result<()>;
 }
 
 #[async_trait]
@@ -94,8 +125,19 @@ pub trait SandboxHandle: SnapshotHandle {
 }
 
 #[async_trait]
-pub trait AgentHandle: SandboxHandle {
+pub trait AgentHandle: SandboxHandle + VaultContext {
     fn record(&self) -> &AgentRecord;
+
+    async fn prepare_resources(
+        &self,
+        resources: Vec<crate::resources::ResourceDefinition>,
+    ) -> Result<Vec<crate::resources::PreparedResource>> {
+        anyhow::ensure!(
+            resources.is_empty(),
+            "this provider does not support filesystem resources"
+        );
+        Ok(Vec::new())
+    }
 
     async fn list_threads(
         &self,
@@ -127,22 +169,41 @@ pub trait AgentHandle: SandboxHandle {
     ) -> Result<Arc<dyn ConversationHandle>>;
     async fn delete_conversation(&self, id: &ConversationId) -> Result<bool>;
 
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>>;
-    async fn put_binding(&self, binding: Binding) -> Result<BindingId>;
-    async fn get_binding(&self, id: &BindingId) -> Result<Option<Binding>>;
-
-    async fn list_secrets(&self) -> Result<Vec<SecretMetadata>>;
-    async fn put_secret(&self, request: PutSecretRequest) -> Result<SecretId>;
-    async fn get_secret(&self, id: &SecretId) -> Result<Option<Secret>>;
-
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion>;
     async fn read_artifact(&self, request: ReadArtifactRequest) -> Result<Option<Artifact>>;
     async fn list_artifacts(&self) -> Result<Vec<ArtifactVersion>>;
 }
 
 #[async_trait]
-pub trait ThreadHandle: SandboxHandle {
+pub trait ThreadHandle: SandboxHandle + VaultContext {
+    async fn activate_caller(&self) -> Result<bool> {
+        Ok(false)
+    }
+
     fn record(&self) -> &ThreadRecord;
+
+    async fn update_environment(
+        &self,
+        _environment: crate::EnvironmentDefinition,
+    ) -> Result<Arc<dyn ThreadHandle>> {
+        anyhow::bail!("this provider does not support updating thread environments")
+    }
+
+    async fn attach_vaults(&self, _vaults: Vec<VaultId>) -> Result<Arc<dyn ThreadHandle>> {
+        anyhow::bail!("this provider does not support attaching vaults to existing threads")
+    }
+
+    async fn materialize_resources(
+        &self,
+        resources: Vec<crate::resources::PreparedResource>,
+        _provider: SandboxProvider,
+    ) -> Result<Vec<FileSystemMount>> {
+        anyhow::ensure!(
+            resources.is_empty(),
+            "this provider does not support filesystem resources"
+        );
+        Ok(Vec::new())
+    }
 
     async fn start_session(&self) -> Result<SessionId>;
     async fn end_session(&self, id: SessionId) -> Result<()>;
@@ -161,14 +222,6 @@ pub trait ThreadHandle: SandboxHandle {
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion>;
     async fn read_artifact(&self, request: ReadArtifactRequest) -> Result<Option<Artifact>>;
     async fn list_artifacts(&self) -> Result<Vec<ArtifactVersion>>;
-
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>>;
-    async fn put_binding(&self, binding: Binding) -> Result<BindingId>;
-    async fn get_binding(&self, id: &BindingId) -> Result<Option<Binding>>;
-
-    async fn list_secrets(&self) -> Result<Vec<SecretMetadata>>;
-    async fn put_secret(&self, request: PutSecretRequest) -> Result<SecretId>;
-    async fn get_secret(&self, id: &SecretId) -> Result<Option<Secret>>;
 }
 
 /// Compatibility name for [`ThreadHandle`].
@@ -188,24 +241,36 @@ pub struct AgentRecord {
     pub id: AgentId,
     pub slug: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vaults: Vec<VaultId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NewAgentRequest {
     pub slug: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vaults: Vec<VaultId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ThreadRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::EnvironmentDefinition>,
     pub id: ThreadId,
     pub slug: String,
     pub name: String,
     pub latest_event_id: Option<EventId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vaults: Vec<VaultId>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NewThreadRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::EnvironmentDefinition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vaults: Vec<VaultId>,
     pub slug: Option<String>,
     pub name: Option<String>,
 }
@@ -214,6 +279,10 @@ pub struct NewThreadRequest {
 pub struct ListThreadsRequest {
     pub cursor: Option<EventId>,
     pub limit: Option<usize>,
+    /// Return threads with a durable unfinished-turn marker. A crash between
+    /// TurnEnded and marker deletion can leave a finished turn as a candidate.
+    #[serde(default)]
+    pub unfinished_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,6 +332,9 @@ pub struct TurnRecord {
 pub struct BeginTurnRequest {
     pub session_id: Option<SessionId>,
     pub input: Vec<Message>,
+    /// Events committed in the same write as TurnStarted and the input.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub initial_events: Vec<EventData>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -364,6 +436,7 @@ pub struct AddEventsRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AddEventsResult {
+    /// IDs in the same order as the submitted event data.
     pub event_ids: Vec<EventId>,
     pub latest_event_id: EventId,
 }
@@ -443,7 +516,10 @@ pub enum EventData {
     },
     SessionStarted,
     SessionEnded,
-    TurnStarted,
+    TurnStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+    },
     TurnEnded,
     Messages {
         messages: Vec<Message>,
@@ -469,6 +545,8 @@ pub enum EventData {
     },
     Error {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<serde_json::Value>,
     },
     ArtifactWritten {
         artifact_id: ArtifactId,
@@ -485,6 +563,8 @@ pub enum EventData {
         file_system_mounts: Vec<FileSystemMount>,
         #[serde(default)]
         durable_file_systems: Vec<DurableFileSystem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<EgressPolicy>,
         enable_networking: bool,
         idle_seconds: u64,
     },
@@ -550,7 +630,7 @@ impl EventData {
             Self::ThreadForked { .. } => EventKind::THREAD_FORKED,
             Self::SessionStarted => EventKind::SESSION_STARTED,
             Self::SessionEnded => EventKind::SESSION_ENDED,
-            Self::TurnStarted => EventKind::TURN_STARTED,
+            Self::TurnStarted { .. } => EventKind::TURN_STARTED,
             Self::TurnEnded => EventKind::TURN_ENDED,
             Self::Messages { .. } => EventKind::MESSAGES,
             Self::ToolRequested { .. } => EventKind::TOOL_REQUESTED,
@@ -675,19 +755,151 @@ pub struct SandboxRecord {
     pub running: bool,
 }
 
+pub(crate) fn canonical_egress_host(host: &str) -> Result<String> {
+    anyhow::ensure!(
+        !host.is_empty() && host.len() <= 253 && !host.ends_with('.'),
+        "invalid egress hostname"
+    );
+    let host = host.to_ascii_lowercase();
+    anyhow::ensure!(
+        host.parse::<std::net::IpAddr>().is_err(),
+        "IP literals are not egress hostnames"
+    );
+    anyhow::ensure!(
+        host.split('.').all(|label| !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')),
+        "expected an exact ASCII hostname"
+    );
+    Ok(host)
+}
+
+pub(crate) fn canonical_egress_hosts(
+    hosts: &[String],
+) -> Result<std::collections::HashSet<String>> {
+    const MAX_ALLOWED_HOSTS: usize = 128;
+    anyhow::ensure!(hosts.len() <= MAX_ALLOWED_HOSTS, "too many allowed hosts");
+    hosts
+        .iter()
+        .map(|host| canonical_egress_host(host))
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SandboxNetworkPolicy {
+    Unrestricted,
+    Disabled,
+    Limited { allowed_hosts: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EgressPolicy {
+    pub networking: SandboxNetworkPolicy,
+    /// Outbound TCP ports. Omitted allows all ports; an empty list denies all.
+    /// Host-managed DNS is separate from application TCP connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_tcp_ports: Option<Vec<u16>>,
+    #[serde(default)]
+    pub credentials: Vec<EgressCredentialBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EgressCredentialBinding {
+    pub name: String,
+    pub environment_variable: String,
+    pub networking: CredentialNetworkPolicy,
+    pub injection_location: CredentialInjectionLocation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CredentialNetworkPolicy {
+    Limited {
+        allowed_hosts: Vec<String>,
+    },
+    Destinations {
+        allowed_destinations: Vec<crate::CredentialDestination>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CredentialInjectionLocation {
+    #[serde(default)]
+    pub header: bool,
+}
+
+impl EgressPolicy {
+    pub fn allows_tcp_port(&self, port: u16) -> bool {
+        port != 0
+            && self
+                .allowed_tcp_ports
+                .as_ref()
+                .is_none_or(|ports| ports.contains(&port))
+    }
+
+    pub fn networking_enabled(&self) -> bool {
+        self.networking != SandboxNetworkPolicy::Disabled
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+    pub(crate) fn validate_basic(&self, provider: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.allowed_tcp_ports.is_none(),
+            "{provider} does not support policy.allowed_tcp_ports"
+        );
+        if !self.credentials.is_empty() {
+            anyhow::bail!("{provider} does not support policy.credentials");
+        }
+        if matches!(self.networking, SandboxNetworkPolicy::Limited { .. }) {
+            anyhow::bail!("{provider} does not support policy.networking.limited");
+        }
+        Ok(())
+    }
+
+    #[cfg(all(not(target_arch = "wasm32"), feature = "basic-backend"))]
+    pub(crate) fn requires_proxy(&self) -> bool {
+        !self.credentials.is_empty()
+            || self.allowed_tcp_ports.is_some()
+            || matches!(self.networking, SandboxNetworkPolicy::Limited { .. })
+    }
+}
+
+impl From<SandboxNetworkPolicy> for EgressPolicy {
+    fn from(networking: SandboxNetworkPolicy) -> Self {
+        Self {
+            networking,
+            allowed_tcp_ports: None,
+            credentials: Vec::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CreateSandboxRequest {
     #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub provider: SandboxProvider,
     pub image: String,
-    #[serde(default)]
-    pub resources: SandboxResourceShape,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<SandboxResourceShape>,
     pub default_workdir: Option<String>,
     pub file_system_mounts: Option<Vec<FileSystemMount>>,
     pub durable_file_systems: Option<Vec<DurableFileSystem>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<EgressPolicy>,
     pub enable_networking: Option<bool>,
     pub idle_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tcp_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -725,6 +937,12 @@ impl SandboxAttachment {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(transparent)]
 pub struct SandboxProvider(Cow<'static, str>);
+
+impl Default for SandboxProvider {
+    fn default() -> Self {
+        Self::Smolvm
+    }
+}
 
 #[allow(non_upper_case_globals)]
 impl SandboxProvider {
@@ -933,6 +1151,24 @@ pub struct SandboxProcessParts {
     pub wait: BoxFuture<'static, Result<i32>>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxTerminalSize {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[async_trait]
+pub trait SandboxTerminalControl: Send + Sync {
+    async fn resize(&self, size: SandboxTerminalSize) -> Result<()>;
+}
+
+pub struct SandboxTerminalParts {
+    pub output: BoxAsyncRead,
+    pub input: BoxAsyncWrite,
+    pub wait: BoxFuture<'static, Result<i32>>,
+    pub control: Arc<dyn SandboxTerminalControl>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BindingRecord {
     pub id: BindingId,
@@ -951,8 +1187,16 @@ pub enum BindingType {
     Sandbox,
 }
 
+// Vault encryption authenticates the serialized metadata. Preserve the bytes for
+// existing records when changing fields, field order, or serde attributes, or
+// migrate their ciphertext; otherwise saved secrets become undecryptable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SecretMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<CredentialPolicy>,
+    #[serde(default = "initial_secret_revision")]
+    pub revision: u64,
     pub id: SecretId,
     pub r#type: SecretType,
     pub name: String,
@@ -960,9 +1204,31 @@ pub struct SecretMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct PutSecretRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<CredentialPolicy>,
     pub name: String,
     pub secret: Secret,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateSecretRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<Secret>,
+    /// Replace the destination grant; omitted preserves the current grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<CredentialPolicy>,
+}
+
+impl From<Secret> for UpdateSecretRequest {
+    fn from(secret: Secret) -> Self {
+        Self {
+            secret: Some(secret),
+            policy: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -970,26 +1236,29 @@ pub struct PutSecretRequest {
 pub enum SecretType {
     Key,
     Oauth,
+    #[serde(rename = "github_cli")]
+    GithubCli,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Binding {
     Env {
         name: String,
         env_var: String,
-        secret_id: SecretId,
+        secret: SecretReference,
     },
     Mcp {
         name: String,
         server_url: String,
-        secret_id: Option<SecretId>,
+        secret: Option<SecretReference>,
     },
+    /// Decoded only to preserve existing stores; model registration is retired.
     Llm {
         name: String,
         model: String,
         base_url: Option<String>,
-        secret_id: Option<SecretId>,
+        secret: Option<SecretReference>,
     },
     /// How to reach a remote sandbox provider.
     Sandbox {
@@ -1000,7 +1269,7 @@ pub enum Binding {
 
 /// Per-provider sandbox config for a `Binding::Sandbox`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "provider", rename_all = "lowercase")]
+#[serde(tag = "provider", rename_all = "lowercase", deny_unknown_fields)]
 pub enum SandboxProviderConfig {
     Docker {
         #[serde(default = "crate::sandbox_provider::default_docker_image")]
@@ -1024,8 +1293,8 @@ pub enum SandboxProviderConfig {
         default_image: String,
     },
     Daytona {
-        /// Secret-store id of the API key.
-        api_key_secret_id: SecretId,
+        /// Vault secret reference for the API key.
+        api_key_secret: SecretReference,
         /// Daytona `target` region (e.g. `us` / `eu`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         region: Option<String>,
@@ -1037,8 +1306,8 @@ pub enum SandboxProviderConfig {
         default_image: String,
     },
     Vercel {
-        /// Secret-store id of the Vercel API/access token.
-        api_token_secret_id: SecretId,
+        /// Vault secret reference for the Vercel API/access token.
+        api_token_secret: SecretReference,
         team_id: String,
         project_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1047,14 +1316,14 @@ pub enum SandboxProviderConfig {
         default_image: String,
     },
     E2b {
-        api_key_secret_id: SecretId,
+        api_key_secret: SecretReference,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_url: Option<String>,
         #[serde(default = "default_e2b_template")]
         default_image: String,
     },
     Sprites {
-        token_secret_id: SecretId,
+        token_secret: SecretReference,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         api_url: Option<String>,
         /// Sprite HTTP URL auth mode: `sprite` (default) or `public`.
@@ -1127,10 +1396,40 @@ pub enum Secret {
     Key {
         value: String,
     },
+    #[serde(rename = "github_cli")]
+    GithubCli {
+        value: String,
+        account: String,
+    },
     Oauth {
         access_token: String,
         refresh_token: Option<String>,
+        #[serde(default)]
+        expires_at: Option<u64>,
+        #[serde(default)]
+        refresh: Option<crate::vault::OAuthRefresh>,
     },
+}
+
+impl Secret {
+    pub fn bearer_value(&self) -> &str {
+        match self {
+            Self::Key { value } | Self::GithubCli { value, .. } => value,
+            Self::Oauth { access_token, .. } => access_token,
+        }
+    }
+
+    pub fn is_refreshable(&self) -> bool {
+        matches!(
+            self,
+            Self::GithubCli { .. }
+                | Self::Oauth {
+                    refresh_token: Some(_),
+                    refresh: Some(_),
+                    ..
+                }
+        )
+    }
 }
 
 pub type AgentId = Uuid7;
@@ -1162,9 +1461,52 @@ crate::impl_has_uuid7_id!(Event, id);
 crate::impl_has_uuid7_id!(BindingRecord, id);
 crate::impl_has_uuid7_id!(SecretMetadata, id);
 
+pub(crate) fn initial_secret_revision() -> u64 {
+    1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_started_preserves_user_and_accepts_older_events() {
+        for user_id in [None, Some("user-1".to_string())] {
+            let event = EventData::TurnStarted {
+                user_id: user_id.clone(),
+            };
+            let value = serde_json::to_value(&event).unwrap();
+            let decoded: EventData = serde_json::from_value(value).unwrap();
+            assert!(
+                matches!(decoded, EventData::TurnStarted { user_id: actual } if actual == user_id)
+            );
+        }
+        let event: EventData = serde_json::from_str(r#"{"type":"turn_started"}"#).unwrap();
+        assert!(matches!(event, EventData::TurnStarted { user_id: None }));
+    }
+
+    #[test]
+    fn credential_network_policy_requires_explicit_hosts() {
+        for json in [
+            r#"{"type":"unrestricted"}"#,
+            r#"{"type":"limited"}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<CredentialNetworkPolicy>(json).is_err(),
+                "credential policy must specify allowed hosts: {json}"
+            );
+        }
+        let json = r#"{"type":"limited","allowed_hosts":["api.notion.com"]}"#;
+        let policy = serde_json::from_str::<CredentialNetworkPolicy>(json).unwrap();
+        assert_eq!(
+            policy,
+            CredentialNetworkPolicy::Limited {
+                allowed_hosts: vec!["api.notion.com".into()],
+            }
+        );
+        assert_eq!(serde_json::to_string(&policy).unwrap(), json);
+    }
 
     #[test]
     fn serializes_event_types_as_snake_case() {
@@ -1242,6 +1584,29 @@ mod tests {
             serde_json::json!(source_thread_id)
         );
         assert!(value.get("source_conversation_id").is_none());
+    }
+
+    #[test]
+    fn error_event_serializes_optional_metadata() {
+        let event = EventData::Error {
+            message: "request failed".to_string(),
+            metadata: Some(serde_json::json!({"source": "example"})),
+        };
+        assert_eq!(
+            serde_json::to_value(event).expect("event should serialize"),
+            serde_json::json!({
+                "type": "error",
+                "message": "request failed",
+                "metadata": {"source": "example"},
+            })
+        );
+
+        let legacy: EventData = serde_json::from_value(serde_json::json!({
+            "type": "error",
+            "message": "request failed",
+        }))
+        .expect("event without metadata should parse");
+        assert!(matches!(legacy, EventData::Error { metadata: None, .. }));
     }
 
     #[test]
@@ -1324,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    fn create_sandbox_request_defaults_resources_for_older_clients() {
+    fn create_sandbox_request_preserves_omitted_resources() {
         let request: CreateSandboxRequest = serde_json::from_value(serde_json::json!({
             "name": null,
             "provider": "firecracker",
@@ -1336,7 +1701,24 @@ mod tests {
             "idle_seconds": 60
         }))
         .unwrap();
-        assert_eq!(request.resources, SandboxResourceShape::default());
+        assert_eq!(request.resources, None);
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("resources")
+                .is_none()
+        );
+        let explicit = CreateSandboxRequest {
+            resources: Some(SandboxResourceShape::default()),
+            ..request
+        };
+        assert_eq!(
+            serde_json::from_value::<CreateSandboxRequest>(
+                serde_json::to_value(&explicit).unwrap()
+            )
+            .unwrap(),
+            explicit
+        );
     }
 
     #[test]

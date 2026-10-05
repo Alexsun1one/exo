@@ -47,6 +47,7 @@ async fn filesystem_snapshot_and_rewind_round_trip() {
         // it's orthogonal to what we're testing (sandbox snapshots).
         secret_backend: SecretBackendChoice::Static([7u8; 32]),
         sandbox_default: SandboxProvider::Docker,
+        sandbox_policy: None,
         sandbox_backends: vec![SandboxBackendRegistration::docker()],
     })
     .await
@@ -54,6 +55,7 @@ async fn filesystem_snapshot_and_rewind_round_trip() {
 
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "snap-test-agent".into(),
             name: "snap-test agent".into(),
         })
@@ -61,6 +63,8 @@ async fn filesystem_snapshot_and_rewind_round_trip() {
         .expect("new_agent");
     let conversation = agent
         .new_conversation(NewConversationRequest {
+            environment: None,
+            vaults: vec![],
             slug: Some("snap-test-conv".into()),
             name: Some("snap-test conversation".into()),
         })
@@ -70,6 +74,7 @@ async fn filesystem_snapshot_and_rewind_round_trip() {
     // ───── Phase 1: create a docker sandbox and write the initial state ─────
     let sandbox_id = conversation
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::Docker,
             image: SANDBOX_IMAGE.into(),
@@ -77,6 +82,7 @@ async fn filesystem_snapshot_and_rewind_round_trip() {
             default_workdir: Some("/".into()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(false),
             idle_seconds: Some(60),
         })

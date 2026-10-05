@@ -101,20 +101,23 @@ impl ManagedSandboxBackend for AwsAgentCoreSandboxBackend {
     }
 
     async fn acquire(&self, request: SandboxRequest) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        request.spec.policy.validate_basic("aws_agentcore")?;
         reject_unsupported_request(&request, self.session_storage_mount_path.as_deref())?;
         let spec_hash = sandbox_spec_hash(&request.spec);
         let runtime_session_id = agentcore_runtime_session_id(&request, &spec_hash);
-        Ok(Arc::new(AwsAgentCoreSandboxHandle {
-            id: format!("aws-agentcore:{runtime_session_id}"),
-            runtime_session_id,
-            request,
-            backend: AwsAgentCoreBackendHandle {
-                client: self.client.clone(),
-                runtime_arn: self.runtime_arn.clone(),
-                invoke_target: self.invoke_target.clone(),
-                qualifier: self.qualifier.clone(),
+        Ok(crate::with_process_management(Arc::new(
+            AwsAgentCoreSandboxHandle {
+                id: format!("aws-agentcore:{runtime_session_id}"),
+                runtime_session_id,
+                request,
+                backend: AwsAgentCoreBackendHandle {
+                    client: self.client.clone(),
+                    runtime_arn: self.runtime_arn.clone(),
+                    invoke_target: self.invoke_target.clone(),
+                    qualifier: self.qualifier.clone(),
+                },
             },
-        }))
+        )))
     }
 
     async fn attach(
@@ -409,7 +412,10 @@ fn reject_unsupported_request(
             bail!("AgentCore sandbox backend supports at most one durable file system");
         }
     }
-    if matches!(request.spec.network, SandboxNetworkPolicy::Disabled) {
+    if matches!(
+        request.spec.policy.networking,
+        SandboxNetworkPolicy::Disabled
+    ) {
         bail!("AgentCore sandbox backend cannot enforce disabled networking");
     }
     Ok(())
@@ -441,7 +447,7 @@ fn normalize_agentcore_session_storage_mount_path(path: &str) -> Result<String> 
 }
 
 fn agentcore_runtime_session_id(request: &SandboxRequest, spec_hash: &str) -> String {
-    let input = format!("{}\n{spec_hash}", request.key);
+    let input = format!("{}\n{spec_hash}", request.sandbox_id.as_str());
     format!("exo-{}-session-0000000000", stable_fnv1a_hex(&input))
 }
 
@@ -511,7 +517,7 @@ struct AgentCoreExecResponse {
 mod tests {
     use super::*;
     use crate::{
-        DurableFileSystem, FileSystemMountMode, SandboxKey, SandboxLifecycleConfig,
+        DurableFileSystem, FileSystemMountMode, ResourceScope, SandboxLifecycleConfig,
         SandboxNetworkPolicy, SandboxSpec,
     };
 
@@ -554,11 +560,13 @@ mod tests {
 
     fn durable_request(mount_path: &str, mode: FileSystemMountMode) -> SandboxRequest {
         SandboxRequest {
-            key: SandboxKey::ConversationSandbox {
-                thread_id: "thread".to_string(),
-                sandbox_id: "sandbox".to_string(),
+            sandbox_id: "sandbox".to_string(),
+            scope: ResourceScope::Thread {
+                agent_id: crate::Uuid7::now(),
+                thread_id: "00000000-0000-7000-8000-000000000001".parse().unwrap(),
             },
             spec: SandboxSpec {
+                tcp_ports: vec![],
                 image: "agentcore".to_string(),
                 resources: Default::default(),
                 mounts: Vec::new(),
@@ -567,7 +575,7 @@ mod tests {
                     mount_path: mount_path.to_string(),
                     mode,
                 }],
-                network: SandboxNetworkPolicy::Enabled,
+                policy: SandboxNetworkPolicy::Unrestricted.into(),
                 default_workdir: "/mnt/workspace".to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),

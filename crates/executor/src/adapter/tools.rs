@@ -353,6 +353,7 @@ impl AdapterCreationConfig {
                         .password_secret_id
                         .map(|secret_id| {
                             vec![WorkerSecretEnvVar {
+                                vault: None,
                                 env: "EXO_IRC_PASSWORD".to_string(),
                                 secret_id,
                             }]
@@ -406,11 +407,13 @@ impl AdapterCreationConfig {
                 // bind it only when voice is on so text-only adapters need no
                 // OpenAI key.
                 let mut secret_env = vec![WorkerSecretEnvVar {
+                    vault: None,
                     env: "EXO_DISCORD_BOT_TOKEN".to_string(),
                     secret_id: config.bot_token_secret_id,
                 }];
                 if config.voice {
                     secret_env.push(WorkerSecretEnvVar {
+                        vault: None,
                         env: "OPENAI_API_KEY".to_string(),
                         secret_id: config
                             .openai_secret_id
@@ -463,10 +466,12 @@ impl AdapterCreationConfig {
                     state_dir: None,
                     secret_env: vec![
                         WorkerSecretEnvVar {
+                            vault: None,
                             env: "EXO_SLACK_BOT_TOKEN".to_string(),
                             secret_id: config.bot_token_secret_id,
                         },
                         WorkerSecretEnvVar {
+                            vault: None,
                             env: "EXO_SLACK_SIGNING_SECRET".to_string(),
                             secret_id: config.signing_secret_id,
                         },
@@ -494,6 +499,7 @@ impl AdapterCreationConfig {
                     secret_env: secret_id
                         .map(|secret_id| {
                             vec![WorkerSecretEnvVar {
+                                vault: None,
                                 env: "EXO_EXOCHAT_SECRET".to_string(),
                                 secret_id,
                             }]
@@ -627,13 +633,16 @@ async fn bind_exochat_secret(agent: &dyn AgentHandle, config: &mut AdapterConfig
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
         .context("exochat initialization secret is required")?;
     let secret_name = format!("exochat-{}", Uuid7::now());
-    let secret_id = agent
+    let secret_id = exoharness::vault::global_vault(agent)
+        .await?
         .put_secret(PutSecretRequest {
+            policy: None,
             name: secret_name,
             secret: Secret::Key { value: secret },
         })
         .await?;
     config.secret_env.push(WorkerSecretEnvVar {
+        vault: None,
         env: "EXO_EXOCHAT_SECRET".to_string(),
         secret_id: secret_id.to_string(),
     });
@@ -744,7 +753,8 @@ async fn exochat_chat_url(
     let secret_id = if let Ok(id) = secret_ref.parse() {
         id
     } else {
-        let Some(metadata) = agent
+        let Some(metadata) = exoharness::vault::global_vault(agent)
+            .await?
             .list_secrets()
             .await?
             .into_iter()
@@ -754,7 +764,11 @@ async fn exochat_chat_url(
         };
         metadata.id
     };
-    let Some(Secret::Key { value: secret }) = agent.get_secret(&secret_id).await? else {
+    let Some(Secret::Key { value: secret }) = exoharness::vault::global_vault(agent)
+        .await?
+        .get_secret(&secret_id)
+        .await?
+    else {
         return Ok(None);
     };
     Ok(Some(format!(
@@ -1073,7 +1087,7 @@ async fn read_sandbox_file(
         }
         SandboxScope::Conversation => {
             let sandbox_id =
-                ensure_conversation_sandbox(conversation, agent_config, config).await?;
+                ensure_conversation_sandbox(conversation, agent_config, config, None).await?;
             read_sandbox_file_bytes(conversation, sandbox_id, sandbox_path).await
         }
     }
@@ -1389,6 +1403,7 @@ mod tests {
             .unwrap();
         let agent = exoharness
             .new_agent(NewAgentRequest {
+                vaults: vec![],
                 slug: "agent".to_string(),
                 name: "Agent".to_string(),
             })
@@ -1396,6 +1411,8 @@ mod tests {
             .unwrap();
         let conversation = agent
             .new_conversation(NewConversationRequest {
+                environment: None,
+                vaults: vec![],
                 slug: Some("conversation".to_string()),
                 name: Some("Conversation".to_string()),
             })
@@ -1611,13 +1628,17 @@ mod tests {
             .unwrap();
         let agent = exoharness
             .new_agent(NewAgentRequest {
+                vaults: vec![],
                 slug: "agent".to_string(),
                 name: "Agent".to_string(),
             })
             .await
             .unwrap();
-        let secret_id = agent
+        let secret_id = exoharness::vault::global_vault(agent.as_ref())
+            .await
+            .expect("runtime vault")
             .put_secret(PutSecretRequest {
+                policy: None,
                 name: "exochat-test".to_string(),
                 secret: Secret::Key {
                     value: "secret-456".to_string(),
@@ -1641,6 +1662,7 @@ mod tests {
                     }),
                     state_dir: None,
                     secret_env: vec![WorkerSecretEnvVar {
+                        vault: None,
                         env: "EXO_EXOCHAT_SECRET".to_string(),
                         secret_id: secret_id.to_string(),
                     }],
@@ -1663,6 +1685,7 @@ mod tests {
             .unwrap();
         let agent = exoharness
             .new_agent(NewAgentRequest {
+                vaults: vec![],
                 slug: "agent".to_string(),
                 name: "Agent".to_string(),
             })
@@ -1670,6 +1693,8 @@ mod tests {
             .unwrap();
         let conversation = agent
             .new_conversation(NewConversationRequest {
+                environment: None,
+                vaults: vec![],
                 slug: Some("conversation".to_string()),
                 name: Some("Conversation".to_string()),
             })
@@ -1765,6 +1790,7 @@ mod tests {
             .unwrap();
         let agent = exoharness
             .new_agent(NewAgentRequest {
+                vaults: vec![],
                 slug: "agent".to_string(),
                 name: "Agent".to_string(),
             })
@@ -1772,6 +1798,8 @@ mod tests {
             .unwrap();
         let conversation = agent
             .new_conversation(NewConversationRequest {
+                environment: None,
+                vaults: vec![],
                 slug: Some("conversation".to_string()),
                 name: Some("Conversation".to_string()),
             })
@@ -1814,6 +1842,7 @@ mod tests {
             .unwrap();
         let agent = exoharness
             .new_agent(NewAgentRequest {
+                vaults: vec![],
                 slug: "agent".to_string(),
                 name: "Agent".to_string(),
             })
@@ -1821,6 +1850,8 @@ mod tests {
             .unwrap();
         let conversation = agent
             .new_conversation(NewConversationRequest {
+                environment: None,
+                vaults: vec![],
                 slug: Some("conversation".to_string()),
                 name: Some("Conversation".to_string()),
             })
@@ -1884,6 +1915,10 @@ mod tests {
 
     fn test_agent_config() -> AgentConfig {
         AgentConfig {
+            credential: Some("test-openai".into()),
+            base_url: None,
+            reasoning_effort: None,
+            resources: Vec::new(),
             instructions: Vec::new(),
             harness: AgentHarnessKind::Exo,
             typescript: None,

@@ -39,7 +39,7 @@ async fn http_harness() -> HttpHarnessFixture {
     let addr = listener.local_addr().expect("local addr");
     let server = actix_web::rt::spawn(serve_exoharness_http_listener(listener, Arc::new(basic)));
     let harness: Arc<dyn ExoHarness> =
-        Arc::new(HttpExoHarness::new(format!("http://{addr}")).expect("http harness"));
+        Arc::new(HttpExoHarness::new(format!("http://{addr}"), None).expect("http harness"));
 
     HttpHarnessFixture {
         harness,
@@ -60,13 +60,38 @@ async fn http_harness_with_sandbox_backend(
     let addr = listener.local_addr().expect("local addr");
     let server = actix_web::rt::spawn(serve_exoharness_http_listener(listener, Arc::new(basic)));
     let harness: Arc<dyn ExoHarness> =
-        Arc::new(HttpExoHarness::new(format!("http://{addr}")).expect("http harness"));
+        Arc::new(HttpExoHarness::new(format!("http://{addr}"), None).expect("http harness"));
 
     HttpHarnessFixture {
         harness,
         server,
         _tempdir: tempdir,
     }
+}
+
+#[actix_web::test]
+async fn http_exoharness_lists_unfinished_threads() -> crate::Result<()> {
+    let fixture = http_harness().await;
+    let agent = fixture
+        .harness
+        .new_agent(crate::NewAgentRequest {
+            slug: "http-recovery-index".to_string(),
+            name: "HTTP recovery index".to_string(),
+            vaults: Vec::new(),
+        })
+        .await?;
+    let thread = agent.new_thread(Default::default()).await?;
+    let turn = thread.begin_turn(BeginTurnRequest::default()).await?;
+    let query = crate::ListThreadsRequest {
+        unfinished_only: true,
+        ..Default::default()
+    };
+    let indexed = agent.list_threads(query.clone()).await?;
+    assert_eq!(indexed.threads.len(), 1);
+    assert_eq!(indexed.threads[0].record().id, thread.record().id);
+    turn.finish().await?;
+    assert!(agent.list_threads(query).await?.threads.is_empty());
+    Ok(())
 }
 
 #[actix_web::test]
@@ -108,15 +133,6 @@ async fn http_exoharness_turn_events_continue_after_artifact_writes() {
 }
 
 #[actix_web::test]
-async fn http_exoharness_conversation_scope_overrides_and_forks() {
-    let fixture = http_harness().await;
-    crate::contract_tests::conversation_scope_overrides_agent_scope_and_fork_copies_bindings(
-        Arc::clone(&fixture.harness),
-    )
-    .await;
-}
-
-#[actix_web::test]
 #[ignore = "set EXO_CONTRACT_TEST_URL and optional EXO_CONTRACT_TEST_BEARER or EXO_CONTRACT_TEST_BEARER_ENV"]
 async fn hosted_http_exoharness_core_contract() {
     let harness = hosted_harness_from_env();
@@ -131,6 +147,7 @@ async fn http_exoharness_runs_noninteractive_sandbox_commands() {
     let agent = fixture
         .harness
         .new_agent(crate::NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -142,6 +159,7 @@ async fn http_exoharness_runs_noninteractive_sandbox_commands() {
         .expect("conversation");
     let sandbox_id = conversation
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "local".to_string(),
@@ -149,6 +167,7 @@ async fn http_exoharness_runs_noninteractive_sandbox_commands() {
             default_workdir: Some("/".to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
@@ -184,6 +203,7 @@ async fn http_exoharness_runs_agent_scoped_sandbox_commands() {
     let agent = fixture
         .harness
         .new_agent(crate::NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -195,6 +215,7 @@ async fn http_exoharness_runs_agent_scoped_sandbox_commands() {
         .expect("conversation");
     let sandbox_id = agent
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: Some("agent-http".to_string()),
             provider: SandboxProvider::LocalProcess,
             image: "local".to_string(),
@@ -202,6 +223,7 @@ async fn http_exoharness_runs_agent_scoped_sandbox_commands() {
             default_workdir: Some("/".to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
@@ -256,6 +278,7 @@ async fn http_exoharness_supports_sandbox_process_events() {
     let agent = fixture
         .harness
         .new_agent(crate::NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -267,6 +290,7 @@ async fn http_exoharness_supports_sandbox_process_events() {
         .expect("conversation");
     let sandbox_id = conversation
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "local".to_string(),
@@ -274,6 +298,7 @@ async fn http_exoharness_supports_sandbox_process_events() {
             default_workdir: Some("/".to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
@@ -344,6 +369,7 @@ async fn http_exoharness_supports_turn_scoped_sandbox_snapshot_and_start() {
     let agent = fixture
         .harness
         .new_agent(crate::NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -355,6 +381,7 @@ async fn http_exoharness_supports_turn_scoped_sandbox_snapshot_and_start() {
         .expect("conversation");
     let sandbox_id = conversation
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "local".to_string(),
@@ -362,6 +389,7 @@ async fn http_exoharness_supports_turn_scoped_sandbox_snapshot_and_start() {
             default_workdir: Some("/".to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
@@ -371,6 +399,7 @@ async fn http_exoharness_supports_turn_scoped_sandbox_snapshot_and_start() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: Vec::new(),
+            ..Default::default()
         })
         .await
         .expect("turn");
@@ -436,6 +465,7 @@ async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
     let agent = fixture
         .harness
         .new_agent(crate::NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -447,6 +477,7 @@ async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
         .expect("conversation");
     let source_id = conversation
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: Some("source".to_string()),
             provider: SandboxProvider::LocalProcess,
             image: "local".to_string(),
@@ -454,6 +485,7 @@ async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
             default_workdir: Some("/".to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
@@ -467,6 +499,7 @@ async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
         .restore_sandbox(RestoreSandboxRequest {
             snapshot_id,
             sandbox: CreateSandboxRequest {
+                tcp_ports: vec![],
                 name: Some("target".to_string()),
                 provider: SandboxProvider::LocalProcess,
                 image: "local".to_string(),
@@ -474,6 +507,7 @@ async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
                 default_workdir: Some("/".to_string()),
                 file_system_mounts: None,
                 durable_file_systems: None,
+                policy: None,
                 enable_networking: Some(true),
                 idle_seconds: Some(60),
             },
@@ -578,14 +612,163 @@ impl ManagedSandboxHandle for SnapshotTestSandboxHandle {
 fn hosted_harness_from_env() -> Arc<dyn ExoHarness> {
     let url = std::env::var("EXO_CONTRACT_TEST_URL")
         .expect("EXO_CONTRACT_TEST_URL must point at an ExoHarness HTTP endpoint");
-    let mut harness = HttpExoHarness::new(url).expect("hosted http harness");
-    if let Ok(token) = std::env::var("EXO_CONTRACT_TEST_BEARER") {
-        harness = harness.with_bearer_token(token);
-    } else if let Ok(env_name) = std::env::var("EXO_CONTRACT_TEST_BEARER_ENV") {
-        let token = std::env::var(&env_name).unwrap_or_else(|_| {
-            panic!("EXO_CONTRACT_TEST_BEARER_ENV references unset environment variable {env_name}")
-        });
-        harness = harness.with_bearer_token(token);
-    }
-    Arc::new(harness)
+    let token = std::env::var("EXO_CONTRACT_TEST_BEARER").ok().or_else(|| {
+        std::env::var("EXO_CONTRACT_TEST_BEARER_ENV").ok().map(|env_name| {
+            std::env::var(&env_name).unwrap_or_else(|_| {
+                panic!("EXO_CONTRACT_TEST_BEARER_ENV references unset environment variable {env_name}")
+            })
+        })
+    });
+    Arc::new(HttpExoHarness::new(url, token).expect("hosted http harness"))
+}
+
+#[actix_web::test]
+async fn http_vault_contexts_and_secrets_round_trip() -> crate::Result<()> {
+    use crate::vault::CredentialDestination;
+    use crate::{NewAgentRequest, NewThreadRequest, PutSecretRequest, Secret};
+    let fixture = http_harness().await;
+    let harness = &fixture.harness;
+    let runtime = crate::vault::global_vault(harness.as_ref()).await?;
+    let user = harness.create_vault("alice").await?;
+    let target = CredentialDestination::url("https://example.com/mcp")?;
+    let id = user
+        .put_secret(PutSecretRequest {
+            name: "github".into(),
+            secret: Secret::Key {
+                value: "first".into(),
+            },
+            policy: Some((target.clone()).into()),
+        })
+        .await?;
+    assert_eq!(user.list_secrets().await?[0].id, id);
+    let host_credential = Secret::GithubCli {
+        value: "cached-token".into(),
+        account: "server-owner".into(),
+    };
+    assert!(
+        user.put_secret(PutSecretRequest {
+            name: "host-credential".into(),
+            secret: host_credential.clone(),
+            policy: Some(target.clone().into()),
+        })
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("runtime host")
+    );
+    assert!(
+        user.update_secret(&id, host_credential.into())
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("runtime host")
+    );
+    assert_eq!(user.list_secrets().await?.len(), 1);
+    assert_eq!(
+        user.get_secret(&id).await?,
+        Some(Secret::Key {
+            value: "first".into()
+        })
+    );
+    assert!(runtime.get_secret(&id).await?.is_none());
+    let updated = user
+        .update_secret(
+            &id,
+            Secret::Key {
+                value: "second".into(),
+            }
+            .into(),
+        )
+        .await?;
+    let resolved = user.resolve_secret(&id, &target).await?;
+    assert_eq!(resolved.revision, updated.revision);
+    assert_eq!(
+        resolved.secret,
+        Secret::Key {
+            value: "second".into()
+        }
+    );
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            vaults: vec![],
+            name: "agent".into(),
+            slug: "agent".into(),
+        })
+        .await?;
+    let vaults = vec![user.record().id];
+    let thread = agent
+        .new_thread(NewThreadRequest {
+            vaults: vaults.clone(),
+            ..Default::default()
+        })
+        .await?;
+    assert_eq!(thread.record().vaults, vaults);
+    assert_eq!(
+        thread.get_vault(&user.record().id).await?.unwrap().record(),
+        user.record()
+    );
+    assert_eq!(
+        thread
+            .get_vault(&runtime.record().id)
+            .await?
+            .unwrap()
+            .record(),
+        runtime.record()
+    );
+    let sibling = agent.new_thread(NewThreadRequest::default()).await?;
+    assert!(sibling.get_vault(&user.record().id).await?.is_none());
+    let sibling = sibling.attach_vaults(vaults.clone()).await?;
+    let environment = crate::EnvironmentDefinition {
+        name: "updated".into(),
+        config: crate::CreateSandboxRequest {
+            tcp_ports: vec![],
+            provider: SandboxProvider::LocalProcess,
+            image: "local".into(),
+            enable_networking: Some(true),
+
+            name: None,
+            resources: None,
+            default_workdir: None,
+            file_system_mounts: None,
+            durable_file_systems: None,
+            policy: None,
+            idle_seconds: None,
+        },
+    };
+    let sibling = sibling.update_environment(environment.clone()).await?;
+    assert_eq!(sibling.record().environment.as_ref(), Some(&environment));
+    assert_eq!(
+        agent
+            .get_thread(&sibling.record().id)
+            .await?
+            .unwrap()
+            .record(),
+        sibling.record()
+    );
+
+    assert_eq!(sibling.record().vaults, vaults);
+    assert_eq!(
+        sibling
+            .get_vault(&user.record().id)
+            .await?
+            .unwrap()
+            .resolve_secret(&id, &target)
+            .await?
+            .revision,
+        updated.revision
+    );
+    let scoped = thread.get_vault(&user.record().id).await?.unwrap();
+    assert_eq!(
+        scoped.resolve_secret(&id, &target).await?.revision,
+        updated.revision
+    );
+    user.delete_secret(&id).await?;
+    assert!(scoped.resolve_secret(&id, &target).await.is_err());
+    assert!(user.resolve_secret(&id, &target).await.is_err());
+    assert!(harness.delete_vault(&user.record().id).await.is_err());
+    harness.delete_agent(&agent.record().id).await?;
+    harness.delete_vault(&user.record().id).await?;
+    assert!(harness.get_vault(&user.record().id).await?.is_none());
+    fixture.server.abort();
+    Ok(())
 }

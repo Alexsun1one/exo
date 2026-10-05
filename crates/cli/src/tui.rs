@@ -1,23 +1,22 @@
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Result;
 use executor::{
-    ConversationHandle, EventData, EventId, EventKind, EventQuery, EventQueryDirection,
-    ExecutionStreamEvent, HarnessAgent, HarnessConversation, SandboxId, SandboxProvider,
-    SendRequest, SessionId, SnapshotId, StartSandboxRequest,
+    AgentHandle, ConversationHandle, EventData, EventId, EventKind, EventQuery,
+    EventQueryDirection, ExecutionStreamEvent, Runtime, SandboxId, SandboxProvider, SendRequest,
+    SessionId, SnapshotId, StartSandboxRequest,
 };
 use lingua::universal::{UserContent, UserContentPart};
 use lingua::{Message, UniversalStreamChunk};
 use rustyline::error::ReadlineError;
 use rustyline::history::{History, MemHistory, SearchDirection, SearchResult};
-use rustyline::{Cmd, Config, Editor, ExternalPrinter, KeyCode, KeyEvent, Modifiers};
+use rustyline::{Cmd, Config, Editor, KeyCode, KeyEvent, Modifiers};
 use tokio::runtime::Handle;
-use tokio::task::JoinHandle;
 use tokio_stream::StreamExt;
 
 use crate::render::{
@@ -25,19 +24,72 @@ use crate::render::{
     render_assistant_content, render_tool_call, render_tool_result,
 };
 use crate::run_sandbox_shell_command;
+use crate::turn_display::{TurnProgress, UsageTotals, UsageTracker, interruptible};
+use executor::harness::HarnessTurnKey;
 
 const DEFAULT_SHELL_PROGRAM: &str = "/bin/bash";
 const REMOTE_HISTORY_BASE: usize = 1_000_000;
 const REMOTE_HISTORY_PAGE_SIZE: u32 = 32;
 
+#[derive(Default)]
+struct AssistantLine {
+    active: bool,
+    ends_with_newline: bool,
+}
+
+impl AssistantLine {
+    fn write_text(&mut self, writer: &mut impl Write, text: &str) -> io::Result<()> {
+        if !self.active {
+            write!(writer, "{} {ASSISTANT_LABEL}: ", compact_timestamp())?;
+            self.active = true;
+        }
+        writer.write_all(text.as_bytes())?;
+        self.ends_with_newline = text.ends_with('\n');
+        writer.flush()
+    }
+
+    fn break_line(&mut self, writer: &mut impl Write) -> io::Result<()> {
+        if self.active && !self.ends_with_newline {
+            writeln!(writer)?;
+            self.ends_with_newline = true;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, writer: &mut impl Write) -> io::Result<()> {
+        self.break_line(writer)?;
+        self.active = false;
+        Ok(())
+    }
+}
+
 pub async fn run_chat_repl(
-    agent: Arc<dyn HarnessAgent>,
-    conversation: Arc<dyn HarnessConversation>,
+    runtime: Arc<Runtime>,
+    agent: Arc<dyn AgentHandle>,
+    conversation: Arc<dyn ConversationHandle>,
     verbosity: Verbosity,
 ) -> Result<()> {
-    let mut repl = ChatRepl::new(agent, conversation, verbosity)?;
-    repl.print_transcript().await?;
-    repl.run().await
+    let mut repl = ChatRepl::new(runtime, agent, conversation, verbosity)?;
+    interruptible(repl.print_transcript()).await?;
+    repl.reconnect().await?;
+    while interruptible(repl.run()).await?.is_none() {
+        if let Some(key) = repl.active_turn.take() {
+            repl.runtime.cancel(key).await?;
+        }
+    }
+    Ok(())
+}
+
+pub async fn run_prompt(
+    runtime: Arc<Runtime>,
+    agent: Arc<dyn AgentHandle>,
+    conversation: Arc<dyn ConversationHandle>,
+    verbosity: Verbosity,
+    prompt: &str,
+) -> Result<()> {
+    let mut repl = ChatRepl::new(runtime, agent, conversation, verbosity)?;
+    repl.send(prompt).await?;
+    repl.end_session().await
 }
 
 struct ChatHistory {
@@ -348,36 +400,43 @@ fn fetch_remote_user_messages(
 }
 
 struct ChatRepl {
-    agent: Arc<dyn HarnessAgent>,
-    conversation: Arc<dyn HarnessConversation>,
+    runtime: Arc<Runtime>,
+    active_turn: Option<HarnessTurnKey>,
+    agent: Arc<dyn AgentHandle>,
+    conversation: Arc<dyn ConversationHandle>,
     editor: Editor<(), ChatHistory>,
     session_id: Option<SessionId>,
-    watch_after: Arc<Mutex<Option<EventId>>>,
+    watch_after: Option<EventId>,
+    usage: UsageTracker,
     verbosity: Verbosity,
 }
 
 impl ChatRepl {
     fn new(
-        agent: Arc<dyn HarnessAgent>,
-        conversation: Arc<dyn HarnessConversation>,
+        runtime: Arc<Runtime>,
+        agent: Arc<dyn AgentHandle>,
+        conversation: Arc<dyn ConversationHandle>,
         verbosity: Verbosity,
     ) -> Result<Self> {
         let latest_event_id = conversation.record().latest_event_id;
-        let history = ChatHistory::new(conversation.exoharness_handle(), latest_event_id);
+        let history = ChatHistory::new(conversation.clone(), latest_event_id);
         let mut editor = Editor::with_history(Config::default(), history)?;
         editor.bind_sequence(KeyEvent(KeyCode::Enter, Modifiers::ALT), Cmd::Newline);
         Ok(Self {
+            runtime,
+            active_turn: None,
             agent,
             conversation,
             editor,
             session_id: None,
-            watch_after: Arc::new(Mutex::new(latest_event_id)),
+            watch_after: latest_event_id,
+            usage: UsageTracker::default(),
             verbosity,
         })
     }
 
     async fn print_transcript(&self) -> Result<()> {
-        let messages = self.conversation.messages().await?;
+        let messages = executor::materialize_conversation_messages(&*self.conversation).await?;
         print_transcript(&messages, self.verbosity);
         Ok(())
     }
@@ -385,21 +444,21 @@ impl ChatRepl {
     async fn run(&mut self) -> Result<()> {
         loop {
             let prompt = format!("{}> ", self.conversation.record().slug);
-            let event_printer = self.spawn_event_printer()?;
-            let readline_result = self.editor.readline(&prompt);
-            if let Some(event_printer) = event_printer {
-                event_printer.abort();
-                let _ = event_printer.await;
-            }
-
-            match readline_result {
+            match self.editor.readline(&prompt) {
                 Ok(line) => {
                     let trimmed = line.trim();
+                    if matches!(trimmed, "/quit" | "/exit") {
+                        break;
+                    }
+                    if io::stdin().is_terminal()
+                        && let Err(error) = self.print_pending_events().await
+                    {
+                        println!("event update failed: {error:#}");
+                    }
                     if trimmed.is_empty() {
                         continue;
                     }
                     match trimmed {
-                        "/quit" | "/exit" => break,
                         "/history" => self.print_transcript().await?,
                         "/cost" | "/usage" => {
                             print_lines(cost_lines(self.conversation.as_ref()).await);
@@ -523,10 +582,15 @@ impl ChatRepl {
             }
         }
 
-        if let Some(session_id) = self.session_id.take() {
-            self.conversation.close_session(session_id).await?;
-        }
+        self.end_session().await
+    }
 
+    async fn end_session(&mut self) -> Result<()> {
+        if let Some(session_id) = self.session_id.take() {
+            self.runtime
+                .end_session(self.conversation.as_ref(), session_id)
+                .await?;
+        }
         Ok(())
     }
 
@@ -546,12 +610,10 @@ impl ChatRepl {
         println!("snapshotting sandbox {sandbox_id}...");
         let snapshot_id = self
             .conversation
-            .exoharness_handle()
             .snapshot_sandbox(sandbox_id.clone())
             .await?;
         println!("snapshot {snapshot_id} captured; restoring on {provider}...");
         self.conversation
-            .exoharness_handle()
             .start_sandbox(StartSandboxRequest {
                 id: sandbox_id.clone(),
                 snapshot_id,
@@ -563,109 +625,153 @@ impl ChatRepl {
     }
 
     async fn send(&mut self, input: &str) -> Result<()> {
-        let mut stream = self
-            .conversation
-            .send_stream(SendRequest {
-                input: vec![Message::User {
-                    content: UserContent::String(input.to_string()),
-                }],
-                session_id: self.session_id,
-            })
-            .await?;
-        let mut stdout = io::stdout();
-        let mut printed_assistant = false;
-        let mut streamed_text = String::new();
-        // Tool names by call id, so results (which only carry the id) can be
-        // labeled in compact mode.
-        let mut pending_tool_calls: HashMap<String, String> = HashMap::new();
-        // Compact call line left open (no newline) so the matching result can
-        // acknowledge receipt on the same line.
-        let mut open_call: Option<String> = None;
+        let result = self.send_inner(input).await;
+        self.finish_observing(result).await
+    }
 
-        while let Some(event) = stream.next().await {
-            match event? {
-                ExecutionStreamEvent::FirstChunk { ttft } => {
-                    if self.verbosity == Verbosity::Full {
-                        print_ttft(ttft);
-                    }
+    async fn finish_observing(&mut self, result: Result<()>) -> Result<()> {
+        if result.as_ref().err().is_some_and(|error| {
+            error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::Interrupted)
+        }) && let Some(key) = self.active_turn
+        {
+            self.runtime.cancel(key).await?;
+        }
+        self.active_turn = None;
+        result
+    }
+
+    async fn send_inner(&mut self, input: &str) -> Result<()> {
+        let started = Instant::now();
+        let mut progress = TurnProgress::new();
+        progress
+            .wait(self.usage.refresh(self.conversation.as_ref(), None))
+            .await?;
+        let (turn, stream) = progress
+            .wait(self.runtime.start_turn(
+                Arc::clone(&self.agent),
+                Arc::clone(&self.conversation),
+                SendRequest {
+                    input: vec![Message::User {
+                        content: UserContent::String(input.to_string()),
+                    }],
+                    session_id: self.session_id,
+                },
+                true,
+                None,
+            ))
+            .await?;
+        self.observe_turn(turn, stream, started).await
+    }
+
+    async fn reconnect(&mut self) -> Result<()> {
+        if let Some((turn, stream)) = self
+            .runtime
+            .reconnect_turn(self.conversation.as_ref())
+            .await?
+        {
+            println!("Reconnecting to turn {}", turn.id);
+            let result = self.observe_turn(turn, stream, Instant::now()).await;
+            self.finish_observing(result).await?;
+        }
+        Ok(())
+    }
+
+    async fn observe_turn(
+        &mut self,
+        turn: exoharness::TurnRecord,
+        mut stream: executor::ExecutionStreamHandle,
+        started: Instant,
+    ) -> Result<()> {
+        let mut progress = TurnProgress::new();
+        self.session_id = Some(turn.session_id);
+        self.active_turn = Some(HarnessTurnKey::new(self.conversation.record().id, turn.id));
+        progress.set_status(Some("Waiting for model".to_string()));
+        let mut stdout = io::stdout();
+        let mut assistant_line = AssistantLine::default();
+        let mut ttft = None;
+        let mut completed_turn = None;
+        let mut pending_tool_calls: HashMap<String, (String, Option<String>)> = HashMap::new();
+        while let Some(event) = progress
+            .wait(async { stream.next().await.transpose() })
+            .await?
+        {
+            match event {
+                ExecutionStreamEvent::ApprovalRequested { turn, approval } => {
+                    progress.set_status(None);
+                    assistant_line.finish(&mut stdout)?;
+                    self.respond_to_approval(&turn, approval).await?;
+                    progress.set_status(Some("Running tool".to_owned()));
+                }
+                ExecutionStreamEvent::FirstChunk { .. } => {
+                    ttft.get_or_insert_with(|| started.elapsed());
+                    progress.set_status(Some("Thinking".to_string()));
                 }
                 ExecutionStreamEvent::Chunk(chunk) => {
                     let text = chunk_text(&chunk);
                     if text.is_empty() {
                         continue;
                     }
-                    if open_call.take().is_some() {
-                        println!();
-                    }
-                    if !printed_assistant {
-                        print!("{} {ASSISTANT_LABEL}: ", compact_timestamp());
-                        stdout.flush()?;
-                        printed_assistant = true;
-                    }
-                    stdout.write_all(text.as_bytes())?;
-                    stdout.flush()?;
-                    streamed_text.push_str(&text);
+                    ttft.get_or_insert_with(|| started.elapsed());
+                    progress.set_status(None);
+                    assistant_line.write_text(&mut stdout, &text)?;
                 }
                 ExecutionStreamEvent::ToolCall {
                     tool_call_id,
                     tool_name,
                     arguments,
                 } => {
-                    if open_call.take().is_some() {
-                        println!();
-                    }
-                    if printed_assistant && !streamed_text.ends_with('\n') {
-                        println!();
-                        printed_assistant = false;
-                        streamed_text.clear();
-                    }
-                    if let Some(rendered) = render_tool_call(&tool_name, &arguments, self.verbosity)
+                    assistant_line.break_line(&mut stdout)?;
+                    let rendered = render_tool_call(&tool_name, &arguments, self.verbosity);
+                    if self.verbosity == Verbosity::Full
+                        && let Some(rendered) = &rendered
                     {
-                        if self.verbosity == Verbosity::Compact {
-                            print!("{rendered}");
-                            stdout.flush()?;
-                            open_call = Some(tool_call_id.clone());
-                        } else {
-                            println!("{rendered}");
-                        }
-                        printed_assistant = false;
-                        streamed_text.clear();
+                        assistant_line.finish(&mut stdout)?;
+                        println!("{rendered}");
                     }
-                    pending_tool_calls.insert(tool_call_id, tool_name);
+                    progress.set_status(Some(format!("Running tool {tool_name}")));
+                    pending_tool_calls.insert(tool_call_id, (tool_name, rendered));
                 }
                 ExecutionStreamEvent::ToolResult {
                     tool_call_id,
                     result,
                 } => {
-                    let tool_name = pending_tool_calls
+                    let (tool_name, call) = pending_tool_calls
                         .remove(&tool_call_id)
-                        .unwrap_or_else(|| "tool".to_string());
-                    if open_call.as_deref() == Some(tool_call_id.as_str()) {
-                        open_call = None;
-                        println!(" {}", compact_result_status(&result));
-                    } else if let Some(rendered) =
-                        render_tool_result(&tool_name, &result, self.verbosity)
-                    {
-                        if open_call.take().is_some() {
-                            println!();
+                        .unwrap_or_else(|| ("tool".to_string(), None));
+                    let rendered = match (self.verbosity, call) {
+                        (Verbosity::Compact, Some(call)) => {
+                            Some(format!("{call} {}", compact_result_status(&result)))
                         }
+                        _ => render_tool_result(&tool_name, &result, self.verbosity),
+                    };
+                    if let Some(rendered) = rendered {
+                        assistant_line.finish(&mut stdout)?;
                         println!("{rendered}");
                     }
+                    progress.set_status(Some(if pending_tool_calls.is_empty() {
+                        "Waiting for model".to_string()
+                    } else {
+                        "Running tools".to_string()
+                    }));
                 }
                 ExecutionStreamEvent::Completed(result) => {
                     self.session_id = Some(result.session_id);
-                    *self.watch_after.lock().expect("chat event watch poisoned") =
-                        Some(result.latest_event_id);
+                    self.watch_after = Some(result.latest_event_id);
+                    completed_turn = Some(result.turn_id);
                 }
             }
         }
-        if open_call.is_some() {
-            println!();
-        }
+        let elapsed = started.elapsed();
 
-        if printed_assistant {
-            println!();
-        } else if let Some(last_message) = self.conversation.messages().await?.last().cloned()
+        if assistant_line.active {
+            assistant_line.finish(&mut stdout)?;
+        } else if let Some(last_message) =
+            executor::materialize_conversation_messages(&*self.conversation)
+                .await?
+                .last()
+                .cloned()
             && let Message::Assistant { content, .. } = last_message
         {
             let rendered = render_assistant_content(&content, self.verbosity);
@@ -673,59 +779,105 @@ impl ChatRepl {
                 println!("{} {ASSISTANT_LABEL}: {}", compact_timestamp(), rendered);
             }
         }
+        progress.set_status(Some("Finishing turn".to_string()));
+        match progress
+            .wait(
+                self.usage
+                    .refresh(self.conversation.as_ref(), completed_turn),
+            )
+            .await
+        {
+            Ok(usage) => println!("{}", usage.display(&self.usage.total, ttft, elapsed)),
+            Err(error) => {
+                println!(
+                    "{}",
+                    UsageTotals::default().display(&self.usage.total, ttft, elapsed)
+                );
+                println!("usage summary failed: {error:#}");
+            }
+        }
         println!();
         Ok(())
     }
 
-    fn spawn_event_printer(&mut self) -> Result<Option<JoinHandle<()>>> {
-        if !io::stdin().is_terminal() {
-            return Ok(None);
-        }
-        let conversation = self.conversation.exoharness_handle();
-        let watch_after = Arc::clone(&self.watch_after);
-        let verbosity = self.verbosity;
-        let mut printer = self.editor.create_external_printer()?;
-        Ok(Some(tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                interval.tick().await;
-                let cursor = *watch_after.lock().expect("chat event watch poisoned");
-                match conversation
-                    .get_events(Some(EventQuery {
-                        cursor,
-                        direction: Some(EventQueryDirection::Asc),
-                        limit: Some(100),
-                        session_id: None,
-                        turn_id: None,
-                        types: None,
-                    }))
-                    .await
-                {
-                    Ok(result) => {
-                        for event in result.events {
-                            *watch_after.lock().expect("chat event watch poisoned") =
-                                Some(event.id);
-                            for rendered in render_external_event(&event.data, verbosity) {
-                                let _ = printer.print(format!("{rendered}\n"));
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        let _ = printer.print(format!("event watcher error: {error}\n"));
-                        break;
-                    }
+    async fn respond_to_approval(
+        &mut self,
+        turn: &exoharness::TurnRecord,
+        approval: executor::permissions::ApprovalRequest,
+    ) -> Result<()> {
+        println!("Permission required: {}", approval.request.function_name);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&approval.request.arguments)?
+        );
+        let (approved, allow_for_tool) = loop {
+            match self
+                .editor
+                .readline("Allow? [y]es / [n]o / [a]ll calls to this tool this session: ")
+            {
+                Ok(answer) => match answer.trim().to_ascii_lowercase().as_str() {
+                    "y" | "yes" => break (true, false),
+                    "a" | "all" => break (true, true),
+                    "n" | "no" | "" => break (false, false),
+                    _ => println!("Enter y, n, or a."),
+                },
+                Err(ReadlineError::Eof) => break (false, false),
+                Err(ReadlineError::Interrupted) => {
+                    return Err(
+                        io::Error::new(io::ErrorKind::Interrupted, "approval interrupted").into(),
+                    );
                 }
+                Err(error) => return Err(error.into()),
             }
-        })))
+        };
+        self.runtime
+            .approval_response(
+                self.agent.record().id,
+                self.conversation.record().id,
+                turn.id,
+                &exo_managed_agents::http::protocol::ApprovalResponseBody {
+                    session_id: turn.session_id,
+                    approval_id: approval.approval_id,
+                    approved,
+                    allow_for_tool,
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn print_pending_events(&mut self) -> Result<()> {
+        let conversation = &self.conversation;
+        loop {
+            let result = conversation
+                .get_events(Some(EventQuery {
+                    cursor: self.watch_after,
+                    direction: Some(EventQueryDirection::Asc),
+                    limit: Some(100),
+                    session_id: None,
+                    turn_id: None,
+                    types: None,
+                }))
+                .await?;
+            if result.events.is_empty() {
+                return Ok(());
+            }
+            for event in result.events {
+                self.watch_after = Some(event.id);
+                print_lines(render_external_event(&event.data, self.verbosity));
+            }
+        }
     }
 
     async fn run_shell(&self, command: &str) -> Result<()> {
-        let output = shell_output(
-            self.agent.as_ref(),
-            self.conversation.as_ref(),
-            command.to_string(),
-        )
-        .await?;
+        let output = TurnProgress::new()
+            .wait(shell_output(
+                self.runtime.as_ref(),
+                self.agent.as_ref(),
+                self.conversation.as_ref(),
+                command.to_string(),
+            ))
+            .await?;
         io::stdout().write_all(output.stdout.as_bytes())?;
         io::stderr().write_all(output.stderr.as_bytes())?;
         if output.exit_code != 0 {
@@ -745,15 +897,6 @@ pub(crate) fn chunk_text(chunk: &UniversalStreamChunk) -> String {
         }
     }
     text
-}
-
-fn print_ttft(ttft: Duration) {
-    let ttft_ms = ttft.as_millis();
-    if ttft_ms == 0 {
-        println!("[ttft <1 ms]");
-    } else {
-        println!("[ttft {ttft_ms} ms]");
-    }
 }
 
 pub(crate) fn render_external_event(data: &EventData, verbosity: Verbosity) -> Vec<String> {
@@ -799,35 +942,6 @@ fn render_user_content_for_history(content: &UserContent) -> String {
     }
 }
 
-/// Per-model usage tally for `/cost`.
-#[derive(Default)]
-struct ModelCost {
-    calls: u64,
-    prompt: i64,
-    cached: i64,
-    completion: i64,
-    cost: f64,
-}
-
-/// Dynamic precision so sub-cent costs are not rounded to a misleading shape.
-fn fmt_usd(cost: f64) -> String {
-    if cost >= 1.0 {
-        format!("${cost:.2}")
-    } else if cost >= 0.01 {
-        format!("${cost:.4}")
-    } else {
-        format!("${cost:.6}")
-    }
-}
-
-fn truncate(value: &str, max: usize) -> String {
-    if value.len() <= max {
-        value.to_string()
-    } else {
-        format!("{}…", &value[..max.saturating_sub(1)])
-    }
-}
-
 fn print_lines(lines: Vec<String>) {
     for line in lines {
         println!("{line}");
@@ -852,100 +966,23 @@ fn print_help() {
 /// `/cost` output: summarize token usage and dollar cost for the conversation
 /// from the `usage` records on its `messages` events. Paginates so it covers
 /// the whole conversation, not just one page.
-pub(crate) async fn cost_lines(conversation: &dyn HarnessConversation) -> Vec<String> {
+pub(crate) async fn cost_lines(conversation: &dyn ConversationHandle) -> Vec<String> {
     match cost_summary(conversation).await {
         Ok(lines) => lines,
         Err(error) => vec![format!("cost summary failed: {error:#}")],
     }
 }
 
-async fn cost_summary(conversation: &dyn HarnessConversation) -> Result<Vec<String>> {
-    let handle = conversation.exoharness_handle();
-    let mut cursor: Option<EventId> = None;
-    let mut per_model: BTreeMap<String, ModelCost> = BTreeMap::new();
-    let mut unpriced = 0usize;
-    loop {
-        let result = handle
-            .get_events(Some(EventQuery {
-                cursor,
-                direction: Some(EventQueryDirection::Desc),
-                limit: Some(REMOTE_HISTORY_PAGE_SIZE),
-                session_id: None,
-                turn_id: None,
-                types: Some(vec![EventKind::MESSAGES]),
-            }))
-            .await?;
-        for event in &result.events {
-            if let EventData::Messages {
-                usage: Some(usage), ..
-            } = &event.data
-            {
-                let entry = per_model.entry(usage.model.clone()).or_default();
-                entry.calls += 1;
-                entry.prompt += usage.prompt_tokens.unwrap_or(0);
-                entry.cached += usage.prompt_cached_tokens.unwrap_or(0);
-                entry.completion += usage.completion_tokens.unwrap_or(0);
-                match usage.cost_usd {
-                    Some(cost) => entry.cost += cost,
-                    None => unpriced += 1,
-                }
-            }
-        }
-        match result.cursor {
-            Some(next) => cursor = Some(next),
-            None => break,
-        }
-    }
-
-    if per_model.is_empty() {
-        return Ok(vec![
-            "no recorded model usage in this conversation yet".to_string(),
-        ]);
-    }
-
-    let mut lines = Vec::new();
-    let mut total = ModelCost::default();
-    lines.push(format!(
-        "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
-        "MODEL", "CALLS", "PROMPT", "CACHED", "OUT", "COST"
-    ));
-    for (model, c) in &per_model {
-        lines.push(format!(
-            "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
-            truncate(model, 28),
-            c.calls,
-            c.prompt,
-            c.cached,
-            c.completion,
-            fmt_usd(c.cost),
-        ));
-        total.calls += c.calls;
-        total.prompt += c.prompt;
-        total.cached += c.cached;
-        total.completion += c.completion;
-        total.cost += c.cost;
-    }
-    lines.push(format!(
-        "{:<28} {:>6} {:>10} {:>10} {:>10} {:>12}",
-        "TOTAL",
-        total.calls,
-        total.prompt,
-        total.cached,
-        total.completion,
-        fmt_usd(total.cost),
-    ));
-    if unpriced > 0 {
-        lines.push(format!(
-            "note: {unpriced} call(s) had no price (model not in the price table); cost excludes them"
-        ));
-    }
-    Ok(lines)
+async fn cost_summary(conversation: &dyn ConversationHandle) -> Result<Vec<String>> {
+    let mut tracker = UsageTracker::default();
+    tracker.refresh(conversation, None).await?;
+    Ok(tracker.cost_lines())
 }
 
 /// `/snapshot` output: snapshot the given sandbox, or the conversation's
 /// latest one when no id is given.
 pub(crate) async fn snapshot_lines(
-    conversation: &dyn HarnessConversation,
+    conversation: &dyn ConversationHandle,
     explicit_id: Option<SandboxId>,
 ) -> Vec<String> {
     match snapshot_sandbox(conversation, explicit_id).await {
@@ -955,7 +992,7 @@ pub(crate) async fn snapshot_lines(
 }
 
 async fn snapshot_sandbox(
-    conversation: &dyn HarnessConversation,
+    conversation: &dyn ConversationHandle,
     explicit_id: Option<SandboxId>,
 ) -> Result<SnapshotId> {
     let sandbox_id = match explicit_id {
@@ -964,15 +1001,12 @@ async fn snapshot_sandbox(
             anyhow::anyhow!("no sandbox has been created in this conversation yet")
         })?,
     };
-    let id = conversation
-        .exoharness_handle()
-        .snapshot_sandbox(sandbox_id)
-        .await?;
+    let id = conversation.snapshot_sandbox(sandbox_id).await?;
     Ok(id)
 }
 
 /// `/snapshots` output: every snapshot taken in the conversation.
-pub(crate) async fn snapshots_lines(conversation: &dyn HarnessConversation) -> Vec<String> {
+pub(crate) async fn snapshots_lines(conversation: &dyn ConversationHandle) -> Vec<String> {
     match list_snapshots(conversation).await {
         Ok(snapshots) if snapshots.is_empty() => {
             vec!["no snapshots yet for this conversation".to_string()]
@@ -998,7 +1032,7 @@ pub(crate) async fn snapshots_lines(conversation: &dyn HarnessConversation) -> V
 /// snapshot. Stops the current container, decodes the snapshot payload, and
 /// starts a fresh container from that state.
 pub(crate) async fn rewind_lines(
-    conversation: &dyn HarnessConversation,
+    conversation: &dyn ConversationHandle,
     snapshot_id: &str,
 ) -> Vec<String> {
     match rewind_to_snapshot(conversation, snapshot_id).await {
@@ -1008,7 +1042,7 @@ pub(crate) async fn rewind_lines(
 }
 
 async fn rewind_to_snapshot(
-    conversation: &dyn HarnessConversation,
+    conversation: &dyn ConversationHandle,
     snapshot_id_str: &str,
 ) -> Result<()> {
     let snapshot_id = snapshot_id_str
@@ -1018,7 +1052,6 @@ async fn rewind_to_snapshot(
         .await?
         .ok_or_else(|| anyhow::anyhow!("snapshot {snapshot_id} not found in this conversation"))?;
     conversation
-        .exoharness_handle()
         .start_sandbox(StartSandboxRequest {
             id: sandbox_id,
             snapshot_id,
@@ -1035,7 +1068,7 @@ async fn rewind_to_snapshot(
 /// move; only the backend (and the machine actually running the container)
 /// changes.
 pub(crate) async fn teleport_lines(
-    conversation: &dyn HarnessConversation,
+    conversation: &dyn ConversationHandle,
     provider: &str,
 ) -> Vec<String> {
     match teleport_sandbox(conversation, provider).await {
@@ -1047,7 +1080,7 @@ pub(crate) async fn teleport_lines(
 }
 
 async fn teleport_sandbox(
-    conversation: &dyn HarnessConversation,
+    conversation: &dyn ConversationHandle,
     provider_str: &str,
 ) -> Result<(SandboxId, SandboxProvider)> {
     let provider = provider_str
@@ -1056,12 +1089,8 @@ async fn teleport_sandbox(
     let sandbox_id = latest_sandbox_id(conversation)
         .await?
         .ok_or_else(|| anyhow::anyhow!("no sandbox has been created in this conversation yet"))?;
-    let snapshot_id = conversation
-        .exoharness_handle()
-        .snapshot_sandbox(sandbox_id.clone())
-        .await?;
+    let snapshot_id = conversation.snapshot_sandbox(sandbox_id.clone()).await?;
     conversation
-        .exoharness_handle()
         .start_sandbox(StartSandboxRequest {
             id: sandbox_id.clone(),
             snapshot_id,
@@ -1075,11 +1104,12 @@ async fn teleport_sandbox(
 /// `/shell` output as display lines. The line-mode repl streams raw bytes to
 /// stdout/stderr instead; this is for UIs that own the screen.
 pub(crate) async fn shell_lines(
-    agent: &dyn HarnessAgent,
-    conversation: &dyn HarnessConversation,
+    harness: &Runtime,
+    agent: &dyn AgentHandle,
+    conversation: &dyn ConversationHandle,
     command: String,
 ) -> Vec<String> {
-    match shell_output(agent, conversation, command).await {
+    match shell_output(harness, agent, conversation, command).await {
         Ok(output) => {
             let mut lines: Vec<String> = output
                 .stdout
@@ -1097,14 +1127,17 @@ pub(crate) async fn shell_lines(
 }
 
 async fn shell_output(
-    agent: &dyn HarnessAgent,
-    conversation: &dyn HarnessConversation,
+    harness: &Runtime,
+    agent: &dyn AgentHandle,
+    conversation: &dyn ConversationHandle,
     command: String,
 ) -> Result<crate::SandboxShellOutput> {
-    let mut config = conversation.config().await?;
+    let mut config = executor::load_conversation_config(conversation).await?;
     if config.shell_program.is_none() {
         config.shell_program = Some(DEFAULT_SHELL_PROGRAM.to_string());
-        conversation.put_config(config).await?;
+        harness
+            .put_conversation_config(conversation, config)
+            .await?;
     }
     run_sandbox_shell_command(agent, conversation, command).await
 }
@@ -1112,9 +1145,8 @@ async fn shell_output(
 /// Walk the conversation's event log to find the latest `SandboxCreated`
 /// event, returning the sandbox id. Returns `None` if no sandbox has been
 /// created yet (e.g. nothing has been chatted with).
-async fn latest_sandbox_id(conversation: &dyn HarnessConversation) -> Result<Option<SandboxId>> {
+async fn latest_sandbox_id(conversation: &dyn ConversationHandle) -> Result<Option<SandboxId>> {
     let result = conversation
-        .exoharness_handle()
         .get_events(Some(EventQuery {
             cursor: None,
             direction: Some(EventQueryDirection::Desc),
@@ -1140,13 +1172,12 @@ async fn latest_sandbox_id(conversation: &dyn HarnessConversation) -> Result<Opt
 /// All snapshots taken in the conversation, oldest-first. Each tuple is
 /// `(snapshot_id, sandbox_id_it_was_taken_from)`.
 async fn list_snapshots(
-    conversation: &dyn HarnessConversation,
+    conversation: &dyn ConversationHandle,
 ) -> Result<Vec<(SnapshotId, SandboxId)>> {
     let mut out = Vec::new();
     let mut cursor: Option<EventId> = None;
     loop {
         let result = conversation
-            .exoharness_handle()
             .get_events(Some(EventQuery {
                 cursor,
                 direction: Some(EventQueryDirection::Asc),
@@ -1183,7 +1214,7 @@ async fn list_snapshots(
 /// Find the sandbox a particular snapshot was taken from, by scanning the
 /// `SandboxSnapshotted` events.
 async fn sandbox_id_for_snapshot(
-    conversation: &dyn HarnessConversation,
+    conversation: &dyn ConversationHandle,
     target: SnapshotId,
 ) -> Result<Option<SandboxId>> {
     let snapshots = list_snapshots(conversation).await?;
@@ -1195,6 +1226,38 @@ async fn sandbox_id_for_snapshot(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hidden_tools_preserve_the_assistant_label() {
+        for first in ["Thinking", "Thinking\n"] {
+            let mut line = super::AssistantLine::default();
+            let mut output = Vec::new();
+            line.write_text(&mut output, first).unwrap();
+            line.break_line(&mut output).unwrap();
+            line.break_line(&mut output).unwrap();
+            line.write_text(&mut output, "Done").unwrap();
+            line.finish(&mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(output.matches(super::ASSISTANT_LABEL).count(), 1);
+            assert!(output.ends_with("Thinking\nDone\n"));
+        }
+    }
+
+    #[test]
+    fn visible_tool_output_ends_the_assistant_message() {
+        let mut line = super::AssistantLine::default();
+        let mut output = Vec::new();
+        line.write_text(&mut output, "Thinking").unwrap();
+        line.finish(&mut output).unwrap();
+        line.write_text(&mut output, "Done").unwrap();
+        assert_eq!(
+            String::from_utf8(output)
+                .unwrap()
+                .matches(super::ASSISTANT_LABEL)
+                .count(),
+            2
+        );
+    }
+
     use super::{Verbosity, render_external_event, render_user_content_for_history};
     use executor::EventData;
     use lingua::Message;

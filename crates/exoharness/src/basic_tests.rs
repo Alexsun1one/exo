@@ -24,17 +24,106 @@ use crate::{
     Artifact, ArtifactVersion, BasicExoHarness, BeginTurnRequest, Binding, BoxAsyncRead,
     BoxAsyncWrite, CloseSandboxProcessInputRequest, CreateSandboxRequest, DurableFileSystem,
     EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness, FileSystemMountMode,
-    ForkConversationRequest, ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest,
-    NewConversationRequest, PutSecretRequest, RestoreSandboxRequest, RunInSandboxRequest,
-    SandboxAttachment, SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput,
-    SandboxKey, SandboxLifecycleConfig, SandboxNetworkPolicy, SandboxProcessEvent,
-    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin,
-    SandboxProvider, SandboxProviderConfig, SandboxRequest, SandboxSpec, Secret, SnapshotFormat,
-    SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, Uuid7,
-    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    ManagedSandboxBackend, ManagedSandboxHandle, NewAgentRequest, NewConversationRequest,
+    PutSecretRequest, ResourceScope, RestoreSandboxRequest, RunInSandboxRequest, SandboxAttachment,
+    SandboxBackendRegistration, SandboxCommand, SandboxCommandOutput, SandboxLifecycleConfig,
+    SandboxNetworkPolicy, SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts,
+    SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxProviderConfig,
+    SandboxRequest, SandboxSpec, Secret, SnapshotFormat, SnapshotPayload,
+    StartSandboxProcessRequest, StartSandboxRequest, Uuid7, WaitSandboxProcessRequest,
+    WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
 const DEFAULT_DURABLE_CONTRACT_MOUNT_PATH: &str = "/home/exo/workspace";
+
+#[tokio::test]
+async fn unfinished_turn_index_survives_restart_and_excludes_finished_threads() -> crate::Result<()>
+{
+    let temp = TempDir::new()?;
+    let harness = BasicExoHarness::new(local_test_config(temp.path())).await?;
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            vaults: vec![],
+            slug: "indexed-turns".to_string(),
+            name: "Indexed turns".to_string(),
+        })
+        .await?;
+    let finished_thread = agent
+        .new_conversation(NewConversationRequest::default())
+        .await?;
+    let finished = finished_thread
+        .begin_turn(BeginTurnRequest::default())
+        .await?;
+    finished.finish().await?;
+    let unfinished_thread = agent
+        .new_conversation(NewConversationRequest::default())
+        .await?;
+    let unfinished = unfinished_thread
+        .begin_turn(BeginTurnRequest::default())
+        .await?;
+    let agent_id = agent.record().id;
+    let thread_id = unfinished_thread.record().id;
+    let turn_record = unfinished.record().clone();
+    let query = crate::ListThreadsRequest {
+        unfinished_only: true,
+        ..Default::default()
+    };
+    assert_eq!(agent.list_threads(query.clone()).await?.threads.len(), 1);
+
+    drop(unfinished);
+    drop(unfinished_thread);
+    drop(finished);
+    drop(finished_thread);
+    drop(agent);
+    drop(harness);
+
+    let reopened = BasicExoHarness::new(local_test_config(temp.path())).await?;
+    let agent = reopened.get_agent(&agent_id).await?.expect("agent exists");
+    assert_eq!(agent.list_threads(query.clone()).await?.threads.len(), 1);
+    let thread = agent.get_thread(&thread_id).await?.expect("thread exists");
+    thread.turn_handle(turn_record).await?.finish().await?;
+    assert!(agent.list_threads(query).await?.threads.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_memory_state_does_not_create_files_or_survive_reopening() -> crate::Result<()> {
+    let temp = TempDir::new()?;
+    let root = temp.path().join("unused");
+    let harness = BasicExoHarness::in_memory(local_test_config(&root)).await?;
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            vaults: vec![],
+            slug: "temporary".to_string(),
+            name: "Temporary".to_string(),
+        })
+        .await?;
+    let thread = agent
+        .new_conversation(NewConversationRequest::default())
+        .await?;
+    let turn = thread
+        .begin_turn(BeginTurnRequest {
+            session_id: None,
+            input: vec![user_message("remember this")],
+            ..Default::default()
+        })
+        .await?;
+    turn.write_artifact(WriteArtifactRequest {
+        path: "report.md".to_string(),
+        contents: b"temporary report".to_vec(),
+    })
+    .await?;
+    turn.finish().await?;
+    assert!(!thread.get_events(None).await?.events.is_empty());
+    assert_eq!(thread.list_artifacts().await?.len(), 1);
+    assert!(!root.exists());
+    let reopened = BasicExoHarness::in_memory(local_test_config(&root)).await?;
+    assert!(reopened.get_agent(&agent.record().id).await?.is_none());
+    assert!(reopened.list_agents().await?.is_empty());
+    assert!(!root.exists());
+    Ok(())
+}
+
 #[cfg(feature = "aws-agentcore")]
 const DEFAULT_AGENTCORE_DURABLE_CONTRACT_MOUNT_PATH: &str = "/mnt/workspace";
 
@@ -144,20 +233,6 @@ async fn basic_backend_contract_turn_events_continue_after_artifact_writes() {
             .expect("harness should initialize"),
     );
     crate::contract_tests::turn_events_continue_after_artifact_writes(harness).await;
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn basic_backend_contract_conversation_scope_overrides_and_forks() {
-    let tempdir = TempDir::new().expect("tempdir");
-    let harness: std::sync::Arc<dyn ExoHarness> = std::sync::Arc::new(
-        BasicExoHarness::new(local_test_config(tempdir.path()))
-            .await
-            .expect("harness should initialize"),
-    );
-    crate::contract_tests::conversation_scope_overrides_agent_scope_and_fork_copies_bindings(
-        harness,
-    )
-    .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -669,16 +744,18 @@ async fn local_process_contract_handle(
         Arc::new(crate::LocalProcessSandboxBackend::new());
     backend
         .acquire(SandboxRequest {
-            key: SandboxKey::ConversationSandbox {
-                thread_id: Uuid7::now().to_string(),
-                sandbox_id: sandbox_id.to_string(),
+            sandbox_id: sandbox_id.to_string(),
+            scope: ResourceScope::Thread {
+                agent_id: crate::Uuid7::now(),
+                thread_id: Uuid7::now(),
             },
             spec: SandboxSpec {
+                tcp_ports: vec![],
                 image: "local-process".to_string(),
                 resources: Default::default(),
                 mounts: Vec::new(),
                 durable_file_systems: Vec::new(),
-                network: SandboxNetworkPolicy::Enabled,
+                policy: SandboxNetworkPolicy::Unrestricted.into(),
                 default_workdir: tempdir.path().display().to_string(),
             },
             lifecycle: SandboxLifecycleConfig::default(),
@@ -870,16 +947,18 @@ fn provider_contract_request(
     default_workdir: &str,
 ) -> SandboxRequest {
     SandboxRequest {
-        key: SandboxKey::ConversationSandbox {
-            thread_id: Uuid7::now().to_string(),
-            sandbox_id: format!("{provider}-{contract}-contract"),
+        sandbox_id: format!("{provider}-{contract}-contract"),
+        scope: ResourceScope::Thread {
+            agent_id: crate::Uuid7::now(),
+            thread_id: Uuid7::now(),
         },
         spec: SandboxSpec {
+            tcp_ports: vec![],
             image,
             resources: Default::default(),
             mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            network: SandboxNetworkPolicy::Enabled,
+            policy: SandboxNetworkPolicy::Unrestricted.into(),
             default_workdir: default_workdir.to_string(),
         },
         lifecycle: SandboxLifecycleConfig {
@@ -927,6 +1006,7 @@ async fn turn_events_continue_after_artifact_writes() {
         .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -941,6 +1021,7 @@ async fn turn_events_continue_after_artifact_writes() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("ping")],
+            ..Default::default()
         })
         .await
         .expect("turn");
@@ -976,6 +1057,68 @@ async fn turn_events_continue_after_artifact_writes() {
     assert_eq!(artifact_event.turn_id, Some(turn.record().id));
 }
 
+#[tokio::test]
+async fn rebuilding_a_turn_uses_the_committed_event_head_for_its_next_sandbox_event()
+-> crate::Result<()> {
+    let temp = TempDir::new()?;
+    let harness = BasicExoHarness::new_with_sandbox_backend(
+        local_test_config(temp.path()),
+        Arc::new(RestoreImageTestBackend::default()),
+    )
+    .await?;
+    let agent = harness
+        .new_agent(NewAgentRequest {
+            vaults: vec![],
+            slug: "batch-turn".to_string(),
+            name: "Batch turn".to_string(),
+        })
+        .await?;
+    let thread = agent
+        .new_conversation(NewConversationRequest::default())
+        .await?;
+    let sandbox_id = thread
+        .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
+            name: None,
+            provider: SandboxProvider::LocalProcess,
+            image: "snapshot-test".to_string(),
+            resources: Default::default(),
+            default_workdir: Some(temp.path().display().to_string()),
+            file_system_mounts: None,
+            durable_file_systems: None,
+            policy: None,
+            enable_networking: Some(true),
+            idle_seconds: Some(60),
+        })
+        .await?;
+    let turn = thread.begin_turn(BeginTurnRequest::default()).await?;
+    let turn_record = turn.record().clone();
+
+    let added = turn
+        .add_events(vec![
+            EventData::Error {
+                message: "first".to_string(),
+                metadata: None,
+            },
+            EventData::Error {
+                message: "second".to_string(),
+                metadata: None,
+            },
+        ])
+        .await?;
+
+    // Appends do not rewrite record.json. A rebuilt turn must derive its head
+    // from the committed event batch before recording another sandbox event.
+    let rebuilt = thread.turn_handle(turn_record).await?;
+    rebuilt.snapshot_sandbox(sandbox_id).await?;
+    let refreshed = agent
+        .get_thread(&thread.record().id)
+        .await?
+        .expect("thread exists");
+    assert!(refreshed.record().latest_event_id > Some(added.latest_event_id));
+    Ok(())
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn turn_artifact_write_allows_interleaved_conversation_writes() {
     let tempdir = TempDir::new().expect("tempdir");
@@ -984,6 +1127,7 @@ async fn turn_artifact_write_allows_interleaved_conversation_writes() {
         .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -997,6 +1141,7 @@ async fn turn_artifact_write_allows_interleaved_conversation_writes() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("ping")],
+            ..Default::default()
         })
         .await
         .expect("turn");
@@ -1063,6 +1208,7 @@ async fn artifacts_are_versioned_by_path() {
         .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -1101,6 +1247,7 @@ async fn artifacts_store_metadata_and_raw_contents_separately() {
         .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -1142,6 +1289,7 @@ async fn legacy_json_artifacts_are_still_readable() {
         .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -1187,146 +1335,6 @@ async fn legacy_json_artifacts_are_still_readable() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn conversation_scope_overrides_agent_scope_and_fork_copies_local_state() {
-    let tempdir = TempDir::new().expect("tempdir");
-    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
-        .await
-        .expect("harness should initialize");
-    let agent = harness
-        .new_agent(NewAgentRequest {
-            slug: "agent".to_string(),
-            name: "Agent".to_string(),
-        })
-        .await
-        .expect("agent");
-    let conversation = agent
-        .new_conversation(NewConversationRequest {
-            slug: Some("base".to_string()),
-            name: Some("Base".to_string()),
-        })
-        .await
-        .expect("conversation");
-
-    let agent_secret_id = agent
-        .put_secret(PutSecretRequest {
-            name: "OPENAI_API_KEY".to_string(),
-            secret: Secret::Key {
-                value: "agent".to_string(),
-            },
-        })
-        .await
-        .expect("agent secret");
-    agent
-        .put_binding(Binding::Env {
-            name: "OPENAI_API_KEY".to_string(),
-            env_var: "OPENAI_API_KEY".to_string(),
-            secret_id: agent_secret_id,
-        })
-        .await
-        .expect("agent binding");
-
-    let conversation_secret_id = conversation
-        .put_secret(PutSecretRequest {
-            name: "OPENAI_API_KEY".to_string(),
-            secret: Secret::Key {
-                value: "conversation".to_string(),
-            },
-        })
-        .await
-        .expect("conversation secret");
-    conversation
-        .put_binding(Binding::Env {
-            name: "OPENAI_API_KEY".to_string(),
-            env_var: "OPENAI_API_KEY".to_string(),
-            secret_id: conversation_secret_id,
-        })
-        .await
-        .expect("conversation binding");
-
-    let effective_secret = conversation
-        .list_secrets()
-        .await
-        .expect("list secrets")
-        .into_iter()
-        .find(|secret| secret.name == "OPENAI_API_KEY")
-        .expect("effective secret");
-    assert_eq!(effective_secret.id, conversation_secret_id);
-
-    let forked = conversation
-        .fork(ForkConversationRequest {
-            up_to_inclusive: None,
-            slug: Some("fork".to_string()),
-            name: Some("Fork".to_string()),
-        })
-        .await
-        .expect("fork");
-    let forked_secret = forked
-        .list_secrets()
-        .await
-        .expect("list forked secrets")
-        .into_iter()
-        .find(|secret| secret.name == "OPENAI_API_KEY")
-        .expect("forked effective secret");
-    assert_eq!(forked_secret.name, "OPENAI_API_KEY");
-    let events = forked
-        .get_events(Some(EventQuery {
-            cursor: None,
-            direction: Some(EventQueryDirection::Asc),
-            limit: None,
-            session_id: None,
-            turn_id: None,
-            types: None,
-        }))
-        .await;
-    let events = events.expect("get forked events").events;
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event.data, EventData::ThreadForked { .. }))
-    );
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn secrets_are_encrypted_at_rest() {
-    let tempdir = TempDir::new().expect("tempdir");
-    let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
-        .await
-        .expect("harness should initialize");
-    let agent = harness
-        .new_agent(NewAgentRequest {
-            slug: "agent".to_string(),
-            name: "Agent".to_string(),
-        })
-        .await
-        .expect("agent");
-
-    let secret_id = agent
-        .put_secret(PutSecretRequest {
-            name: "OPENAI_API_KEY".to_string(),
-            secret: Secret::Key {
-                value: "super-secret-token".to_string(),
-            },
-        })
-        .await
-        .expect("secret should be stored");
-
-    let stored_path = tempdir
-        .path()
-        .join("agents")
-        .join(agent.record().id.to_string())
-        .join("secrets")
-        .join(format!("{secret_id}.json"));
-    let stored_bytes = fs::read(stored_path)
-        .await
-        .expect("stored secret should exist");
-    let stored_text = String::from_utf8_lossy(&stored_bytes);
-
-    assert!(!stored_text.contains("super-secret-token"));
-    assert!(stored_text.contains("\"ciphertext\""));
-    assert!(stored_text.contains("\"algorithm\""));
-}
-
-#[tokio::test(flavor = "current_thread")]
 async fn basic_backend_runs_commands_in_created_sandbox() {
     let tempdir = TempDir::new().expect("tempdir");
     let harness = BasicExoHarness::new(local_test_config(tempdir.path()))
@@ -1334,6 +1342,7 @@ async fn basic_backend_runs_commands_in_created_sandbox() {
         .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -1346,6 +1355,7 @@ async fn basic_backend_runs_commands_in_created_sandbox() {
 
     let sandbox_id = conversation
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "basic-local-process".to_string(),
@@ -1353,6 +1363,7 @@ async fn basic_backend_runs_commands_in_created_sandbox() {
             default_workdir: Some(tempdir.path().display().to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
@@ -1422,6 +1433,7 @@ async fn agent_scoped_sandbox_is_shared_without_conversation_ownership() {
         .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -1429,6 +1441,8 @@ async fn agent_scoped_sandbox_is_shared_without_conversation_ownership() {
         .expect("agent");
     let first_conversation = agent
         .new_conversation(NewConversationRequest {
+            environment: None,
+            vaults: vec![],
             slug: Some("first".to_string()),
             name: Some("First".to_string()),
         })
@@ -1436,6 +1450,8 @@ async fn agent_scoped_sandbox_is_shared_without_conversation_ownership() {
         .expect("first conversation");
     let second_conversation = agent
         .new_conversation(NewConversationRequest {
+            environment: None,
+            vaults: vec![],
             slug: Some("second".to_string()),
             name: Some("Second".to_string()),
         })
@@ -1443,6 +1459,7 @@ async fn agent_scoped_sandbox_is_shared_without_conversation_ownership() {
         .expect("second conversation");
 
     let create_request = CreateSandboxRequest {
+        tcp_ports: vec![],
         name: Some("shared-agent-sandbox".to_string()),
         provider: SandboxProvider::LocalProcess,
         image: "basic-local-process".to_string(),
@@ -1450,6 +1467,7 @@ async fn agent_scoped_sandbox_is_shared_without_conversation_ownership() {
         default_workdir: Some(tempdir.path().display().to_string()),
         file_system_mounts: None,
         durable_file_systems: None,
+        policy: None,
         enable_networking: Some(true),
         idle_seconds: Some(60),
     };
@@ -1545,6 +1563,7 @@ async fn conversation_create_sandbox_is_not_turn_scoped() {
         .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -1558,12 +1577,14 @@ async fn conversation_create_sandbox_is_not_turn_scoped() {
         .begin_turn(BeginTurnRequest {
             session_id: None,
             input: vec![user_message("start turn")],
+            ..Default::default()
         })
         .await
         .expect("turn should begin");
 
     conversation
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "basic-local-process".to_string(),
@@ -1571,6 +1592,7 @@ async fn conversation_create_sandbox_is_not_turn_scoped() {
             default_workdir: Some(tempdir.path().display().to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
@@ -1607,6 +1629,7 @@ async fn basic_backend_reuses_named_sandbox() {
         .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -1618,6 +1641,7 @@ async fn basic_backend_reuses_named_sandbox() {
         .expect("conversation");
 
     let request = CreateSandboxRequest {
+        tcp_ports: vec![],
         name: Some("worker".to_string()),
         provider: SandboxProvider::LocalProcess,
         image: "basic-local-process".to_string(),
@@ -1625,6 +1649,7 @@ async fn basic_backend_reuses_named_sandbox() {
         default_workdir: Some(tempdir.path().display().to_string()),
         file_system_mounts: None,
         durable_file_systems: None,
+        policy: None,
         enable_networking: Some(true),
         idle_seconds: Some(60),
     };
@@ -1656,6 +1681,7 @@ async fn basic_backend_reattaches_running_sandbox_in_new_harness_process() {
         .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -1670,6 +1696,7 @@ async fn basic_backend_reattaches_running_sandbox_in_new_harness_process() {
 
     let sandbox_id = conversation
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "basic-local-process".to_string(),
@@ -1677,6 +1704,7 @@ async fn basic_backend_reattaches_running_sandbox_in_new_harness_process() {
             default_workdir: Some(tempdir.path().display().to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
@@ -1739,6 +1767,7 @@ async fn basic_backend_exposes_process_events_and_input() {
         .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -1750,6 +1779,7 @@ async fn basic_backend_exposes_process_events_and_input() {
         .expect("conversation");
     let sandbox_id = conversation
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "basic-local-process".to_string(),
@@ -1757,6 +1787,7 @@ async fn basic_backend_exposes_process_events_and_input() {
             default_workdir: Some(tempdir.path().display().to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
@@ -1865,6 +1896,7 @@ async fn basic_backend_records_process_name_metadata() {
         .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -1876,6 +1908,7 @@ async fn basic_backend_records_process_name_metadata() {
         .expect("conversation");
     let sandbox_id = conversation
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: Some("service-test".to_string()),
             provider: SandboxProvider::LocalProcess,
             image: "basic-local-process".to_string(),
@@ -1883,6 +1916,7 @@ async fn basic_backend_records_process_name_metadata() {
             default_workdir: Some(tempdir.path().display().to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
@@ -2070,6 +2104,7 @@ async fn wait_sandbox_process_returns_after_concurrent_completion() {
 async fn test_conversation(harness: &BasicExoHarness) -> Arc<dyn crate::ConversationHandle> {
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -2084,6 +2119,7 @@ async fn test_conversation(harness: &BasicExoHarness) -> Arc<dyn crate::Conversa
 async fn test_sandbox(conversation: &Arc<dyn crate::ConversationHandle>) -> String {
     conversation
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::LocalProcess,
             image: "test-sandbox".to_string(),
@@ -2091,25 +2127,12 @@ async fn test_sandbox(conversation: &Arc<dyn crate::ConversationHandle>) -> Stri
             default_workdir: Some("/".to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
         .await
         .expect("sandbox should be created")
-}
-
-#[test]
-fn create_sandbox_request_requires_provider() {
-    let error = serde_json::from_value::<CreateSandboxRequest>(serde_json::json!({
-        "image": "test-sandbox",
-        "default_workdir": "/",
-        "file_system_mounts": null,
-        "enable_networking": true,
-        "idle_seconds": 60,
-    }))
-    .expect_err("provider should be required");
-
-    assert!(error.to_string().contains("missing field `provider`"));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -2120,6 +2143,7 @@ async fn basic_backend_rejects_daytona_provider() {
         .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -2132,6 +2156,7 @@ async fn basic_backend_rejects_daytona_provider() {
 
     let error = conversation
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::Daytona,
             image: "test-sandbox".to_string(),
@@ -2139,6 +2164,7 @@ async fn basic_backend_rejects_daytona_provider() {
             default_workdir: Some("/".to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
@@ -2160,6 +2186,7 @@ async fn advertised_daytona_without_secret_errors_at_first_use() {
         .expect("harness should initialize without any daytona secret set");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -2172,6 +2199,7 @@ async fn advertised_daytona_without_secret_errors_at_first_use() {
 
     let error = conversation
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: None,
             provider: SandboxProvider::Daytona,
             image: "test-sandbox".to_string(),
@@ -2179,6 +2207,7 @@ async fn advertised_daytona_without_secret_errors_at_first_use() {
             default_workdir: Some("/".to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
@@ -2196,12 +2225,43 @@ async fn sandbox_provider_state_persists_through_events_after_harness_reload() {
         "endpoint": "https://example.com"
     });
     let first_backend = Arc::new(TestProviderStateBackend::new(state.clone()));
-    let harness =
-        BasicExoHarness::new_with_sandbox_backend(local_test_config(tempdir.path()), first_backend)
-            .await
-            .expect("harness should initialize");
+    let policy = crate::EgressPolicy {
+        allowed_tcp_ports: None,
+        networking: SandboxNetworkPolicy::Limited {
+            allowed_hosts: vec!["api.example.com".into()],
+        },
+        credentials: vec![crate::EgressCredentialBinding {
+            name: "thread-credential".into(),
+            environment_variable: "API_KEY".into(),
+            networking: crate::CredentialNetworkPolicy::Limited {
+                allowed_hosts: vec!["api.example.com".into()],
+            },
+            injection_location: crate::CredentialInjectionLocation { header: true },
+        }],
+    };
+    let mut config = local_test_config(tempdir.path());
+    config.sandbox_policy = Some(policy.clone());
+    let harness = BasicExoHarness::new_with_sandbox_backend(config, first_backend.clone())
+        .await
+        .expect("harness should initialize");
+    crate::vault::global_vault(&harness)
+        .await
+        .unwrap()
+        .put_secret(PutSecretRequest {
+            name: "thread-credential".into(),
+            policy: Some(
+                (crate::vault::CredentialDestination::origin("https://api.example.com").unwrap())
+                    .into(),
+            ),
+            secret: Secret::Key {
+                value: "test-token".into(),
+            },
+        })
+        .await
+        .unwrap();
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -2244,11 +2304,17 @@ async fn sandbox_provider_state_persists_through_events_after_harness_reload() {
         .await
         .expect("conversation lookup should succeed")
         .expect("conversation should exist");
+    assert_eq!(*first_backend.policies.lock().await, vec![policy.clone()]);
+    let mut request = provider_state_test_create_request();
+    request.policy = Some(policy.clone());
     let reused_sandbox_id = reloaded_conversation
-        .create_sandbox(provider_state_test_create_request())
+        .create_sandbox(request.clone())
         .await
         .expect("sandbox should be reused");
     assert_eq!(reused_sandbox_id, sandbox_id);
+    assert_eq!(*second_backend.policies.lock().await, vec![policy]);
+    request.policy.as_mut().unwrap().credentials.clear();
+    assert!(reloaded_conversation.create_sandbox(request).await.is_err());
     assert_eq!(
         second_backend.requests.lock().await.as_slice(),
         &[Some(state)]
@@ -2268,6 +2334,7 @@ async fn deleting_conversation_terminates_persisted_sandbox_after_harness_reload
             .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -2315,6 +2382,7 @@ async fn deleting_conversation_terminates_persisted_sandbox_after_harness_reload
 
 fn provider_state_test_create_request() -> CreateSandboxRequest {
     CreateSandboxRequest {
+        tcp_ports: vec![],
         name: Some("stateful".to_string()),
         provider: SandboxProvider::LocalProcess,
         image: "test-sandbox".to_string(),
@@ -2322,6 +2390,7 @@ fn provider_state_test_create_request() -> CreateSandboxRequest {
         default_workdir: Some("/".to_string()),
         file_system_mounts: None,
         durable_file_systems: None,
+        policy: None,
         enable_networking: Some(true),
         idle_seconds: Some(60),
     }
@@ -2330,6 +2399,7 @@ fn provider_state_test_create_request() -> CreateSandboxRequest {
 struct TestProviderStateBackend {
     state: Value,
     requests: Arc<AsyncMutex<Vec<Option<Value>>>>,
+    policies: Arc<AsyncMutex<Vec<crate::EgressPolicy>>>,
     cleanup_count: Arc<AsyncMutex<usize>>,
 }
 
@@ -2338,6 +2408,7 @@ impl TestProviderStateBackend {
         Self {
             state,
             requests: Arc::new(AsyncMutex::new(Vec::new())),
+            policies: Arc::new(AsyncMutex::new(Vec::new())),
             cleanup_count: Arc::new(AsyncMutex::new(0)),
         }
     }
@@ -2357,6 +2428,7 @@ impl ManagedSandboxBackend for TestProviderStateBackend {
         &self,
         request: SandboxRequest,
     ) -> crate::Result<Arc<dyn ManagedSandboxHandle>> {
+        self.policies.lock().await.push(request.spec.policy.clone());
         self.requests.lock().await.push(request.provider_state);
         Ok(Arc::new(TestProviderStateHandle {
             state: self.state.clone(),
@@ -2582,6 +2654,7 @@ async fn restored_sandbox_image_persists_for_cross_process_reattach() {
             .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -2590,6 +2663,7 @@ async fn restored_sandbox_image_persists_for_cross_process_reattach() {
     let agent_id = agent.record().id;
 
     let create_request = CreateSandboxRequest {
+        tcp_ports: vec![],
         name: Some("agent-sandbox".to_string()),
         provider: SandboxProvider::LocalProcess,
         image: "original-image".to_string(),
@@ -2597,6 +2671,7 @@ async fn restored_sandbox_image_persists_for_cross_process_reattach() {
         default_workdir: Some("/".to_string()),
         file_system_mounts: None,
         durable_file_systems: None,
+        policy: None,
         enable_networking: Some(true),
         idle_seconds: Some(60),
     };
@@ -2658,6 +2733,7 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
     .expect("harness should initialize");
     let agent = harness
         .new_agent(NewAgentRequest {
+            vaults: vec![],
             slug: "agent".to_string(),
             name: "Agent".to_string(),
         })
@@ -2667,6 +2743,7 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
 
     let source_id = agent
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: Some("source".to_string()),
             provider: SandboxProvider::LocalProcess,
             image: "original-image".to_string(),
@@ -2674,6 +2751,7 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
             default_workdir: Some("/".to_string()),
             file_system_mounts: None,
             durable_file_systems: None,
+            policy: None,
             enable_networking: Some(true),
             idle_seconds: Some(60),
         })
@@ -2686,6 +2764,7 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
     first_backend.acquired_images.lock().await.clear();
 
     let target_request = CreateSandboxRequest {
+        tcp_ports: vec![],
         name: Some("target".to_string()),
         provider: SandboxProvider::LocalProcess,
         image: "original-image".to_string(),
@@ -2693,6 +2772,7 @@ async fn restore_sandbox_creates_a_new_target_without_a_cold_acquire() {
         default_workdir: Some("/".to_string()),
         file_system_mounts: None,
         durable_file_systems: None,
+        policy: None,
         enable_networking: Some(true),
         idle_seconds: Some(60),
     };
@@ -2833,8 +2913,11 @@ async fn daytona_sandbox_binding_drives_provider_config() {
             .is_none()
     );
 
-    let secret_id = harness
+    let secret_id = crate::vault::global_vault(&harness)
+        .await
+        .expect("runtime vault")
         .put_secret(PutSecretRequest {
+            policy: None,
             name: "DAYTONA_API_KEY".to_string(),
             secret: Secret::Key {
                 value: "key-123".to_string(),
@@ -2846,7 +2929,14 @@ async fn daytona_sandbox_binding_drives_provider_config() {
         .put_binding(Binding::Sandbox {
             name: "daytona".to_string(),
             config: SandboxProviderConfig::Daytona {
-                api_key_secret_id: secret_id,
+                api_key_secret: crate::vault::SecretReference {
+                    vault_id: crate::vault::global_vault(&harness)
+                        .await
+                        .unwrap()
+                        .record()
+                        .id,
+                    secret_id,
+                },
                 region: Some("experimental".to_string()),
                 organization_id: Some("org-1".to_string()),
                 api_url: None,
@@ -2865,4 +2955,33 @@ async fn daytona_sandbox_binding_drives_provider_config() {
     assert_eq!(config.target.as_deref(), Some("experimental"));
     assert_eq!(config.organization_id.as_deref(), Some("org-1"));
     assert_eq!(config.api_url, crate::DEFAULT_DAYTONA_API_URL);
+}
+
+#[tokio::test]
+async fn local_process_sandbox_rejects_disabled_networking() {
+    let backend = crate::LocalProcessSandboxBackend::new();
+    let result = backend
+        .acquire(crate::SandboxRequest {
+            sandbox_id: "disabled-network".into(),
+            scope: crate::ResourceScope::Global,
+            provider_state: None,
+            spec: crate::SandboxSpec {
+                tcp_ports: vec![],
+                image: String::new(),
+                resources: Default::default(),
+                mounts: vec![],
+                durable_file_systems: vec![],
+                default_workdir: "/tmp".into(),
+                policy: crate::SandboxNetworkPolicy::Disabled.into(),
+            },
+            lifecycle: crate::SandboxLifecycleConfig::default(),
+        })
+        .await;
+    assert!(
+        result
+            .err()
+            .expect("disabled networking must be rejected")
+            .to_string()
+            .contains("policy.networking.disabled")
+    );
 }

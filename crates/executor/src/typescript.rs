@@ -8,18 +8,18 @@ use std::time::Duration;
 use anyhow::{Context as AnyhowContext, anyhow, bail};
 use async_trait::async_trait;
 use exoharness::{
-    AddEventsRequest, AgentHandle, AgentId, BasicExoHarness, BasicExoHarnessConfig,
-    CancelSandboxProcessRequest, CloseSandboxProcessInputRequest, ConversationHandle,
-    ConversationId, EventData, EventKind, EventQuery, EventQueryDirection, ExoHarness,
-    GetSandboxProcessEventsResult, Result, SandboxId, SandboxProcessEvent,
-    SandboxProcessEventQuery, SandboxProcessId, SandboxProcessLifecycle, SandboxProcessMode,
-    SandboxProcessStatus, SandboxProcessStdin, StartSandboxProcessRequest, ToolArguments,
-    ToolRequest, ToolResult, TurnHandle, WriteSandboxProcessInputRequest,
+    AddEventsRequest, AgentHandle, AgentId, CancelSandboxProcessRequest,
+    CloseSandboxProcessInputRequest, ConversationHandle, ConversationId, EventData, EventKind,
+    EventQuery, EventQueryDirection, ExoHarness, GetSandboxProcessEventsResult, Result, SandboxId,
+    SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessId, SandboxProcessLifecycle,
+    SandboxProcessMode, SandboxProcessStatus, SandboxProcessStdin, StartSandboxProcessRequest,
+    ToolArguments, ToolRequest, ToolResult, TurnHandle, WriteSandboxProcessInputRequest,
     protocol::{
         ConversationHandleInfo, Request as ExoRequest, Response as ExoResponse, TurnHandleInfo,
     },
     server::ExoHarnessServer,
 };
+use futures::{StreamExt, stream::FuturesUnordered};
 use lingua::UniversalStreamChunk;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter, Lines};
@@ -28,14 +28,10 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::execution_tracing::TurnExecutionTrace;
-use crate::harness_executor::{ExecutorHarnessRuntime, ExecutorStreamMode, HarnessExecutor};
-use crate::harness_facade::{SharedHarness, SharedHarnessBacked};
-use crate::harness_tool::{BasicToolRuntime, ExoToolRuntime, ensure_shell_sandbox};
+use crate::harness_executor::{ExecutorStreamMode, HarnessExecutor};
+use crate::harness_tool::ensure_shell_sandbox;
 use crate::shared::try_send_stream_event;
-use crate::{
-    AgentConfig, BraintrustRuntimeConfig, ConversationConfig, ExecutionStreamEvent, SendRequest,
-    ToolRuntime,
-};
+use crate::{AgentConfig, ConversationConfig, ExecutionStreamEvent, SendRequest, ToolRuntime};
 
 pub struct TypeScriptExecutor<T> {
     root: Arc<dyn ExoHarness>,
@@ -62,24 +58,49 @@ impl<T> TypeScriptExecutor<T> {
     }
 }
 
-impl<T> Clone for TypeScriptExecutor<T> {
-    fn clone(&self) -> Self {
-        Self {
-            root: Arc::clone(&self.root),
-            workspace_root: self.workspace_root.clone(),
-            env: Arc::clone(&self.env),
-            tools: Arc::clone(&self.tools),
-            runners: Arc::clone(&self.runners),
-        }
-    }
-}
-
 #[async_trait]
 impl<T> HarnessExecutor for TypeScriptExecutor<T>
 where
     T: ToolRuntime + 'static,
 {
-    type Prepared = SendRequest;
+    fn name(&self) -> &'static str {
+        "typescript"
+    }
+
+    fn can_reconcile_unresolved_tool_call(&self, config: &AgentConfig) -> bool {
+        config.typescript.is_some()
+    }
+
+    async fn cancel_turn(
+        &self,
+        thread: &dyn ConversationHandle,
+        config: &AgentConfig,
+    ) -> Result<()> {
+        let module = config
+            .typescript
+            .as_ref()
+            .ok_or_else(|| anyhow!("missing TypeScript module"))?;
+        let key = format!("{}:{}", thread.record().id, module.module_path);
+        let runner = self.runners.lock().await.remove(&key);
+        if let Some(runner) = runner {
+            runner.lock().await.shutdown().await?;
+        }
+        Ok(())
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        let runners = std::mem::take(&mut *self.runners.lock().await);
+        let results = futures::future::join_all(
+            runners
+                .into_values()
+                .map(|runner| async move { runner.lock().await.shutdown().await }),
+        )
+        .await;
+        for result in results {
+            result?;
+        }
+        Ok(())
+    }
 
     async fn prepare_conversation(
         &self,
@@ -93,22 +114,64 @@ where
             .await
     }
 
-    fn prepare_request(&self, request: &SendRequest) -> Result<Self::Prepared> {
-        Ok(request.clone())
-    }
-
     async fn execute_turn(
         &self,
         agent: &dyn AgentHandle,
-        conversation: &dyn ConversationHandle,
+        conversation: Arc<dyn ConversationHandle>,
         turn: Arc<dyn TurnHandle>,
         agent_config: &AgentConfig,
         conversation_config: &ConversationConfig,
-        prepared: &Self::Prepared,
+        prepared: &SendRequest,
         stream_mode: ExecutorStreamMode<'_>,
         turn_trace: Option<&dyn TurnExecutionTrace>,
     ) -> Result<()> {
-        let module_path = agent_config
+        self.run_turn(TypeScriptTurn {
+            agent,
+            conversation,
+            turn,
+            agent_config,
+            conversation_config,
+            prepared,
+            stream_mode,
+            turn_trace,
+            recovering: false,
+        })
+        .await
+    }
+
+    async fn resume_turn(
+        &self,
+        agent: &dyn AgentHandle,
+        conversation: Arc<dyn ConversationHandle>,
+        turn: Arc<dyn TurnHandle>,
+        agent_config: &AgentConfig,
+        conversation_config: &ConversationConfig,
+        prepared: &SendRequest,
+        stream_mode: ExecutorStreamMode<'_>,
+        turn_trace: Option<&dyn TurnExecutionTrace>,
+    ) -> Result<()> {
+        self.run_turn(TypeScriptTurn {
+            agent,
+            conversation,
+            turn,
+            agent_config,
+            conversation_config,
+            prepared,
+            stream_mode,
+            turn_trace,
+            recovering: true,
+        })
+        .await
+    }
+}
+
+impl<T> TypeScriptExecutor<T>
+where
+    T: ToolRuntime + 'static,
+{
+    async fn run_turn(&self, turn: TypeScriptTurn<'_>) -> Result<()> {
+        let module_path = turn
+            .agent_config
             .typescript
             .as_ref()
             .map(|config| config.module_path.clone())
@@ -117,41 +180,32 @@ where
             bail!("typescript harness module does not exist: {module_path}");
         }
 
-        let runner = self.runner(&module_path).await?;
+        let key = format!("{}:{}", turn.conversation.record().id, module_path);
+        let runner = self
+            .runner(&key, &module_path, Arc::clone(&turn.conversation))
+            .await?;
         let result = {
             let mut runner = runner.lock().await;
-            runner
-                .execute_turn(
-                    self,
-                    TypeScriptTurn {
-                        agent,
-                        conversation,
-                        turn,
-                        agent_config,
-                        conversation_config,
-                        prepared,
-                        stream_mode,
-                        turn_trace,
-                    },
-                )
-                .await
+            runner.execute_turn(self, turn).await
         };
 
         if result.is_err() {
-            self.remove_runner(&module_path, &runner).await;
+            self.remove_runner(&key, &runner).await;
+            if let Err(error) = runner.lock().await.shutdown().await {
+                tracing::warn!(%error, "failed to stop TypeScript runner after a failed turn");
+            }
         }
 
         result
     }
-}
-
-impl<T> TypeScriptExecutor<T>
-where
-    T: ToolRuntime + 'static,
-{
-    async fn runner(&self, module_path: &str) -> Result<Arc<Mutex<TypeScriptRunnerProcess>>> {
+    async fn runner(
+        &self,
+        key: &str,
+        module_path: &str,
+        thread: Arc<dyn ConversationHandle>,
+    ) -> Result<Arc<Mutex<TypeScriptRunnerProcess>>> {
         let mut runners = self.runners.lock().await;
-        if let Some(runner) = runners.get(module_path) {
+        if let Some(runner) = runners.get(key) {
             return Ok(Arc::clone(runner));
         }
 
@@ -159,8 +213,9 @@ where
             &self.workspace_root,
             self.env.as_ref(),
             module_path,
+            thread,
         )?));
-        runners.insert(module_path.to_string(), Arc::clone(&runner));
+        runners.insert(key.to_string(), Arc::clone(&runner));
         Ok(runner)
     }
 
@@ -181,8 +236,28 @@ where
         conversation_config: &ConversationConfig,
         turn: Arc<dyn TurnHandle>,
         request: RuntimeRequest,
+        stream_mode: ExecutorStreamMode<'_>,
     ) -> Result<RuntimeResponsePayload> {
+        if let RuntimeRequest::ExecuteTool { request } | RuntimeRequest::AuthorizeTool { request } =
+            &request
+        {
+            crate::permissions::authorize(
+                conversation,
+                turn.as_ref(),
+                self.tools
+                    .permission_policy(&conversation_config.permissions, &request.function_name),
+                None,
+                None,
+                false,
+                request,
+                stream_mode,
+            )
+            .await?;
+        }
         match request {
+            RuntimeRequest::AuthorizeTool { .. } => Ok(RuntimeResponsePayload::ToolResult {
+                result: serde_json::Value::Null,
+            }),
             RuntimeRequest::ExecuteTool { request } => Ok(RuntimeResponsePayload::ToolResult {
                 result: self
                     .tools
@@ -209,6 +284,7 @@ where
 const RUNNER_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 struct TypeScriptRunnerProcess {
+    thread: Arc<dyn ConversationHandle>,
     child: Child,
     host_tx: mpsc::UnboundedSender<HostToGuestMessage>,
     lines: Lines<BufReader<ChildStdout>>,
@@ -235,20 +311,42 @@ struct TypeScriptSandboxProcessReuseEvent {
 
 struct TypeScriptTurn<'a> {
     agent: &'a dyn AgentHandle,
-    conversation: &'a dyn ConversationHandle,
+    conversation: Arc<dyn ConversationHandle>,
     turn: Arc<dyn TurnHandle>,
     agent_config: &'a AgentConfig,
     conversation_config: &'a ConversationConfig,
     prepared: &'a SendRequest,
     stream_mode: ExecutorStreamMode<'a>,
     turn_trace: Option<&'a dyn TurnExecutionTrace>,
+    recovering: bool,
 }
 
 impl TypeScriptRunnerProcess {
+    async fn shutdown(&mut self) -> Result<()> {
+        let child_result = self.child.kill().await;
+        let processes = std::mem::take(&mut self.sandbox_processes);
+        let results = futures::future::join_all(processes.into_values().map(|process| {
+            process.event_task.abort();
+            self.thread
+                .cancel_sandbox_process(CancelSandboxProcessRequest {
+                    sandbox_id: process.sandbox_id,
+                    process_id: process.process_id,
+                    signal: None,
+                })
+        }))
+        .await;
+        child_result?;
+        for result in results {
+            result?;
+        }
+        Ok(())
+    }
+
     fn start(
         workspace_root: &Path,
         env: &HashMap<String, String>,
         module_path: &str,
+        thread: Arc<dyn ConversationHandle>,
     ) -> Result<Self> {
         let runner_path = workspace_root
             .join("exoharness")
@@ -262,13 +360,14 @@ impl TypeScriptRunnerProcess {
             );
         }
 
-        let mut child = Command::new("node")
+        let mut command = Command::new("node");
+        command.envs(env);
+        let mut child = command
             .arg("--import")
             .arg("tsx")
             .arg(&runner_path)
             .arg(module_path)
             .current_dir(workspace_root)
-            .envs(env.iter())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -309,6 +408,7 @@ impl TypeScriptRunnerProcess {
 
         Ok(Self {
             child,
+            thread,
             host_tx,
             lines: BufReader::new(stdout).lines(),
             stderr_task: Some(stderr_task),
@@ -328,14 +428,16 @@ impl TypeScriptRunnerProcess {
     {
         let TypeScriptTurn {
             agent,
-            conversation,
+            conversation: conversation_arc,
             turn,
             agent_config,
             conversation_config,
             prepared,
             stream_mode,
             turn_trace,
+            recovering,
         } = turn;
+        let conversation = conversation_arc.as_ref();
         let exoharness_server = ExoHarnessServer::new(Arc::clone(&executor.root));
         let conversation_info = ConversationHandleInfo {
             agent_id: agent.record().id,
@@ -356,14 +458,22 @@ impl TypeScriptRunnerProcess {
                     conversation_config: conversation_config.clone(),
                     request: prepared.clone(),
                     streaming: matches!(stream_mode, ExecutorStreamMode::Enabled(_)),
+                    recovering,
+                    tools: executor.tools.definitions(),
+                    mcp_servers: executor.tools.mcp_servers(conversation).await?,
                     braintrust_parent: turn_trace.and_then(TurnExecutionTrace::export_parent),
                 }),
             },
         )?;
 
+        let mut tool_requests = FuturesUnordered::new();
         loop {
             tokio::select! {
                 biased;
+
+                Some(response) = tool_requests.next(), if !tool_requests.is_empty() => {
+                    send_host_message(&self.host_tx, response)?;
+                }
 
                 line = self.lines.next_line() => {
                     let Some(line) = line? else {
@@ -382,8 +492,22 @@ impl TypeScriptRunnerProcess {
                     match message {
                         GuestToHostMessage::RuntimeRequest { id, request } => {
                             let request_kind = request.kind();
-                            let response = self
-                                .execute_runtime_request(
+                            if matches!(request, RuntimeRequest::ExecuteTool { .. } | RuntimeRequest::AuthorizeTool { .. }) {
+                                let turn = Arc::clone(&turn);
+                                tool_requests.push(async move {
+                                    let response = executor.execute_runtime_request(
+                                        agent,
+                                        conversation,
+                                        agent_config,
+                                        conversation_config,
+                                        turn,
+                                        request,
+                                        stream_mode,
+                                    ).await;
+                                    runtime_response(id, request_kind, response)
+                                });
+                            } else {
+                                let response = self.execute_runtime_request(
                                     executor,
                                     agent,
                                     conversation,
@@ -391,30 +515,25 @@ impl TypeScriptRunnerProcess {
                                     conversation_config,
                                     Arc::clone(&turn),
                                     request,
-                                )
-                                .await;
-                            let response = match response {
-                                Ok(payload) => HostToGuestMessage::RuntimeResponse {
-                                    id,
-                                    ok: true,
-                                    payload: Some(payload),
-                                    error: None,
-                                },
-                                Err(error) => HostToGuestMessage::RuntimeResponse {
-                                    id,
-                                    ok: false,
-                                    payload: None,
-                                    error: Some(format_error_chain(
-                                        &error,
-                                        format_args!("typescript runtime request `{request_kind}` failed"),
-                                    )),
-                                },
-                            };
-                            send_host_message(&self.host_tx, response)?;
+                                    stream_mode,
+                                ).await;
+                                send_host_message(&self.host_tx, runtime_response(id, request_kind, response))?;
+                            }
                         }
                         GuestToHostMessage::ExoRequest { id, request } => {
                             let request_kind = request.kind();
-                            let response = match exoharness_server.handle_request(request).await {
+                            let result = match *request {
+                                ExoRequest::TurnAddEvents { agent_id, conversation_id, session_id, turn_id, data }
+                                    if agent_id == agent.record().id
+                                        && conversation_id == conversation.record().id
+                                        && session_id == turn.record().session_id
+                                        && turn_id == turn.record().id =>
+                                {
+                                    turn.add_events(data).await.map(|result| ExoResponse::AddEvents { result })
+                                }
+                                request => exoharness_server.handle_request(request).await,
+                            };
+                            let response = match result {
                                 Ok(response) => HostToGuestMessage::ExoResponse {
                                     id,
                                     ok: true,
@@ -468,12 +587,14 @@ impl TypeScriptRunnerProcess {
         conversation_config: &ConversationConfig,
         turn: Arc<dyn TurnHandle>,
         request: RuntimeRequest,
+        stream_mode: ExecutorStreamMode<'_>,
     ) -> Result<RuntimeResponsePayload>
     where
         T: ToolRuntime + 'static,
     {
         match request {
-            RuntimeRequest::ExecuteTool { request } => {
+            request @ (RuntimeRequest::ExecuteTool { .. }
+            | RuntimeRequest::AuthorizeTool { .. }) => {
                 executor
                     .execute_runtime_request(
                         agent,
@@ -481,7 +602,8 @@ impl TypeScriptRunnerProcess {
                         agent_config,
                         conversation_config,
                         Arc::clone(&turn),
-                        RuntimeRequest::ExecuteTool { request },
+                        request,
+                        stream_mode,
                     )
                     .await
             }
@@ -817,97 +939,11 @@ where
     }
 }
 
-pub struct TypeScriptHarness<T> {
-    inner: SharedHarness<ExecutorHarnessRuntime<TypeScriptExecutor<T>>>,
-}
-
-impl<T> TypeScriptHarness<T> {
-    pub fn new(exoharness: Arc<dyn ExoHarness>, workspace_root: PathBuf, tools: Arc<T>) -> Self
-    where
-        T: ToolRuntime + 'static,
-    {
-        let runtime = ExecutorHarnessRuntime::new(
-            TypeScriptExecutor::new(
-                Arc::clone(&exoharness),
-                workspace_root,
-                HashMap::new(),
-                tools,
-            ),
-            None,
-        );
-        Self {
-            inner: SharedHarness::new(exoharness, runtime),
-        }
-    }
-}
-
-impl TypeScriptHarness<BasicToolRuntime> {
-    pub fn from_exoharness(
-        exoharness: Arc<dyn ExoHarness>,
-        runtime_config: Option<BraintrustRuntimeConfig>,
-        env: HashMap<String, String>,
-    ) -> Result<Self> {
-        let workspace_root = std::env::current_dir()
-            .context("failed to resolve current directory for TypeScript harness")?;
-        let tools = Arc::new(BasicToolRuntime);
-        let runtime = ExecutorHarnessRuntime::new(
-            TypeScriptExecutor::new(Arc::clone(&exoharness), workspace_root, env, tools),
-            runtime_config,
-        );
-        Ok(Self {
-            inner: SharedHarness::new(exoharness, runtime),
-        })
-    }
-
-    pub async fn from_config(
-        exo_config: BasicExoHarnessConfig,
-        runtime_config: Option<BraintrustRuntimeConfig>,
-        env: HashMap<String, String>,
-    ) -> Result<Self> {
-        Self::from_exoharness(
-            Arc::new(BasicExoHarness::new(exo_config).await?),
-            runtime_config,
-            env,
-        )
-    }
-}
-
-impl TypeScriptHarness<ExoToolRuntime> {
-    pub async fn exo_from_root(
-        root: impl AsRef<Path>,
-        exo_config: BasicExoHarnessConfig,
-        runtime_config: Option<BraintrustRuntimeConfig>,
-        env: HashMap<String, String>,
-    ) -> Result<Self> {
-        let workspace_root = std::env::current_dir()
-            .context("failed to resolve current directory for Exo harness")?;
-        let root = root.as_ref();
-        let exoharness: Arc<dyn ExoHarness> = Arc::new(BasicExoHarness::new(exo_config).await?);
-        let adapter_worker_root = workspace_root.join("exo/adapters");
-        let tools = Arc::new(ExoToolRuntime::with_roots(
-            root.join("scheduled-tasks"),
-            root.join("adapters"),
-            adapter_worker_root,
-        ));
-        let runtime = ExecutorHarnessRuntime::new(
-            TypeScriptExecutor::new(Arc::clone(&exoharness), workspace_root, env, tools),
-            runtime_config,
-        );
-        Ok(Self {
-            inner: SharedHarness::new(exoharness, runtime),
-        })
-    }
-}
-
-impl<T> SharedHarnessBacked for TypeScriptHarness<T>
-where
-    T: ToolRuntime + 'static,
-{
-    type Runtime = ExecutorHarnessRuntime<TypeScriptExecutor<T>>;
-
-    fn shared_harness(&self) -> &SharedHarness<Self::Runtime> {
-        &self.inner
-    }
+pub(crate) fn typescript_workspace_root() -> Result<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .context("failed to resolve Exo installation for TypeScript harness")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -981,6 +1017,30 @@ fn undecodable_message_response(line: &str, detail: String) -> Option<HostToGues
     }
 }
 
+fn runtime_response(
+    id: u64,
+    request_kind: &str,
+    response: Result<RuntimeResponsePayload>,
+) -> HostToGuestMessage {
+    match response {
+        Ok(payload) => HostToGuestMessage::RuntimeResponse {
+            id,
+            ok: true,
+            payload: Some(payload),
+            error: None,
+        },
+        Err(error) => HostToGuestMessage::RuntimeResponse {
+            id,
+            ok: false,
+            payload: None,
+            error: Some(format_error_chain(
+                &error,
+                format_args!("typescript runtime request `{request_kind}` failed"),
+            )),
+        },
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum GuestToHostMessage {
@@ -990,7 +1050,7 @@ enum GuestToHostMessage {
     },
     ExoRequest {
         id: u64,
-        request: ExoRequest,
+        request: Box<ExoRequest>,
     },
     StreamEvent {
         event: TypeScriptStreamEvent,
@@ -1004,6 +1064,8 @@ enum GuestToHostMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TypeScriptInitPayload {
+    mcp_servers: Vec<crate::NativeMcpServer>,
+    tools: Vec<crate::ToolDefinition>,
     agent: exoharness::AgentRecord,
     conversation: ConversationHandleInfo,
     turn: TurnHandleInfo,
@@ -1011,12 +1073,16 @@ struct TypeScriptInitPayload {
     conversation_config: ConversationConfig,
     request: SendRequest,
     streaming: bool,
+    recovering: bool,
     braintrust_parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RuntimeRequest {
+    AuthorizeTool {
+        request: ToolRequest,
+    },
     ExecuteTool {
         request: ToolRequest,
     },
@@ -1040,6 +1106,7 @@ enum RuntimeRequest {
 impl RuntimeRequest {
     fn kind(&self) -> &'static str {
         match self {
+            Self::AuthorizeTool { .. } => "authorize_tool",
             Self::ExecuteTool { .. } => "execute_tool",
             Self::StartSandboxProcess { .. } => "start_sandbox_process",
             Self::WriteSandboxProcessStdin { .. } => "write_sandbox_process_stdin",
@@ -1302,6 +1369,420 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use super::*;
+
+    #[tokio::test]
+    async fn recovery_calls_typescript_resume_turn_instead_of_run_turn() -> Result<()> {
+        use crate::{BasicToolRuntime, LocalProvider, Runtime, test_support::local_test_config};
+        use exoharness::{BasicExoHarness, BeginTurnRequest, NewAgentRequest};
+
+        let temp = tempfile::TempDir::new()?;
+        let module = temp.path().join("resume-turn.mjs");
+        std::fs::write(
+            &module,
+            r#"
+export default {
+  reconcileUnresolvedToolCalls: true,
+  async runTurn() { throw new Error("runTurn replayed interrupted work"); },
+  async resumeTurn(context) {
+    await context.exoharness.current.turn.addEvents([
+      { type: "tool_result", tool_call_id: "saved-call", result: { ok: true } },
+      { type: "messages", response_id: null,
+        messages: [{ role: "assistant", content: "resumed" }] }
+    ]);
+  }
+};
+"#,
+        )?;
+        let state_path = temp.path().join("state");
+        let state: Arc<dyn ExoHarness> =
+            Arc::new(BasicExoHarness::new(local_test_config(&state_path)).await?);
+        let agent = state
+            .new_agent(NewAgentRequest {
+                slug: "typescript-recovery".into(),
+                name: "TypeScript recovery".into(),
+                vaults: vec![],
+            })
+            .await?;
+        let thread = agent.new_conversation(Default::default()).await?;
+        let agent_id = agent.record().id;
+        let thread_id = thread.record().id;
+        let config: AgentConfig = serde_json::from_value(serde_json::json!({
+            "instructions": [], "harness": "typescript",
+            "typescript": { "module_path": module },
+            "sandbox": { "provider": "local_process" }, "model": "gpt-5-mini"
+        }))?;
+        let work = crate::harness_executor::RecoverableTurn {
+            agent_config: config,
+            thread_config: ConversationConfig::default(),
+            request: SendRequest {
+                input: vec![],
+                session_id: None,
+            },
+        };
+        let turn = thread
+            .begin_turn(BeginTurnRequest {
+                session_id: None,
+                input: vec![],
+                initial_events: vec![
+                    work.event()?,
+                    EventData::ToolRequested {
+                        tool_call_id: "saved-call".into(),
+                        response_id: None,
+                        request: ToolRequest {
+                            namespace: None,
+                            function_name: "shell".into(),
+                            arguments: Default::default(),
+                        },
+                    },
+                ],
+            })
+            .await?;
+        let turn_id = turn.record().id;
+        drop(turn);
+        drop(thread);
+        drop(agent);
+        drop(state);
+
+        let state: Arc<dyn ExoHarness> =
+            Arc::new(BasicExoHarness::new(local_test_config(&state_path)).await?);
+        let runtime = Runtime::new(
+            LocalProvider::typescript(
+                Arc::clone(&state),
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+                HashMap::new(),
+                Arc::new(BasicToolRuntime),
+            ),
+            None,
+        );
+        runtime.recover_unfinished_turns().await?;
+        let agent = state.get_agent(&agent_id).await?.unwrap();
+        let thread = agent.get_thread(&thread_id).await?.unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let events = thread
+                    .get_events(Some(EventQuery {
+                        turn_id: Some(turn_id),
+                        ..Default::default()
+                    }))
+                    .await?
+                    .events;
+                if events
+                    .iter()
+                    .any(|event| matches!(event.data, EventData::TurnEnded))
+                {
+                    return Ok::<_, anyhow::Error>(events);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        assert!(events.iter().any(|event| matches!(
+            &event.data,
+            EventData::Messages { messages, .. }
+                if messages.iter().any(|message| matches!(message, lingua::Message::Assistant { .. }))
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.data,
+            EventData::ToolResult { tool_call_id, .. } if tool_call_id == "saved-call"
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.data, EventData::Error { .. }))
+        );
+        runtime.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unresolved_tool_requires_typescript_recovery_capability() -> Result<()> {
+        use crate::{BasicToolRuntime, LocalProvider, Runtime, test_support::local_test_config};
+        use exoharness::{BasicExoHarness, BeginTurnRequest, NewAgentRequest};
+
+        let temp = tempfile::TempDir::new()?;
+        let module = temp.path().join("no-tool-recovery.mjs");
+        std::fs::write(
+            &module,
+            r#"
+export default {
+  async runTurn() { throw new Error("unexpected runTurn"); },
+  async resumeTurn(context) {
+    await context.exoharness.current.turn.addEvents([
+      { type: "messages", messages: [{ role: "assistant", content: "unsafe replay" }] }
+    ]);
+  }
+};
+"#,
+        )?;
+        let state: Arc<dyn ExoHarness> =
+            Arc::new(BasicExoHarness::new(local_test_config(temp.path().join("state"))).await?);
+        let agent = state
+            .new_agent(NewAgentRequest {
+                slug: "typescript-no-tool-recovery".into(),
+                name: "No tool recovery".into(),
+                vaults: vec![],
+            })
+            .await?;
+        let thread = agent.new_conversation(Default::default()).await?;
+        let config: AgentConfig = serde_json::from_value(serde_json::json!({
+            "instructions": [], "harness": "typescript",
+            "typescript": { "module_path": module },
+            "sandbox": { "provider": "local_process" }, "model": "gpt-5-mini"
+        }))?;
+        let work = crate::harness_executor::RecoverableTurn {
+            agent_config: config,
+            thread_config: ConversationConfig::default(),
+            request: SendRequest {
+                input: vec![],
+                session_id: None,
+            },
+        };
+        let turn = thread
+            .begin_turn(BeginTurnRequest {
+                session_id: None,
+                input: vec![],
+                initial_events: vec![
+                    work.event()?,
+                    EventData::ToolRequested {
+                        tool_call_id: "saved-call".into(),
+                        response_id: None,
+                        request: ToolRequest {
+                            namespace: None,
+                            function_name: "shell".into(),
+                            arguments: Default::default(),
+                        },
+                    },
+                ],
+            })
+            .await?;
+        let turn_id = turn.record().id;
+        let runtime = Runtime::new(
+            LocalProvider::typescript(
+                state,
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+                HashMap::new(),
+                Arc::new(BasicToolRuntime),
+            ),
+            None,
+        );
+        runtime.recover_unfinished_turns().await?;
+        let events = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let events = thread
+                    .get_events(Some(EventQuery {
+                        turn_id: Some(turn_id),
+                        ..Default::default()
+                    }))
+                    .await?
+                    .events;
+                if events
+                    .iter()
+                    .any(|event| matches!(event.data, EventData::TurnEnded))
+                {
+                    return Ok::<_, anyhow::Error>(events);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.data, EventData::Error { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.data, EventData::Messages { .. }))
+        );
+        runtime.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn canonical_turn_events_publish_tool_progress_once() -> Result<()> {
+        use crate::{BasicToolRuntime, LocalProvider, Runtime, test_support::local_test_config};
+        use exoharness::{BasicExoHarness, NewAgentRequest};
+
+        let temp = tempfile::TempDir::new()?;
+        let module = temp.path().join("canonical-events.mjs");
+        std::fs::write(
+            &module,
+            r#"
+export default {
+  async runTurn(context) {
+    await context.exoharness.current.turn.addEvents([
+      { type: "tool_requested", tool_call_id: "call", response_id: null,
+        request: { function_name: "shell", arguments: { command: "pwd" } } },
+      { type: "tool_result", tool_call_id: "call", result: { stdout: "/workspace" } },
+      { type: "messages", response_id: null, messages: [{ role: "assistant", content: "done" }] }
+    ]);
+  }
+};
+"#,
+        )?;
+        let state =
+            Arc::new(BasicExoHarness::new(local_test_config(temp.path().join("state"))).await?);
+        let agent = state
+            .new_agent(NewAgentRequest {
+                slug: "canonical".into(),
+                name: "Canonical".into(),
+                vaults: vec![],
+            })
+            .await?;
+        let thread = agent.new_conversation(Default::default()).await?;
+        let config: AgentConfig = serde_json::from_value(serde_json::json!({
+            "instructions": [], "harness": "typescript",
+            "typescript": { "module_path": module },
+            "sandbox": { "provider": "local_process" }, "model": "gpt-5-mini"
+        }))?;
+        let runtime = Runtime::new(
+            LocalProvider::typescript(
+                state,
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+                HashMap::new(),
+                Arc::new(BasicToolRuntime),
+            ),
+            None,
+        );
+        let (_, mut stream) = runtime
+            .start_turn(
+                agent,
+                thread.clone(),
+                SendRequest {
+                    input: vec![],
+                    session_id: None,
+                },
+                true,
+                Some(config),
+            )
+            .await?;
+        let mut calls = 0;
+        let mut results = 0;
+        let mut completed = false;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = stream.next().await {
+                match event? {
+                    ExecutionStreamEvent::ToolCall { tool_call_id, .. } => {
+                        assert_eq!(tool_call_id, "call");
+                        calls += 1;
+                    }
+                    ExecutionStreamEvent::ToolResult { tool_call_id, .. } => {
+                        assert_eq!(tool_call_id, "call");
+                        results += 1;
+                    }
+                    ExecutionStreamEvent::Completed(_) => completed = true,
+                    _ => {}
+                }
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        runtime.shutdown().await?;
+        assert_eq!((calls, results, completed), (1, 1, true));
+        let history = crate::materialize_conversation_messages(thread.as_ref()).await?;
+        assert_eq!(history.len(), 3);
+        assert!(matches!(history.last(), Some(lingua::Message::Assistant {
+            content: lingua::universal::AssistantContent::String(text), ..
+        }) if text == "done"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approvals_do_not_block_other_requests_output_or_runner_exit() -> Result<()> {
+        use crate::{BasicToolRuntime, test_support::local_test_config};
+        use exoharness::{BasicExoHarness, NewAgentRequest};
+
+        let temp = tempfile::TempDir::new()?;
+        let stop = temp.path().join("stop");
+        let module = temp.path().join("approvals.mjs");
+        std::fs::write(
+            &module,
+            format!(
+                r#"
+import {{ existsSync }} from "node:fs";
+export default {{
+  async runTurn(context) {{
+    const pending = [1, 2].map(() => context.authorizeTool({{
+      functionName: "shell", arguments: {{ command: "true" }}
+    }}));
+    await context.stream.text("waiting for approvals");
+    const timer = setInterval(() => {{
+      if (existsSync({})) process.exit(17);
+    }}, 10);
+    await Promise.all(pending);
+    clearInterval(timer);
+  }}
+}};
+"#,
+                serde_json::to_string(&stop)?
+            ),
+        )?;
+        let state =
+            Arc::new(BasicExoHarness::new(local_test_config(temp.path().join("state"))).await?);
+        let agent = state
+            .new_agent(NewAgentRequest {
+                slug: "approvals".into(),
+                name: "Approvals".into(),
+                vaults: vec![],
+            })
+            .await?;
+        let thread = agent.new_conversation(Default::default()).await?;
+        let turn = thread.begin_turn(Default::default()).await?;
+        let config: AgentConfig = serde_json::from_value(serde_json::json!({
+            "instructions": [],
+            "harness": "typescript",
+            "typescript": {"module_path": module},
+            "sandbox": {"provider": "local_process"},
+            "model": "gpt-5-mini"
+        }))?;
+        let mut conversation_config = ConversationConfig::default();
+        conversation_config.permissions.tool_policies.insert(
+            "shell".into(),
+            exo_managed_agents::permissions::PermissionPolicy::AlwaysAsk {},
+        );
+        let executor = TypeScriptExecutor::new(
+            state,
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."),
+            HashMap::new(),
+            Arc::new(BasicToolRuntime),
+        );
+        let request = SendRequest {
+            input: vec![],
+            session_id: None,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let execution = executor.execute_turn(
+            agent.as_ref(),
+            thread.clone(),
+            turn,
+            &config,
+            &conversation_config,
+            &request,
+            ExecutorStreamMode::Enabled(&tx),
+            None,
+        );
+        tokio::pin!(execution);
+        let mut approvals = 0;
+        let mut streamed = false;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while approvals < 2 || !streamed {
+                tokio::select! {
+                    result = &mut execution => panic!("runner stopped before emitting both approvals and output: {result:?}"),
+                    event = rx.recv() => match event.context("stream closed")?? {
+                        ExecutionStreamEvent::ApprovalRequested { .. } => approvals += 1,
+                        ExecutionStreamEvent::Chunk(_) => streamed = true,
+                        _ => {}
+                    }
+                }
+            }
+            std::fs::write(&stop, "stop")?;
+            let error = execution.await.expect_err("runner exited with approvals pending");
+            assert!(format!("{error:#}").contains("17"), "{error:#}");
+            Ok::<_, anyhow::Error>(())
+        }).await??;
+        Ok(())
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn latest_sandbox_process_event_cursor_pages_to_latest_cursor() {

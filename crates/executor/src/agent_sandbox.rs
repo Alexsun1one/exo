@@ -111,6 +111,7 @@ async fn attach_agent_sandbox(
 ) -> Result<AgentSandboxHandle> {
     let sandbox_id = agent
         .create_sandbox(CreateSandboxRequest {
+            tcp_ports: vec![],
             name: Some(sandbox_name),
             provider: spec.provider.clone(),
             image: spec.image.clone(),
@@ -118,6 +119,7 @@ async fn attach_agent_sandbox(
             default_workdir: Some(spec.default_workdir.clone()),
             file_system_mounts: Some(spec.file_system_mounts.clone()),
             durable_file_systems: Some(spec.durable_file_systems.clone()),
+            policy: None,
             enable_networking: Some(spec.enable_networking),
             idle_seconds: Some(spec.idle_seconds),
         })
@@ -185,6 +187,7 @@ mod tests {
             .unwrap();
         exoharness
             .new_agent(NewAgentRequest {
+                vaults: vec![],
                 slug: "agent".to_string(),
                 name: "Agent".to_string(),
             })
@@ -194,6 +197,10 @@ mod tests {
 
     fn test_agent_config(sandbox: AgentSandboxConfig) -> AgentConfig {
         AgentConfig {
+            credential: Some("test-openai".into()),
+            base_url: None,
+            reasoning_effort: None,
+            resources: Vec::new(),
             instructions: vec![],
             harness: AgentHarnessKind::Exo,
             typescript: None,
@@ -211,7 +218,7 @@ mod tests {
             image: image.map(str::to_string),
             provider: SandboxProvider::LocalProcess,
             mounts: vec![],
-            enable_networking: false,
+            enable_networking: true,
             scope: SandboxScope::Agent,
         }
     }

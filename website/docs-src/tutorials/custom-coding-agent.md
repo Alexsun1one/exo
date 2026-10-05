@@ -224,18 +224,31 @@ export default defineHarness({
 ## Run it
 
 ```bash
-exo --harness typescript agent create "Coder" \
-  --module exoharness/examples/typescript/coding-agent-harness.ts \
-  --model gpt-5.5 \
-  --sandbox-image python:3.12-slim
-exo conversation create coder "Build"
-exo repl --agent coder --conversation coder-build
+cat > coder.md <<'EOF'
+---
+name: "Coder"
+harness: exoharness/examples/typescript/coding-agent-harness.ts
+config:
+  model: gpt-5.5
+  credential: openai
+---
+Help the user with their task.
+EOF
+exo agent create coder --file coder.md
+exo thread create coder "Build" --slug coder-build
+cat > coding-environment.yaml <<'EOF'
+name: coding
+config:
+  provider: docker
+  image: python:3.12-slim
+  enable_networking: true
+EOF
+exo agent run --agent coder --thread coder-build --environment-file coding-environment.yaml
 ```
 
 The default sandbox image is `ubuntu:24.04`, which is bare — no Python,
-Node, etc. Setting `--sandbox-image` on the *agent* makes every
-conversation it owns boot that image; the model installs anything else it
-needs with the shell tool.
+Node, etc. Setting `config.image` in the environment file chooses the image
+for this thread; the model installs anything else it needs with the shell tool.
 
 A real run (via `conversation send`), asking it to write a buggy
 `fizzbuzz.py`, find the bug, and fix it — abbreviated to show the shape:

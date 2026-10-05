@@ -6,6 +6,9 @@ a minimal initramfs. It launches Firecracker only through the matching `jailer` 
 communicates with a static Rust PID 1 over virtio-vsock, and adds a TAP device
 only when the sandbox requests networking.
 
+See [sandbox egress](../../docs/egress.md) for network policies, credential
+substitution, and the Firecracker proxy smoke tests.
+
 ## Compatible host artifact bundle
 
 Install Firecracker, jailer, the guest kernel, and the Exo initramfs as one
@@ -138,6 +141,20 @@ use forks, the guest kernel must additionally be 5.18 or newer with
 `CONFIG_HW_RANDOM_VIRTIO=y` lets the guest draw extra entropy from the
 attached virtio-rng device.
 
+Exo enables dirty-page tracking and captures sparse memory snapshots instead
+of writing the entire configured RAM size. Each capture merges changes into a
+private reflink of the machine's latest captured memory, or its original restore
+template on the first capture. The result is independently restorable. Published
+templates remain read-only and shared by restored VMs; disk and memory are
+captured while the guest is paused.
+
+The latest memory base is retained outside the writable jail, counted against
+the snapshot budget, and removed with the machine. An interrupted capture blocks
+further snapshots until that sandbox is restarted: Firecracker may already have
+cleared dirty bits, so repeating a diff against the previous base would be unsafe.
+Host swap must remain disabled, including when adopting a VM started without
+dirty-page tracking by an older backend.
+
 Install matching official Firecracker and jailer release binaries under
 `/usr/local/bin`, and install the guest kernel at
 `/var/lib/exo/firecracker/vmlinux`. The binaries and all parent directories
@@ -153,62 +170,55 @@ Run Exo as root, select the backend, and configure the provider binding:
 ```bash
 sudo EXO_FIRECRACKER_KERNEL=/var/lib/exo/firecracker/vmlinux \
   EXO_FIRECRACKER_INITRAMFS=/var/lib/exo/firecracker/exo-firecracker-initramfs.cpio \
-  target/debug/exo provider configure \
-  --provider firecracker \
+  target/debug/exo environment provider create \
+  --backend firecracker \
   --default-image 123456789012.dkr.ecr.us-east-1.amazonaws.com/exo-sandbox@sha256:...
 ```
 
-Agents can then select `--provider firecracker`; the Exo CLI and data
-model remain the same as for hosted sandbox providers.
-
-To start an unnamed sandbox and connect a shell in one command, use `sandbox
-play`. It destroys the sandbox when the shell exits:
+Run an agent with the Firecracker backend:
 
 ```bash
-sudo target/debug/exo sandbox play \
-  --provider firecracker \
-  --image 123456789012.dkr.ecr.us-east-1.amazonaws.com/exo-sandbox@sha256:... \
-  --networking enabled \
-  --firecracker-memory-mib 2048 \
-  --firecracker-vcpu-count 2
+sudo target/debug/exo agent run \
+  --agent-file exoharness/examples/managed-agents/exo-developer.md \
+  --sandbox firecracker
 ```
 
-`sandbox start --help` and `sandbox play --help` list every sandbox-creation
-parameter, including the working directory, idle timeout, host mounts, durable
-filesystems, and networking. Their `--firecracker-*` options control the VMM
-and jailer paths, kernel, initramfs, state root, VM sizing, DNS, UID range,
-image/workspace sizes, and network rate limit. The same options live under
-`exo serve` for a persistent backend. The corresponding `EXO_FIRECRACKER_*`
-environment variables remain supported.
+The agent's thread owns its sandbox. In the conversation, `/sandbox COMMAND`
+runs a shell command in that sandbox. Use an environment definition to configure
+its image, working directory, resource limits, mounts, and networking.
 
-For a sandbox that survives between CLI invocations, use the separate lifecycle
-commands. Each command adopts the running Firecracker VM from its persisted
-state:
+`exo serve --help` lists the `--firecracker-*` options for a persistent backend,
+including VMM and jailer paths, kernel, initramfs, state root, VM sizing, DNS,
+UID range, image/workspace sizes, and network rate limits. The corresponding
+`EXO_FIRECRACKER_*` environment variables also work with `exo agent run`.
 
-```bash
-sandbox_id=$(sudo target/debug/exo sandbox start --provider firecracker)
-sudo target/debug/exo sandbox ps
-sudo target/debug/exo sandbox exec "$sandbox_id" -- /bin/echo hello
-sudo target/debug/exo sandbox connect "$sandbox_id"
-sudo target/debug/exo sandbox terminate "$sandbox_id"
+## Resource storage
+
+Filesystem resources require the Firecracker state root to reside on XFS with
+`reflink=1`. Exo verifies the filesystem and probes `cp --reflink=always`; it
+never falls back to a full copy. Resource disks contain ext4 for the guest, while
+XFS on the host supplies copy-on-write cloning. The Linux host needs `git`,
+`xfsprogs`, `e2fsprogs`, and `util-linux`.
+
+On macOS, Exo provisions XFS automatically inside Lima at the configured state
+root (normally `/var/lib/exo/firecracker/state`). The first startup installs
+`xfsprogs` if needed, creates a sparse backing file alongside the state root,
+and preserves existing state in it. The volume is sized to 80% of the VM's
+available disk space at creation; physical storage grows as data is written.
+Subsequent starts reuse it and remount it after a VM reboot. Existing XFS
+storage is used directly. Stop running sandboxes before the first migration.
+
+No storage environment variable or manual mount is needed:
+
+```sh
+exo agent run \
+  --agent-file exoharness/examples/managed-agents/exo-developer.md \
+  --environment-file exoharness/examples/environments/codex-firecracker.yaml
 ```
 
-`connect` streams an interactive shell over stdin/stdout/stderr; the current
-sandbox process API does not provide a PTY. A long-running `exo serve` process
-is still useful when multiple clients need concurrent access to one backend.
-Every lifecycle command accepts `--agent <slug>` to use that agent's sandbox
-scope. Without it, commands share an internal singleton owner intended for
-direct CLI use.
-
-`sandbox ps` shows running sandboxes by default; `-a` includes stopped records,
-and `-q` prints only IDs.
-`stop` and `terminate` accept multiple IDs, so retained sandboxes can be cleaned
-up compositionally:
-
-```bash
-sudo target/debug/exo sandbox ps -aq \
-  | sudo target/debug/exo sandbox terminate
-```
+The rootfs must contain the selected harness. Rebuild the guest initramfs after
+updating Exo. See [resources](../../docs/resources.md) for Git caching,
+credentials, local directory imports, and thread cleanup.
 
 ## Security model
 
@@ -360,7 +370,7 @@ auto-create the instance: it must already exist, so a typo'd
 `EXO_FIRECRACKER_LIMA_INSTANCE` cannot silently provision a default VM that
 mounts your home directory. The Firecracker binaries, kernel, initramfs, and
 state directory remain inside that VM. Run the macOS Exo CLI normally with
-`--provider firecracker`.
+`--sandbox firecracker`.
 
 Use `make restart-firecracker-lima` to restart the outer VM without removing
 Exo state. Use `make clean-firecracker-microvms` to restart it and remove all

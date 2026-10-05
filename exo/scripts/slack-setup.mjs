@@ -112,8 +112,12 @@ for (const [name, definition] of Object.entries(PROFILE_DEFINITIONS)) {
 }
 
 console.log("\nExo secrets:\n");
-console.log("exo secret set slack-signing-secret --value '<signing-secret>'");
-console.log("exo secret set slack-bot-token --value 'xoxb-...'");
+console.log(
+  "exo vault secret create global slack-signing-secret --token-env SLACK_SIGNING_SECRET",
+);
+console.log(
+  "exo vault secret create global slack-bot-token --token-env SLACK_BOT_TOKEN",
+);
 
 function parseArgs(args) {
   let profileName = "dm";

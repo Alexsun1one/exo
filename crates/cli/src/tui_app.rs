@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,8 +11,8 @@ use crossterm::event::{
     EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use executor::{
-    EventId, EventQuery, EventQueryDirection, ExecutionStreamEvent, HarnessAgent,
-    HarnessConversation, SendRequest, SessionId,
+    AgentHandle, ConversationHandle, EventId, EventQuery, EventQueryDirection,
+    ExecutionStreamEvent, Runtime, SendRequest, SessionId,
 };
 use lingua::Message;
 use lingua::universal::UserContent;
@@ -368,8 +368,9 @@ enum AppEvent {
 }
 
 pub async fn run_chat_tui(
-    agent: Arc<dyn HarnessAgent>,
-    conversation: Arc<dyn HarnessConversation>,
+    runtime: Arc<Runtime>,
+    agent: Arc<dyn AgentHandle>,
+    conversation: Arc<dyn ConversationHandle>,
     verbosity: Verbosity,
 ) -> Result<()> {
     let terminal = ratatui::init();
@@ -378,7 +379,7 @@ pub async fn run_chat_tui(
     // Bracketed paste keeps pasted newlines literal instead of sending the
     // message once per line.
     let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste);
-    let result = TuiApp::new(agent, conversation, verbosity)
+    let result = TuiApp::new(runtime, agent, conversation, verbosity)
         .run(terminal)
         .await;
     let _ = crossterm::execute!(
@@ -391,8 +392,9 @@ pub async fn run_chat_tui(
 }
 
 struct TuiApp {
-    agent: Arc<dyn HarnessAgent>,
-    conversation: Arc<dyn HarnessConversation>,
+    runtime: Arc<Runtime>,
+    agent: Arc<dyn AgentHandle>,
+    conversation: Arc<dyn ConversationHandle>,
     verbosity: Verbosity,
     transcript: Vec<Line<'static>>,
     input: InputBuffer,
@@ -425,16 +427,22 @@ struct TuiApp {
     open_calls: HashMap<String, usize>,
     /// Tool names by call id, for full-mode results and fallbacks.
     pending_tool_names: HashMap<String, String>,
+    approvals: VecDeque<(
+        exoharness::TurnRecord,
+        executor::permissions::ApprovalRequest,
+    )>,
 }
 
 impl TuiApp {
     fn new(
-        agent: Arc<dyn HarnessAgent>,
-        conversation: Arc<dyn HarnessConversation>,
+        runtime: Arc<Runtime>,
+        agent: Arc<dyn AgentHandle>,
+        conversation: Arc<dyn ConversationHandle>,
         verbosity: Verbosity,
     ) -> Self {
         let watch_after = Arc::new(Mutex::new(conversation.record().latest_event_id));
         Self {
+            runtime,
             agent,
             conversation,
             verbosity,
@@ -455,6 +463,7 @@ impl TuiApp {
             assistant_prefixed: false,
             open_calls: HashMap::new(),
             pending_tool_names: HashMap::new(),
+            approvals: VecDeque::new(),
         }
     }
 
@@ -512,13 +521,15 @@ impl TuiApp {
 
         watcher.abort();
         if let Some(session_id) = self.session_id.take() {
-            self.conversation.close_session(session_id).await?;
+            self.runtime
+                .end_session(self.conversation.as_ref(), session_id)
+                .await?;
         }
         outcome
     }
 
     async fn load_transcript(&mut self) -> Result<()> {
-        let messages = self.conversation.messages().await?;
+        let messages = executor::materialize_conversation_messages(&*self.conversation).await?;
         self.transcript = render_transcript_lines(&messages, self.verbosity)
             .iter()
             .flat_map(|rendered| styled_message_lines(rendered))
@@ -651,6 +662,41 @@ impl TuiApp {
     async fn submit_input(&mut self, tx: &mpsc::UnboundedSender<AppEvent>) -> Result<bool> {
         let line = self.input.take();
         self.history_pos = None;
+        if !line.trim_start().starts_with("/")
+            && let Some((turn, approval)) = self.approvals.front()
+        {
+            let (approved, allow_for_tool) = match line.trim().to_ascii_lowercase().as_str() {
+                "y" | "yes" => (true, false),
+                "a" | "all" => (true, true),
+                "n" | "no" | "" => (false, false),
+                _ => {
+                    self.input.replace(line);
+                    self.push_notice("Enter y, n, or a to answer the pending approval.");
+                    return Ok(false);
+                }
+            };
+            let result = self
+                .runtime
+                .approval_response(
+                    self.agent.record().id,
+                    self.conversation.record().id,
+                    turn.id,
+                    &exo_managed_agents::http::protocol::ApprovalResponseBody {
+                        session_id: turn.session_id,
+                        approval_id: approval.approval_id.clone(),
+                        approved,
+                        allow_for_tool,
+                    },
+                )
+                .await;
+            match result {
+                Ok(_) => {
+                    self.approvals.pop_front();
+                }
+                Err(error) => self.push_notice(&format!("Approval failed: {error}")),
+            }
+            return Ok(false);
+        }
         // The bare help listing is ours, not clap's CLI-shaped help screen.
         if matches!(line.trim(), "/" | "/help") {
             for rendered in command_help_lines() {
@@ -695,6 +741,8 @@ impl TuiApp {
             self.push_notice("still waiting on the previous operation");
             return Ok(false);
         }
+        let harness = Arc::clone(&self.runtime);
+        let agent = Arc::clone(&self.agent);
         let conversation = Arc::clone(&self.conversation);
         match command {
             ReplCommand::Quit => return Ok(true),
@@ -713,9 +761,14 @@ impl TuiApp {
                 self.spawn_command(tx, async move { cost_lines(conversation.as_ref()).await })
             }
             ReplCommand::Shell { command } => {
-                let agent = Arc::clone(&self.agent);
                 self.spawn_command(tx, async move {
-                    shell_lines(agent.as_ref(), conversation.as_ref(), command).await
+                    shell_lines(
+                        harness.as_ref(),
+                        agent.as_ref(),
+                        conversation.as_ref(),
+                        command,
+                    )
+                    .await
                 });
             }
             ReplCommand::Snapshot { sandbox_id } => self.spawn_command(tx, async move {
@@ -759,19 +812,43 @@ impl TuiApp {
         self.assistant_prefixed = false;
         self.open_calls.clear();
         let conversation = Arc::clone(&self.conversation);
+        let harness = Arc::clone(&self.runtime);
+        let agent = Arc::clone(&self.agent);
         let session_id = self.session_id;
         tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut ttft = None;
+            let mut completed_turn = None;
             let request = SendRequest {
                 input: vec![Message::User {
                     content: UserContent::String(text),
                 }],
                 session_id,
             };
-            match conversation.send_stream(request).await {
+            match harness
+                .send_stream(Arc::clone(&agent), Arc::clone(&conversation), request)
+                .await
+            {
                 Ok(mut stream) => {
                     while let Some(event) = stream.next().await {
                         let app_event = match event {
-                            Ok(event) => AppEvent::Stream(event),
+                            Ok(event) => {
+                                match &event {
+                                    ExecutionStreamEvent::FirstChunk { .. } => {
+                                        ttft.get_or_insert_with(|| started.elapsed());
+                                    }
+                                    ExecutionStreamEvent::Chunk(chunk)
+                                        if !chunk_text(chunk).is_empty() =>
+                                    {
+                                        ttft.get_or_insert_with(|| started.elapsed());
+                                    }
+                                    ExecutionStreamEvent::Completed(result) => {
+                                        completed_turn = Some(result.turn_id)
+                                    }
+                                    _ => {}
+                                }
+                                AppEvent::Stream(event)
+                            }
                             Err(error) => AppEvent::StreamError(format!("{error:#}")),
                         };
                         if tx.send(app_event).is_err() {
@@ -783,6 +860,17 @@ impl TuiApp {
                     let _ = tx.send(AppEvent::StreamError(format!("{error:#}")));
                 }
             }
+            let elapsed = started.elapsed();
+            if let Some(turn_id) = completed_turn {
+                let mut tracker = crate::turn_display::UsageTracker::default();
+                let summary = match tracker.refresh(conversation.as_ref(), Some(turn_id)).await {
+                    Ok(usage) => usage.display(&tracker.total, ttft, elapsed),
+                    Err(error) => format!("usage summary failed: {error:#}"),
+                };
+                if tx.send(AppEvent::CommandOutput(vec![summary])).is_err() {
+                    return;
+                }
+            }
             let _ = tx.send(AppEvent::StreamDone);
         });
     }
@@ -792,6 +880,7 @@ impl TuiApp {
             AppEvent::Stream(event) => self.handle_stream_event(event),
             AppEvent::StreamError(error) => self.push_notice(&format!("stream error: {error}")),
             AppEvent::StreamDone => {
+                self.approvals.clear();
                 self.busy.store(false, Ordering::Relaxed);
                 self.open_assistant = None;
                 self.assistant_prefixed = false;
@@ -814,6 +903,14 @@ impl TuiApp {
 
     fn handle_stream_event(&mut self, event: ExecutionStreamEvent) {
         match event {
+            ExecutionStreamEvent::ApprovalRequested { turn, approval } => {
+                self.push_notice(&format!(
+                    "Permission required: {} {}",
+                    approval.request.function_name,
+                    serde_json::Value::Object(approval.request.arguments.clone())
+                ));
+                self.approvals.push_back((turn, approval));
+            }
             ExecutionStreamEvent::FirstChunk { .. } => {}
             ExecutionStreamEvent::Chunk(chunk) => {
                 let text = chunk_text(&chunk);
@@ -863,6 +960,7 @@ impl TuiApp {
                 }
             }
             ExecutionStreamEvent::Completed(result) => {
+                self.approvals.clear();
                 self.session_id = Some(result.session_id);
                 *self.watch_after.lock().expect("watch cursor poisoned") =
                     Some(result.latest_event_id);
@@ -987,7 +1085,7 @@ impl TuiApp {
         &self,
         tx: mpsc::UnboundedSender<AppEvent>,
     ) -> tokio::task::JoinHandle<()> {
-        let conversation = self.conversation.exoharness_handle();
+        let conversation = self.conversation.clone();
         let watch_after = Arc::clone(&self.watch_after);
         let busy = Arc::clone(&self.busy);
         let verbosity = self.verbosity;
@@ -1034,8 +1132,23 @@ impl TuiApp {
         let wrapped = wrap_input_chars(self.input.as_str(), self.input.cursor(), input_width);
         let input_height = (wrapped.lines.len() as u16).min(MAX_INPUT_ROWS) + 2;
 
-        let [transcript_area, input_area, status_area] = Layout::vertical([
+        let approval_text = self.approvals.front().map(|(_, approval)| {
+            format!(
+                "{}\n{}",
+                approval.request.function_name,
+                serde_json::Value::Object(approval.request.arguments.clone()),
+            )
+        });
+        let approval_panel =
+            Paragraph::new(approval_text.as_deref().unwrap_or_default()).wrap(Wrap { trim: false });
+        let approval_height = if approval_text.is_some() {
+            (approval_panel.line_count(input_width as u16) as u16 + 2).min(frame.area().height / 2)
+        } else {
+            0
+        };
+        let [transcript_area, approval_area, input_area, status_area] = Layout::vertical([
             Constraint::Min(1),
+            Constraint::Length(approval_height),
             Constraint::Length(input_height),
             Constraint::Length(1),
         ])
@@ -1071,6 +1184,21 @@ impl TuiApp {
             transcript_area,
         );
 
+        if approval_text.is_some() {
+            frame.render_widget(
+                approval_panel.block(
+                    Block::bordered()
+                        .title(format!(
+                            " Permission required · {} pending ",
+                            self.approvals.len()
+                        ))
+                        .title_bottom(" [y]es / [n]o / [a]ll calls to this tool this session ")
+                        .border_style(Style::new().yellow()),
+                ),
+                approval_area,
+            );
+        }
+
         // Once the input outgrows its bounded height, scroll vertically so the
         // current cursor row stays visible even when editing earlier text.
         let cursor_col = wrapped.cursor_col as u16;
@@ -1092,7 +1220,11 @@ impl TuiApp {
         .block(
             Block::new()
                 .borders(Borders::ALL)
-                .title(" message or /command "),
+                .title(if self.approvals.is_empty() {
+                    " message or /command "
+                } else {
+                    " Approval response [y/n/a] "
+                }),
         );
         frame.render_widget(input, input_area);
         frame.set_cursor_position(Position::new(
@@ -1100,7 +1232,9 @@ impl TuiApp {
             input_area.y + 1 + (cursor_row - input_scroll),
         ));
 
-        let state = if self.is_busy() {
+        let state = if !self.approvals.is_empty() {
+            "waiting for approval".to_string()
+        } else if self.is_busy() {
             format!("{} thinking…", SPINNER[self.spinner_frame % SPINNER.len()])
         } else {
             "idle".to_string()
@@ -1285,6 +1419,131 @@ fn status_style(status: &str) -> Style {
 mod tests {
     use super::{InputBuffer, ReplCommand, ReplInput, parse_repl_input, wrap_input_chars};
     use crate::render::Verbosity;
+
+    #[tokio::test]
+    async fn concurrent_approvals_are_displayed_and_answered_in_order() -> anyhow::Result<()> {
+        use super::{AppEvent, TuiApp};
+        use executor::{ExecutionStreamEvent, HttpProvider, Runtime, permissions};
+        use exoharness::{
+            BasicExoHarness, BasicExoHarnessConfig, ExoHarness, NewAgentRequest,
+            SandboxBackendRegistration, SandboxProvider, SecretBackendChoice, ToolRequest,
+        };
+        use std::sync::Arc;
+
+        let temp = tempfile::TempDir::new()?;
+        let config = BasicExoHarnessConfig {
+            root: temp.path().to_owned(),
+            secret_backend: SecretBackendChoice::Static([7; 32]),
+            sandbox_default: SandboxProvider::LocalProcess,
+            sandbox_policy: None,
+            sandbox_backends: vec![SandboxBackendRegistration::local_process()],
+        };
+        let state = Arc::new(BasicExoHarness::in_memory(config.clone()).await?);
+        let agent = state
+            .new_agent(NewAgentRequest {
+                slug: "approvals".into(),
+                name: "Approvals".into(),
+                vaults: vec![],
+            })
+            .await?;
+        let thread = agent.new_conversation(Default::default()).await?;
+        let turn = thread.begin_turn(Default::default()).await?;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"event_id": exoharness::Uuid7::now()})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let runtime = Arc::new(Runtime::new(
+            HttpProvider::new(exo_managed_agents::http::RuntimeClient::new(&server.uri())?),
+            None,
+        ));
+        let mut app = TuiApp::new(runtime, agent, thread.clone(), Verbosity::Compact);
+        for name in ["first", "second"] {
+            let approval = permissions::ApprovalRequest {
+                approval_id: name.into(),
+                tool_call_id: None,
+                round: None,
+                request: ToolRequest {
+                    namespace: None,
+                    function_name: format!("exo_mcp__notes__{name}"),
+                    arguments: Default::default(),
+                },
+            };
+            app.handle_stream_event(ExecutionStreamEvent::ApprovalRequested {
+                turn: turn.record().clone(),
+                approval,
+            });
+        }
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))?;
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.input.replace("draft message".into());
+        assert!(!app.submit_input(&tx).await?);
+        assert_eq!(app.input.take(), "draft message");
+        assert_eq!(app.approvals.len(), 2);
+        app.input.replace("/help".into());
+        assert!(!app.submit_input(&tx).await?);
+        assert_eq!(app.approvals.len(), 2);
+        app.input.replace("/quit".into());
+        assert!(app.submit_input(&tx).await?);
+        assert_eq!(app.approvals.len(), 2);
+        assert!(server.received_requests().await.unwrap().is_empty());
+        for (name, answer, remaining) in [("first", "y", 1), ("second", "n", 0)] {
+            terminal.draw(|frame| app.draw(frame))?;
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(screen.contains("Permission required"), "{screen}");
+            assert!(screen.contains("waiting for approval"), "{screen}");
+            assert_eq!(app.approvals.front().unwrap().1.approval_id, name);
+            app.input.replace(answer.into());
+            app.submit_input(&tx).await?;
+            assert_eq!(app.approvals.len(), remaining);
+            assert!(
+                !app.approvals
+                    .iter()
+                    .any(|(_, approval)| approval.approval_id == name)
+            );
+        }
+        assert!(app.approvals.is_empty());
+        #[derive(serde::Deserialize)]
+        struct Decision {
+            approval_id: String,
+            approved: bool,
+        }
+        let mut decisions = Vec::new();
+        for request in server.received_requests().await.unwrap() {
+            let decision: Decision = request.body_json()?;
+            decisions.push((decision.approval_id, decision.approved));
+        }
+        assert_eq!(
+            decisions,
+            [("first".into(), true), ("second".into(), false)]
+        );
+        app.handle_stream_event(ExecutionStreamEvent::ApprovalRequested {
+            turn: turn.record().clone(),
+            approval: permissions::ApprovalRequest {
+                approval_id: "cancelled".into(),
+                tool_call_id: None,
+                round: None,
+                request: ToolRequest {
+                    namespace: None,
+                    function_name: "cancelled".into(),
+                    arguments: Default::default(),
+                },
+            },
+        });
+        app.handle_app_event(AppEvent::StreamDone);
+        assert!(app.approvals.is_empty());
+        Ok(())
+    }
 
     fn input_buffer(text: &str) -> InputBuffer {
         let mut input = InputBuffer::default();

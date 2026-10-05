@@ -1,28 +1,31 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use futures::StreamExt;
 use futures::future::BoxFuture;
 use futures::io::{AsyncReadExt, AsyncWriteExt};
 use futures::stream::{self, BoxStream};
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
+use tokio::sync::{
+    Mutex as AsyncMutex, Notify, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
+    RwLock as AsyncRwLock, mpsc,
+};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
 use crate::sandbox::{
-    BoxSandboxTcpStream, CliContainerSandboxBackend, LocalProcessSandboxBackend,
-    ManagedSandboxBackend, ManagedSandboxHandle, SANDBOX_MAIN_MOUNT_DIR, SandboxCommand,
-    SandboxKey, SandboxLifecycleConfig, SandboxMount, SandboxMountAccess, SandboxNetworkPolicy,
-    SandboxRequest, SandboxSpec, SnapshotFormat, SnapshotPayload, sandbox_spec_hash,
+    BoxSandboxTcpStream, LocalProcessSandboxBackend, ManagedSandboxBackend, ManagedSandboxHandle,
+    SANDBOX_MAIN_MOUNT_DIR, SandboxCommand, SandboxLifecycleConfig, SandboxMount,
+    SandboxMountAccess, SandboxNetworkPolicy, SandboxRequest, SandboxSpec, SnapshotFormat,
+    SnapshotPayload, sandbox_spec_hash,
 };
 #[cfg(feature = "apple-keychain")]
 use crate::secrets::AppleKeychainSecretKeyProvider;
@@ -31,6 +34,10 @@ use crate::secrets::{
     StaticSecretKeyProvider, default_master_key_path,
 };
 use crate::storage::BasicObjectStore;
+use crate::vault::{
+    BasicVaultStore, SecretReference, VaultContext, VaultHandle, VaultId, compose_vaults,
+    global_vault, require_vaults,
+};
 use crate::{
     AddEventsRequest, AddEventsResult, AgentHandle, AgentId, AgentRecord, Artifact,
     ArtifactVersion, AttachSandboxRequest, BeginTurnRequest, Binding, BindingId, BindingRecord,
@@ -39,17 +46,158 @@ use crate::{
     CreateSandboxRequest, DurableFileSystem, Event, EventData, EventId, EventKind, EventQuery,
     EventQueryDirection, EventStream, ExoHarness, FileSystemMount, ForkConversationRequest,
     ForkSandboxRequest, GetEventsResult, GetSandboxProcessEventsResult, ListConversationsRequest,
-    ListConversationsResult, NewAgentRequest, NewConversationRequest, PutSecretRequest,
-    ReadArtifactRequest, RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment,
+    ListConversationsResult, NewAgentRequest, NewConversationRequest, ReadArtifactRequest,
+    ResourceScope, RestoreSandboxRequest, Result, RunInSandboxRequest, SandboxAttachment,
     SandboxHandle, SandboxId, SandboxProcess, SandboxProcessEvent, SandboxProcessEventQuery,
     SandboxProcessId, SandboxProcessMode, SandboxProcessParts, SandboxProcessRecord,
     SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxProviderConfig,
-    SandboxRecord, Secret, SecretId, SecretMetadata, SecretType, SessionId, SnapshotHandle,
-    SnapshotId, StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord,
-    Uuid7, WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
+    SandboxRecord, Secret, SecretId, SecretMetadata, SessionId, SnapshotHandle, SnapshotId,
+    StartSandboxProcessRequest, StartSandboxRequest, TurnHandle, TurnId, TurnRecord, Uuid7,
+    WaitSandboxProcessRequest, WriteArtifactRequest, WriteSandboxProcessInputRequest,
 };
 
+#[path = "basic/access.rs"]
+mod access;
+#[path = "basic/migration.rs"]
+mod migration;
+#[path = "basic/vault_context.rs"]
+mod vault_context;
+use vault_context::ScopedVaultContext;
+#[path = "basic/egress.rs"]
+mod egress;
+use egress::LocalEgressResolver;
+
+#[cfg(test)]
+#[path = "basic/resource_tests.rs"]
+mod resource_tests;
+
 const SANDBOX_PROVIDER_STATE_EVENT: &str = "sandbox_provider_state";
+const UNFINISHED_TURNS_DIR: &str = "recovery/unfinished_turns";
+
+#[derive(Serialize, Deserialize)]
+struct StoredEventBatch {
+    events: Vec<Event>,
+}
+
+#[derive(Default)]
+struct EventBatchIndex {
+    batches: Vec<IndexedEventBatch>,
+}
+
+struct IndexedEventBatch {
+    first: EventId,
+    last: EventId,
+    max_last: EventId,
+    key: String,
+}
+
+impl EventBatchIndex {
+    fn from_keys(keys: &[String]) -> Self {
+        let mut batches = keys
+            .iter()
+            .filter_map(|key| {
+                let (first, last) = event_batch_range_from_key(key)?;
+                Some(IndexedEventBatch {
+                    first,
+                    last,
+                    max_last: last,
+                    key: key.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        batches.sort_by_key(|batch| batch.first);
+        let mut max_last = None;
+        for batch in &mut batches {
+            batch.max_last =
+                max_last.map_or(batch.last, |current: EventId| current.max(batch.last));
+            max_last = Some(batch.max_last);
+        }
+        Self { batches }
+    }
+
+    fn insert(&mut self, first: EventId, last: EventId, key: String) {
+        let offset = self.batches.partition_point(|batch| batch.first <= first);
+        self.batches.insert(
+            offset,
+            IndexedEventBatch {
+                first,
+                last,
+                max_last: last,
+                key,
+            },
+        );
+        let mut max_last = if offset == 0 {
+            None
+        } else {
+            Some(self.batches[offset - 1].max_last)
+        };
+        for batch in &mut self.batches[offset..] {
+            batch.max_last =
+                max_last.map_or(batch.last, |current: EventId| current.max(batch.last));
+            max_last = Some(batch.max_last);
+        }
+    }
+
+    fn keys_containing(&self, id: EventId) -> Vec<String> {
+        let end = self.batches.partition_point(|batch| batch.first <= id);
+        let mut keys = Vec::new();
+        for batch in self.batches[..end].iter().rev() {
+            if batch.max_last < id {
+                break;
+            }
+            if id <= batch.last {
+                keys.push(batch.key.clone());
+            }
+        }
+        keys
+    }
+}
+
+fn event_batch_path(conversation_dir: &Path, first: EventId, last: EventId) -> PathBuf {
+    conversation_dir
+        .join("events")
+        .join(format!("{first}_{last}.batch.json"))
+}
+
+fn remember_appended_batch(
+    index: &Mutex<Option<EventBatchIndex>>,
+    conversation_dir: &Path,
+    added: &AddEventsResult,
+) {
+    if added.event_ids.len() < 2 {
+        return;
+    }
+    let first = added.event_ids[0];
+    let last = added.latest_event_id;
+    index
+        .lock()
+        .expect("event batch index poisoned")
+        .get_or_insert_with(EventBatchIndex::default)
+        .insert(
+            first,
+            last,
+            event_batch_path(conversation_dir, first, last)
+                .to_string_lossy()
+                .into_owned(),
+        );
+}
+
+fn unfinished_turn_marker_path(
+    agent_id: AgentId,
+    thread_id: ConversationId,
+    turn_id: TurnId,
+) -> PathBuf {
+    Path::new(UNFINISHED_TURNS_DIR)
+        .join(agent_id.to_string())
+        .join(thread_id.to_string())
+        .join(format!("{turn_id}.json"))
+}
+
+fn unfinished_thread_markers_dir(agent_id: AgentId, thread_id: ConversationId) -> PathBuf {
+    Path::new(UNFINISHED_TURNS_DIR)
+        .join(agent_id.to_string())
+        .join(thread_id.to_string())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct SandboxProviderStatePayload {
@@ -71,7 +219,7 @@ pub enum SecretBackendChoice {
 
 type SandboxBackendFactory = Arc<
     dyn for<'a> Fn(
-            &'a BasicExoHarnessInner,
+            &'a Arc<BasicExoHarnessInner>,
         ) -> BoxFuture<'a, Result<Arc<dyn ManagedSandboxBackend>>>
         + Send
         + Sync,
@@ -122,14 +270,14 @@ impl SandboxBackendRegistration {
     pub fn apple_container() -> Self {
         Self::from_backend(
             SandboxProvider::AppleContainer,
-            Arc::new(CliContainerSandboxBackend::apple_container()),
+            Arc::new(crate::CliContainerSandboxBackend::apple_container()),
         )
     }
 
     pub fn docker() -> Self {
         Self::from_backend(
             SandboxProvider::Docker,
-            Arc::new(CliContainerSandboxBackend::docker()),
+            Arc::new(crate::CliContainerSandboxBackend::docker()),
         )
     }
 
@@ -138,9 +286,16 @@ impl SandboxBackendRegistration {
         Self::from_factory(
             SandboxProvider::Firecracker,
             cfg!(any(target_os = "linux", target_os = "macos")),
-            move |_| {
+            move |inner| {
                 let spec = spec.clone();
-                Box::pin(crate::firecracker_backend(spec.config, spec.lima))
+                let resolver = Arc::new(LocalEgressResolver {
+                    harness: Arc::downgrade(inner),
+                });
+                Box::pin(crate::firecracker_backend_with_credentials(
+                    spec.config,
+                    spec.lima,
+                    resolver,
+                ))
             },
         )
     }
@@ -166,16 +321,20 @@ impl SandboxBackendRegistration {
     /// is not macOS-only.
     pub fn smolvm() -> Self {
         // A factory, not a fixed backend: the binary paths are configured per
-        // binding (`exo provider configure --provider smolvm --smolvm-binary`),
+        // binding (`exo environment provider create --backend smolvm --smolvm-binary`),
         // so they have to be read when a request arrives rather than at startup —
         // the same shape daytona/e2b use for their credentials. The result is
         // cached per provider by `sandbox_backend_for_provider`, so this runs
         // once per harness and not once per sandbox.
-        Self::from_factory(SandboxProvider::Smolvm, false, |inner| {
+        Self::from_factory(SandboxProvider::Smolvm, true, |inner| {
             Box::pin(async move {
                 let config = inner.smolvm_config_from_binding().await?;
-                Ok(Arc::new(crate::SmolvmSandboxBackend::from_config(config))
-                    as Arc<dyn ManagedSandboxBackend>)
+                let resolver = Arc::new(LocalEgressResolver {
+                    harness: Arc::downgrade(inner),
+                });
+                Ok(Arc::new(
+                    crate::SmolvmSandboxBackend::from_config(config).with_credentials(resolver),
+                ) as Arc<dyn ManagedSandboxBackend>)
             })
         })
     }
@@ -243,7 +402,7 @@ impl SandboxBackendRegistration {
                 {
                     let config = _inner.aws_agentcore_config_from_binding().await?.ok_or_else(|| {
                         anyhow!(
-                            "aws-agentcore sandbox requested but no sandbox provider binding is configured; run `exo provider configure --provider aws-agentcore --runtime-arn <arn>`"
+                            "aws-agentcore sandbox requested but no sandbox provider binding is configured; run `exo environment provider create --backend aws-agentcore --runtime-arn <arn>`"
                         )
                     })?;
                     Ok(
@@ -272,7 +431,7 @@ impl SandboxBackendRegistration {
     fn from_factory<F>(provider: SandboxProvider, is_local: bool, factory: F) -> Self
     where
         F: for<'a> Fn(
-                &'a BasicExoHarnessInner,
+                &'a Arc<BasicExoHarnessInner>,
             ) -> BoxFuture<'a, Result<Arc<dyn ManagedSandboxBackend>>>
             + Send
             + Sync
@@ -401,6 +560,7 @@ pub struct BasicExoHarnessConfig {
     pub secret_backend: SecretBackendChoice,
     /// Default when a caller doesn't request a provider. Must be in `sandbox_backends`.
     pub sandbox_default: SandboxProvider,
+    pub sandbox_policy: Option<crate::EgressPolicy>,
     /// Supported providers; anything not listed is rejected.
     pub sandbox_backends: Vec<SandboxBackendRegistration>,
 }
@@ -408,23 +568,67 @@ pub struct BasicExoHarnessConfig {
 #[derive(Clone)]
 pub struct BasicExoHarness {
     inner: Arc<BasicExoHarnessInner>,
+    caller: Option<crate::access::Caller>,
 }
 
 struct BasicExoHarnessInner {
+    access_policy: std::sync::OnceLock<Arc<dyn crate::access::AccessPolicy>>,
+    cache_root: PathBuf,
+    resources: crate::resources::ResourceStore,
     storage: BasicObjectStore,
     write_lock: AsyncMutex<()>,
+    resource_locks: Mutex<HashMap<ResourceScope, Weak<AsyncRwLock<()>>>>,
     subscribers: Mutex<HashMap<ConversationId, Vec<mpsc::UnboundedSender<Result<Event>>>>>,
     sandbox_registry: HashMap<SandboxProvider, SandboxBackendRegistration>,
+    sandbox_policy: Option<crate::EgressPolicy>,
     /// Backends built (and secrets read) lazily on first use, cached by provider.
     sandbox_backends: AsyncMutex<HashMap<SandboxProvider, Arc<dyn ManagedSandboxBackend>>>,
     running_sandboxes: AsyncMutex<HashMap<SandboxId, Arc<dyn ManagedSandboxHandle>>>,
     running_processes: AsyncMutex<HashMap<SandboxProcessId, Arc<RunningSandboxProcess>>>,
     secret_cipher: SecretCipher,
+    vaults: BasicVaultStore,
 }
 
 impl BasicExoHarnessInner {
-    async fn sandbox_backend_for_provider(
+    fn resource_lock(&self, scope: ResourceScope) -> Arc<AsyncRwLock<()>> {
+        let mut locks = self
+            .resource_locks
+            .lock()
+            .expect("resource lock map poisoned");
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&scope).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(AsyncRwLock::new(()));
+                locks.insert(scope, Arc::downgrade(&lock));
+                lock
+            }
+        }
+    }
+
+    // Lock order is agent resources, thread resources, then write_lock. Waiting
+    // for resource I/O must never hold the global metadata lock.
+    async fn lock_thread_resources(
         &self,
+        agent_id: AgentId,
+        thread_id: ConversationId,
+    ) -> (OwnedRwLockReadGuard<()>, OwnedRwLockWriteGuard<()>) {
+        let agent = self
+            .resource_lock(ResourceScope::Agent { agent_id })
+            .read_owned()
+            .await;
+        let thread = self
+            .resource_lock(ResourceScope::Thread {
+                agent_id,
+                thread_id,
+            })
+            .write_owned()
+            .await;
+        (agent, thread)
+    }
+
+    async fn sandbox_backend_for_provider(
+        self: &Arc<Self>,
         provider: SandboxProvider,
     ) -> Result<Arc<dyn ManagedSandboxBackend>> {
         if let Some(backend) = self.sandbox_backends.lock().await.get(&provider) {
@@ -498,30 +702,31 @@ impl BasicExoHarnessInner {
 
     async fn e2b_config_from_binding(&self) -> Result<Option<crate::E2bConfig>> {
         let bindings = list_binding_records(&self.storage, Path::new("bindings")).await?;
-        let Some((api_key_secret_id, api_url, default_image)) = bindings
-            .into_iter()
-            .rev()
-            .find_map(|record| match record.binding {
-                Binding::Sandbox {
-                    config:
-                        SandboxProviderConfig::E2b {
-                            api_key_secret_id,
-                            api_url,
-                            default_image,
-                        },
-                    ..
-                } => Some((api_key_secret_id, api_url, default_image)),
-                _ => None,
-            })
+        let Some((api_key_secret, api_url, default_image)) =
+            bindings
+                .into_iter()
+                .rev()
+                .find_map(|record| match record.binding {
+                    Binding::Sandbox {
+                        config:
+                            SandboxProviderConfig::E2b {
+                                api_key_secret,
+                                api_url,
+                                default_image,
+                            },
+                        ..
+                    } => Some((api_key_secret, api_url, default_image)),
+                    _ => None,
+                })
         else {
             return Ok(None);
         };
         let api_key = self
-            .secret_key_by_id(api_key_secret_id)
+            .secret_key_by_id(&api_key_secret)
             .await?
             .ok_or_else(|| {
                 anyhow!(
-                    "e2b sandbox binding references secret id {api_key_secret_id}, which is not set"
+                    "e2b sandbox binding references secret id {api_key_secret:?}, which is not set"
                 )
             })?;
         Ok(Some(crate::E2bConfig {
@@ -555,34 +760,31 @@ impl BasicExoHarnessInner {
 
     async fn sprites_config_from_binding(&self) -> Result<Option<crate::SpritesConfig>> {
         let bindings = list_binding_records(&self.storage, Path::new("bindings")).await?;
-        let Some((token_secret_id, api_url, url_auth, organization, labels)) = bindings
+        let Some((token_secret, api_url, url_auth, organization, labels)) = bindings
             .into_iter()
             .rev()
             .find_map(|record| match record.binding {
                 Binding::Sandbox {
                     config:
                         SandboxProviderConfig::Sprites {
-                            token_secret_id,
+                            token_secret,
                             api_url,
                             url_auth,
                             organization,
                             labels,
                         },
                     ..
-                } => Some((token_secret_id, api_url, url_auth, organization, labels)),
+                } => Some((token_secret, api_url, url_auth, organization, labels)),
                 _ => None,
             })
         else {
             return Ok(None);
         };
-        let token = self
-            .secret_key_by_id(token_secret_id)
-            .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "sprites sandbox binding references secret id {token_secret_id}, which is not set"
-                )
-            })?;
+        let token = self.secret_key_by_id(&token_secret).await?.ok_or_else(|| {
+            anyhow!(
+                "sprites sandbox binding references secret id {token_secret:?}, which is not set"
+            )
+        })?;
         Ok(Some(crate::SpritesConfig {
             token,
             api_url: api_url.unwrap_or_else(|| crate::DEFAULT_SPRITES_API_URL.to_string()),
@@ -635,35 +837,40 @@ impl BasicExoHarnessInner {
     /// Decrypt the first stored secret matching `predicate`, if any.
     async fn find_secret_by(
         &self,
-        predicate: impl Fn(&StoredSecret) -> bool,
+        predicate: impl Fn(&SecretMetadata) -> bool,
     ) -> Result<Option<Secret>> {
-        let stored = self
-            .storage
-            .list_json_matching_suffix::<StoredSecret>(Path::new("secrets"), ".json")
-            .await?;
-        match stored.into_iter().find(|s| predicate(s)) {
-            Some(record) => Ok(Some(self.secret_cipher.decrypt_secret(&record.secret)?)),
+        let vault = self.vaults.global_vault().await?;
+        let metadata = vault.list_secrets().await?.into_iter().find(predicate);
+        match metadata {
+            Some(metadata) => vault.get_secret(&metadata.id).await,
             None => Ok(None),
         }
     }
 
     /// Decrypt the `Key`-typed secret stored under `name`, if it exists.
     async fn secret_key(&self, name: &str) -> Result<Option<String>> {
-        match self.find_secret_by(|s| s.metadata.name == name).await? {
+        match self.find_secret_by(|s| s.name == name).await? {
             Some(Secret::Key { value }) => Ok(Some(value)),
-            Some(Secret::Oauth { .. }) => {
-                bail!("secret {name:?} is an OAuth secret; expected an API key")
+            Some(Secret::Oauth { .. } | Secret::GithubCli { .. }) => {
+                bail!("secret {name:?} is not a static API key")
             }
             None => Ok(None),
         }
     }
 
     /// Decrypt the `Key`-typed secret with the given id, if it exists.
-    async fn secret_key_by_id(&self, id: SecretId) -> Result<Option<String>> {
-        match self.find_secret_by(|s| s.metadata.id == id).await? {
+    async fn secret_key_by_id(&self, reference: &SecretReference) -> Result<Option<String>> {
+        match self
+            .vaults
+            .get_vault(&reference.vault_id)
+            .await?
+            .context("sandbox credential vault is unavailable")?
+            .get_secret(&reference.secret_id)
+            .await?
+        {
             Some(Secret::Key { value }) => Ok(Some(value)),
-            Some(Secret::Oauth { .. }) => {
-                bail!("secret {id} is an OAuth secret; expected an API key")
+            Some(Secret::Oauth { .. } | Secret::GithubCli { .. }) => {
+                bail!("sandbox credential must be an API key")
             }
             None => Ok(None),
         }
@@ -698,37 +905,38 @@ impl BasicExoHarnessInner {
             mode: crate::SmolvmExecutionMode::default(),
             binary,
             boot_binary,
+            image_cache: Some(self.cache_root.join("smolvm/images")),
         })
     }
 
     async fn daytona_config_from_binding(&self) -> Result<Option<crate::DaytonaConfig>> {
         let bindings = list_binding_records(&self.storage, Path::new("bindings")).await?;
-        let Some((api_key_secret_id, region, organization_id, api_url)) = bindings
+        let Some((api_key_secret, region, organization_id, api_url)) = bindings
             .into_iter()
             .rev()
             .find_map(|record| match record.binding {
                 Binding::Sandbox {
                     config:
                         SandboxProviderConfig::Daytona {
-                            api_key_secret_id,
+                            api_key_secret,
                             region,
                             organization_id,
                             api_url,
                             ..
                         },
                     ..
-                } => Some((api_key_secret_id, region, organization_id, api_url)),
+                } => Some((api_key_secret, region, organization_id, api_url)),
                 _ => None,
             })
         else {
             return Ok(None);
         };
         let api_key = self
-            .secret_key_by_id(api_key_secret_id)
+            .secret_key_by_id(&api_key_secret)
             .await?
             .ok_or_else(|| {
                 anyhow!(
-                    "daytona sandbox binding references secret id {api_key_secret_id}, \
+                    "daytona sandbox binding references secret id {api_key_secret:?}, \
                  which is not set"
                 )
             })?;
@@ -743,32 +951,32 @@ impl BasicExoHarnessInner {
 
     async fn vercel_config_from_binding(&self) -> Result<Option<crate::VercelConfig>> {
         let bindings = list_binding_records(&self.storage, Path::new("bindings")).await?;
-        let Some((api_token_secret_id, team_id, project_id, api_url)) = bindings
+        let Some((api_token_secret, team_id, project_id, api_url)) = bindings
             .into_iter()
             .rev()
             .find_map(|record| match record.binding {
                 Binding::Sandbox {
                     config:
                         SandboxProviderConfig::Vercel {
-                            api_token_secret_id,
+                            api_token_secret,
                             team_id,
                             project_id,
                             api_url,
                             ..
                         },
                     ..
-                } => Some((api_token_secret_id, team_id, project_id, api_url)),
+                } => Some((api_token_secret, team_id, project_id, api_url)),
                 _ => None,
             })
         else {
             return Ok(None);
         };
         let api_token = self
-            .secret_key_by_id(api_token_secret_id)
+            .secret_key_by_id(&api_token_secret)
             .await?
             .ok_or_else(|| {
                 anyhow!(
-                    "vercel sandbox binding references secret id {api_token_secret_id}, \
+                    "vercel sandbox binding references secret id {api_token_secret:?}, \
                  which is not set"
                 )
             })?;
@@ -868,6 +1076,11 @@ fn nonempty_env(name: &str) -> Option<String> {
 }
 
 impl BasicExoHarness {
+    /// In-memory state uses a fresh encryption key, ignoring `config.secret_backend`.
+    pub async fn in_memory(config: BasicExoHarnessConfig) -> Result<Self> {
+        Self::new_with_storage(config, None, BasicObjectStore::in_memory(), true).await
+    }
+
     pub async fn new(config: BasicExoHarnessConfig) -> Result<Self> {
         Self::new_with_backend(config, None).await
     }
@@ -893,11 +1106,25 @@ impl BasicExoHarness {
         config: BasicExoHarnessConfig,
         seed: Option<Arc<dyn ManagedSandboxBackend>>,
     ) -> Result<Self> {
+        let root = config.root.clone();
+        let storage = BasicObjectStore::local_filesystem(&config.root).await?;
+        let harness = Self::new_with_storage(config, seed, storage, false).await?;
+        harness.migrate_legacy_secrets(root).await?;
+        Ok(harness)
+    }
+
+    async fn new_with_storage(
+        config: BasicExoHarnessConfig,
+        seed: Option<Arc<dyn ManagedSandboxBackend>>,
+        storage: BasicObjectStore,
+        in_memory: bool,
+    ) -> Result<Self> {
         let BasicExoHarnessConfig {
             root,
             secret_backend,
             sandbox_default,
             sandbox_backends,
+            sandbox_policy,
         } = config;
 
         let mut registry = HashMap::new();
@@ -916,14 +1143,38 @@ impl BasicExoHarness {
             cache.insert(sandbox_default.clone(), backend);
         }
 
-        let storage = BasicObjectStore::local_filesystem(&root).await?;
+        let resource_master_key = match &secret_backend {
+            SecretBackendChoice::File { path } => Some(
+                path.clone()
+                    .map(Ok)
+                    .unwrap_or_else(crate::secrets::default_master_key_path)?,
+            ),
+            _ => None,
+        };
+        let secret_backend = if in_memory {
+            SecretBackendChoice::Static(crate::secrets::random_master_key())
+        } else {
+            secret_backend
+        };
         let secret_cipher =
             build_secret_cipher(secret_backend, root.to_string_lossy().to_string())?;
+        let vaults = BasicVaultStore::new(
+            (!in_memory).then(|| root.join("vaults")),
+            secret_cipher.clone(),
+        )?;
         Ok(Self {
+            caller: None,
             inner: Arc::new(BasicExoHarnessInner {
+                access_policy: std::sync::OnceLock::new(),
+                cache_root: root.join("cache"),
+                resources: crate::resources::ResourceStore::new(&root)?
+                    .excluding_master_key(resource_master_key)?,
+                vaults,
                 storage,
                 write_lock: AsyncMutex::new(()),
+                resource_locks: Mutex::new(HashMap::new()),
                 subscribers: Mutex::new(HashMap::new()),
+                sandbox_policy,
                 sandbox_registry: registry,
                 sandbox_backends: AsyncMutex::new(cache),
                 running_sandboxes: AsyncMutex::new(HashMap::new()),
@@ -935,6 +1186,21 @@ impl BasicExoHarness {
 
     fn agents_dir(&self) -> PathBuf {
         PathBuf::from("agents")
+    }
+
+    fn owner_dir(&self, scope: ResourceScope) -> PathBuf {
+        match scope {
+            ResourceScope::Global => PathBuf::new(),
+            ResourceScope::Agent { agent_id } => self.agents_dir().join(agent_id.to_string()),
+            ResourceScope::Thread {
+                agent_id,
+                thread_id,
+            } => self
+                .agents_dir()
+                .join(agent_id.to_string())
+                .join("conversations")
+                .join(thread_id.to_string()),
+        }
     }
 
     /// Slug-uniqueness index: one marker file per slug, so the per-create
@@ -964,23 +1230,30 @@ impl BasicExoHarness {
         PathBuf::from("bindings")
     }
 
-    fn secrets_dir(&self) -> PathBuf {
-        PathBuf::from("secrets")
-    }
-
     async fn list_agent_records(&self) -> Result<Vec<AgentRecord>> {
-        let mut agents = Vec::new();
-        for key in self.inner.storage.list_keys(self.agents_dir()).await? {
-            if !key.ends_with("/record.json") || Path::new(&key).components().count() != 3 {
-                continue;
-            }
-            agents.push(
-                self.inner
-                    .storage
-                    .get_json::<AgentRecord>(Path::new(&key))
-                    .await?,
-            );
-        }
+        let storage = &self.inner.storage;
+        let directories = storage
+            .list_directories(self.agents_dir())
+            .await?
+            .into_iter()
+            .filter(|directory| {
+                directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.parse::<AgentId>().is_ok())
+            });
+        let mut agents = stream::iter(directories)
+            .map(|directory| async move {
+                storage
+                    .get_json_if_exists::<AgentRecord>(directory.join("record.json"))
+                    .await
+            })
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         agents.sort_by_key(|record| record.id);
         Ok(agents)
     }
@@ -988,18 +1261,95 @@ impl BasicExoHarness {
 
 #[async_trait]
 impl ExoHarness for BasicExoHarness {
-    async fn list_agents(&self) -> Result<Vec<Arc<dyn AgentHandle>>> {
-        let mut handles: Vec<Arc<dyn AgentHandle>> = Vec::new();
-        for record in self.list_agent_records().await? {
-            handles.push(Arc::new(BasicAgentHandle {
-                harness: self.clone(),
-                record,
-            }));
+    fn with_caller(&self, caller: crate::access::Caller) -> Result<Arc<dyn ExoHarness>> {
+        self.inner
+            .access_policy
+            .get_or_init(|| caller.policy.clone());
+        Ok(Arc::new(Self {
+            inner: self.inner.clone(),
+            caller: Some(caller),
+        }))
+    }
+
+    async fn list_environments(&self) -> Result<Vec<crate::EnvironmentDefinition>> {
+        self.check(ResourceScope::Global).await?;
+        let mut definitions: Vec<crate::EnvironmentDefinition> = self
+            .inner
+            .storage
+            .list_json_matching_suffix(Path::new("environments"), ".json")
+            .await?;
+        definitions.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(definitions)
+    }
+
+    async fn put_environment(&self, environment: crate::EnvironmentDefinition) -> Result<()> {
+        if let Some(caller) = &self.caller {
+            caller.policy.check_operator(&caller.principal).await?;
         }
-        Ok(handles)
+        environment.validate()?;
+        let _guard = self.inner.write_lock.lock().await;
+        self.inner
+            .storage
+            .put_json(
+                Path::new("environments").join(format!("{}.json", environment.name)),
+                &environment,
+            )
+            .await
+    }
+
+    async fn delete_environment(&self, name: &str) -> Result<bool> {
+        if let Some(caller) = &self.caller {
+            caller.policy.check_operator(&caller.principal).await?;
+        }
+        crate::EnvironmentDefinition::validate_name(name)?;
+        let _guard = self.inner.write_lock.lock().await;
+        let path = Path::new("environments").join(format!("{name}.json"));
+        if self
+            .inner
+            .storage
+            .get_json_if_exists::<crate::EnvironmentDefinition>(&path)
+            .await?
+            .is_none()
+        {
+            return Ok(false);
+        }
+        self.inner.storage.delete_key_if_exists(path).await?;
+        Ok(true)
+    }
+
+    async fn list_agents(&self) -> Result<Vec<Arc<dyn AgentHandle>>> {
+        self.check(ResourceScope::Global).await?;
+        Ok(stream::iter(self.list_agent_records().await?)
+            .map(|record| async move {
+                self.check(ResourceScope::Agent {
+                    agent_id: record.id,
+                })
+                .await
+                .ok()
+                .map(|_| {
+                    Arc::new(BasicAgentHandle {
+                        harness: self.clone(),
+                        record,
+                    }) as Arc<dyn AgentHandle>
+                })
+            })
+            .buffered(16)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     async fn get_agent(&self, id: &AgentId) -> Result<Option<Arc<dyn AgentHandle>>> {
+        self.check(ResourceScope::Global).await?;
+        if self
+            .check(ResourceScope::Agent { agent_id: *id })
+            .await
+            .is_err()
+        {
+            return Ok(None);
+        }
         let record_path = self.agents_dir().join(id.to_string()).join("record.json");
         let Some(record) = self
             .inner
@@ -1016,6 +1366,7 @@ impl ExoHarness for BasicExoHarness {
     }
 
     async fn new_agent(&self, request: NewAgentRequest) -> Result<Arc<dyn AgentHandle>> {
+        self.check(ResourceScope::Global).await?;
         let _guard = self.inner.write_lock.lock().await;
         // TODO: claim the marker with a conditional put (put_json_if_absent,
         // arriving in PR #113) to close the cross-process create race.
@@ -1030,11 +1381,17 @@ impl ExoHarness for BasicExoHarness {
             bail!("agent slug already exists: {}", request.slug);
         }
 
+        require_vaults(self, &request.vaults).await?;
         let record = AgentRecord {
+            vaults: request.vaults,
             id: Uuid7::now(),
             slug: request.slug,
             name: request.name,
         };
+        self.claim(ResourceScope::Agent {
+            agent_id: record.id,
+        })
+        .await?;
         let agent_dir = self.agents_dir().join(record.id.to_string());
         self.inner
             .storage
@@ -1048,6 +1405,13 @@ impl ExoHarness for BasicExoHarness {
     }
 
     async fn delete_agent(&self, id: &AgentId) -> Result<bool> {
+        self.check(ResourceScope::Global).await?;
+        self.check(ResourceScope::Agent { agent_id: *id }).await?;
+        let _resources = self
+            .inner
+            .resource_lock(ResourceScope::Agent { agent_id: *id })
+            .write_owned()
+            .await;
         let agent_dir = self.agents_dir().join(id.to_string());
         if self.inner.storage.list_keys(&agent_dir).await?.is_empty() {
             return Ok(false);
@@ -1063,13 +1427,10 @@ impl ExoHarness for BasicExoHarness {
         for _ in 0..5 {
             terminate_running_sandboxes(&BasicScopedSandboxHandle::agent(self, *id)).await?;
             for conversation_id in agent_conversation_ids(self, &agent_dir).await? {
-                let conversation_dir = agent_dir
-                    .join("conversations")
-                    .join(conversation_id.to_string());
                 terminate_running_sandboxes(&BasicScopedSandboxHandle::conversation(
                     self,
+                    *id,
                     conversation_id,
-                    conversation_dir,
                 ))
                 .await?;
             }
@@ -1082,17 +1443,17 @@ impl ExoHarness for BasicExoHarness {
             // sweep above would otherwise slip past the check.
             let mut scopes = vec![BasicScopedSandboxHandle::agent(self, *id)];
             for conversation_id in agent_conversation_ids(self, &agent_dir).await? {
-                let conversation_dir = agent_dir
-                    .join("conversations")
-                    .join(conversation_id.to_string());
                 scopes.push(BasicScopedSandboxHandle::conversation(
                     self,
+                    *id,
                     conversation_id,
-                    conversation_dir,
                 ));
             }
             if !prepare_sandbox_scopes_for_deletion(self, &scopes).await? {
                 continue;
+            }
+            for conversation_id in agent_conversation_ids(self, &agent_dir).await? {
+                remove_thread_resources(self, *id, conversation_id).await?;
             }
             // Release the slug before the record (its source) disappears.
             if let Some(record) = self
@@ -1112,72 +1473,110 @@ impl ExoHarness for BasicExoHarness {
                 );
             }
             self.inner.storage.delete_prefix(agent_dir).await?;
+            self.inner
+                .storage
+                .delete_prefix(Path::new(UNFINISHED_TURNS_DIR).join(id.to_string()))
+                .await?;
             return Ok(true);
         }
         bail!("agent {id} kept acquiring sandboxes while it was being deleted")
     }
 
     async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
-        list_binding_records(&self.inner.storage, &self.bindings_dir()).await
+        self.check(ResourceScope::Global).await?;
+        self.binding_records(&self.bindings_dir()).await
     }
 
     async fn put_binding(&self, binding: Binding) -> Result<BindingId> {
+        self.check_binding(&binding).await?;
+        self.check(ResourceScope::Global).await?;
         let _guard = self.inner.write_lock.lock().await;
         let id = Uuid7::now();
         let record = stored_binding(id, binding);
         self.inner
             .storage
-            .put_json(self.bindings_dir().join(format!("{id}.json")), &record)
+            .put_json(
+                self.caller_bindings_dir(&self.bindings_dir())
+                    .join(format!("{id}.json")),
+                &record,
+            )
             .await?;
         Ok(id)
     }
 
     async fn get_binding(&self, id: &BindingId) -> Result<Option<Binding>> {
-        let path = self.bindings_dir().join(format!("{id}.json"));
-        Ok(self
-            .inner
-            .storage
-            .get_json_if_exists::<StoredBinding>(&path)
+        self.check(ResourceScope::Global).await?;
+        self.find_binding(&[self.bindings_dir()], id).await
+    }
+
+    async fn create_vault(&self, name: &str) -> Result<Arc<dyn VaultHandle>> {
+        self.check(ResourceScope::Global).await?;
+        let stored_name = if let Some(caller) = &self.caller {
+            anyhow::ensure!(
+                !self
+                    .list_vaults()
+                    .await?
+                    .iter()
+                    .any(|v| v.record().name == name),
+                "vault already exists: {name}"
+            );
+            format!("{}:{name}", caller.principal)
+        } else {
+            name.to_owned()
+        };
+        let vault = self.inner.vaults.create_vault(&stored_name).await?;
+        if let Some(caller) = &self.caller
+            && let Err(error) = caller
+                .policy
+                .vault_created(&caller.principal, vault.record().id, name)
+                .await
+        {
+            self.inner.vaults.delete_vault(&vault.record().id).await?;
+            return Err(error);
+        }
+        self.scoped_vault(vault)
             .await?
-            .map(|record| record.record.binding))
+            .context("new vault is unavailable")
     }
-
-    async fn list_secrets(&self) -> Result<Vec<SecretMetadata>> {
-        list_secret_metadata(&self.inner.storage, &self.secrets_dir()).await
-    }
-
-    async fn put_secret(&self, request: PutSecretRequest) -> Result<SecretId> {
+    async fn delete_vault(&self, id: &VaultId) -> Result<()> {
+        let vault = crate::vault::require_vault(self, id).await?;
+        if let Some(caller) = &self.caller {
+            anyhow::ensure!(
+                caller.policy.default_vault(&caller.principal).await? != *id,
+                "the personal vault cannot be deleted"
+            );
+            anyhow::ensure!(
+                caller
+                    .policy
+                    .vault(&caller.principal, vault.record(), true)
+                    .await?
+                    .is_some(),
+                "vault is read-only"
+            );
+        }
+        self.check(ResourceScope::Global).await?;
         let _guard = self.inner.write_lock.lock().await;
-        let id = Uuid7::now();
-        let record = StoredSecret {
-            metadata: SecretMetadata {
-                id,
-                r#type: secret_type(&request.secret),
-                name: request.name,
-                created_at: id.timestamp().expect("uuid7 timestamp"),
-            },
-            secret: self.inner.secret_cipher.encrypt_secret(&request.secret)?,
+        let operator = Self {
+            inner: self.inner.clone(),
+            caller: None,
         };
-        self.inner
-            .storage
-            .put_json(self.secrets_dir().join(format!("{id}.json")), &record)
-            .await?;
-        Ok(id)
-    }
-
-    async fn get_secret(&self, id: &SecretId) -> Result<Option<Secret>> {
-        let path = self.secrets_dir().join(format!("{id}.json"));
-        let Some(record) = self
-            .inner
-            .storage
-            .get_json_if_exists::<StoredSecret>(&path)
-            .await?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(
-            self.inner.secret_cipher.decrypt_secret(&record.secret)?,
-        ))
+        for agent in operator.list_agents().await? {
+            anyhow::ensure!(
+                !agent.record().vaults.contains(id),
+                "vault is still attached to an agent"
+            );
+            for thread in agent
+                .list_conversations(ListConversationsRequest::default())
+                .await?
+                .conversations
+            {
+                anyhow::ensure!(
+                    !thread.record().vaults.contains(id),
+                    "vault is still attached to a thread"
+                );
+            }
+        }
+        self.inner.vaults.delete_vault(id).await
     }
 }
 
@@ -1313,6 +1712,24 @@ where
 
 #[async_trait]
 impl AgentHandle for BasicAgentHandle {
+    async fn prepare_resources(
+        &self,
+        resources: Vec<crate::resources::ResourceDefinition>,
+    ) -> Result<Vec<crate::resources::PreparedResource>> {
+        self.harness
+            .check(ResourceScope::Agent {
+                agent_id: self.record.id,
+            })
+            .await?;
+        if !resources.is_empty()
+            && let Some(caller) = &self.harness.caller
+        {
+            caller.policy.check_operator(&caller.principal).await?;
+        }
+        let store = self.harness.inner.resources.clone();
+        tokio::task::spawn_blocking(move || store.prepare(resources)).await?
+    }
+
     fn record(&self) -> &AgentRecord {
         &self.record
     }
@@ -1321,15 +1738,36 @@ impl AgentHandle for BasicAgentHandle {
         &self,
         request: ListConversationsRequest,
     ) -> Result<ListConversationsResult<Arc<dyn ConversationHandle>>> {
-        let mut handles: Vec<Arc<dyn ConversationHandle>> = Vec::new();
-        let result = self.list_conversation_records(request).await?;
-        for record in result.conversations {
-            handles.push(Arc::new(BasicConversationHandle {
-                harness: self.harness.clone(),
+        self.harness
+            .check(ResourceScope::Agent {
                 agent_id: self.record.id,
-                record,
-            }));
-        }
+            })
+            .await?;
+        let result = self.list_conversation_records(request).await?;
+        let handles = stream::iter(result.conversations)
+            .map(|record| async move {
+                self.harness
+                    .check(ResourceScope::Thread {
+                        agent_id: self.record.id,
+                        thread_id: record.id,
+                    })
+                    .await
+                    .ok()
+                    .map(|_| {
+                        Arc::new(BasicConversationHandle {
+                            harness: self.harness.clone(),
+                            agent_id: self.record.id,
+                            record,
+                            event_batch_index: Arc::new(Mutex::new(None)),
+                        }) as Arc<dyn ConversationHandle>
+                    })
+            })
+            .buffered(16)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
         Ok(ListConversationsResult {
             conversations: handles,
             next_cursor: result.next_cursor,
@@ -1340,11 +1778,27 @@ impl AgentHandle for BasicAgentHandle {
         &self,
         id: &ConversationId,
     ) -> Result<Option<Arc<dyn ConversationHandle>>> {
+        self.harness
+            .check(ResourceScope::Agent {
+                agent_id: self.record.id,
+            })
+            .await?;
+        if self
+            .harness
+            .check(ResourceScope::Thread {
+                agent_id: self.record.id,
+                thread_id: *id,
+            })
+            .await
+            .is_err()
+        {
+            return Ok(None);
+        }
         let record_path = self
             .conversations_dir()
             .join(id.to_string())
             .join("record.json");
-        let Some(record) = self
+        let Some(mut record) = self
             .harness
             .inner
             .storage
@@ -1353,10 +1807,19 @@ impl AgentHandle for BasicAgentHandle {
         else {
             return Ok(None);
         };
+        let conversation_dir = record_path.parent().expect("record has a parent");
+        let event_keys = self
+            .harness
+            .inner
+            .storage
+            .list_keys(conversation_dir.join("events"))
+            .await?;
+        record.latest_event_id = latest_event_id_from_keys(&event_keys);
         Ok(Some(Arc::new(BasicConversationHandle {
             harness: self.harness.clone(),
             agent_id: self.record.id,
             record,
+            event_batch_index: Arc::new(Mutex::new(Some(EventBatchIndex::from_keys(&event_keys)))),
         })))
     }
 
@@ -1364,6 +1827,11 @@ impl AgentHandle for BasicAgentHandle {
         &self,
         request: NewConversationRequest,
     ) -> Result<Arc<dyn ConversationHandle>> {
+        self.harness
+            .check(ResourceScope::Agent {
+                agent_id: self.record.id,
+            })
+            .await?;
         let _guard = self.harness.inner.write_lock.lock().await;
         let existing = self
             .list_conversation_records(ListConversationsRequest::default())
@@ -1381,12 +1849,25 @@ impl AgentHandle for BasicAgentHandle {
             }
             None => derive_unique_slug("conversation", &existing),
         };
+        if let Some(environment) = &request.environment {
+            environment.validate()?;
+            self.harness.check_environment(environment).await?;
+        }
+        require_vaults(&self.harness, &request.vaults).await?;
         let record = ConversationRecord {
+            environment: request.environment,
+            vaults: request.vaults,
             id: Uuid7::now(),
             slug: slug.clone(),
             name: request.name.unwrap_or_else(|| slug_to_name(&slug)),
             latest_event_id: None,
         };
+        self.harness
+            .claim(ResourceScope::Thread {
+                agent_id: self.record.id,
+                thread_id: record.id,
+            })
+            .await?;
         let conversation_dir = self.conversations_dir().join(record.id.to_string());
         let mut record = record;
         append_events_to_conversation(
@@ -1412,10 +1893,27 @@ impl AgentHandle for BasicAgentHandle {
             harness: self.harness.clone(),
             agent_id: self.record.id,
             record,
+            event_batch_index: Arc::new(Mutex::new(Some(EventBatchIndex::default()))),
         }))
     }
 
     async fn delete_conversation(&self, id: &ConversationId) -> Result<bool> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.record.id,
+                thread_id: *id,
+            })
+            .await?;
+        self.harness
+            .check(ResourceScope::Agent {
+                agent_id: self.record.id,
+            })
+            .await?;
+        let _resources = self
+            .harness
+            .inner
+            .lock_thread_resources(self.record.id, *id)
+            .await;
         let conversation_dir = self.conversations_dir().join(id.to_string());
         if self
             .harness
@@ -1429,7 +1927,7 @@ impl AgentHandle for BasicAgentHandle {
         }
 
         let sandbox_handle =
-            BasicScopedSandboxHandle::conversation(&self.harness, *id, conversation_dir.clone());
+            BasicScopedSandboxHandle::conversation(&self.harness, self.record.id, *id);
         // Sandbox creation persists its record under the write lock, so the
         // only way to guarantee no VM outlives its conversation record is to
         // observe "no running sandboxes" while holding that lock and delete
@@ -1459,12 +1957,8 @@ impl AgentHandle for BasicAgentHandle {
             {
                 continue;
             }
-            if let Ok(mut record) = self
-                .harness
-                .inner
-                .storage
-                .get_json::<ConversationRecord>(conversation_dir.join("record.json"))
-                .await
+            if let Ok(mut record) =
+                load_conversation_record(&self.harness.inner.storage, &conversation_dir).await
             {
                 append_events_to_conversation(
                     &self.harness.inner,
@@ -1478,105 +1972,38 @@ impl AgentHandle for BasicAgentHandle {
                 )
                 .await?;
             }
+            remove_thread_resources(&self.harness, self.record.id, *id).await?;
             self.harness
                 .inner
                 .storage
                 .delete_prefix(conversation_dir)
+                .await?;
+            self.harness
+                .inner
+                .storage
+                .delete_prefix(unfinished_thread_markers_dir(self.record.id, *id))
                 .await?;
             return Ok(true);
         }
         bail!("conversation {id} kept acquiring sandboxes while it was being deleted")
     }
 
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
-        Ok(merge_binding_records(vec![
-            list_binding_records(&self.harness.inner.storage, &self.harness.bindings_dir()).await?,
-            list_binding_records(&self.harness.inner.storage, &self.bindings_dir()).await?,
-        ]))
-    }
-
-    async fn put_binding(&self, binding: Binding) -> Result<BindingId> {
-        let _guard = self.harness.inner.write_lock.lock().await;
-        let id = Uuid7::now();
-        let record = stored_binding(id, binding);
-        self.harness
-            .inner
-            .storage
-            .put_json(self.bindings_dir().join(format!("{id}.json")), &record)
-            .await?;
-        Ok(id)
-    }
-
-    async fn get_binding(&self, id: &BindingId) -> Result<Option<Binding>> {
-        let path = self.bindings_dir().join(format!("{id}.json"));
-        if let Some(record) = self
-            .harness
-            .inner
-            .storage
-            .get_json_if_exists::<StoredBinding>(&path)
-            .await?
-        {
-            return Ok(Some(record.record.binding));
-        }
-        self.harness.get_binding(id).await
-    }
-
-    async fn list_secrets(&self) -> Result<Vec<SecretMetadata>> {
-        Ok(merge_secret_metadata(vec![
-            list_secret_metadata(&self.harness.inner.storage, &self.harness.secrets_dir()).await?,
-            list_secret_metadata(&self.harness.inner.storage, &self.secrets_dir()).await?,
-        ]))
-    }
-
-    async fn put_secret(&self, request: PutSecretRequest) -> Result<SecretId> {
-        let _guard = self.harness.inner.write_lock.lock().await;
-        let id = Uuid7::now();
-        let record = StoredSecret {
-            metadata: SecretMetadata {
-                id,
-                r#type: secret_type(&request.secret),
-                name: request.name,
-                created_at: id.timestamp().expect("uuid7 timestamp"),
-            },
-            secret: self
-                .harness
-                .inner
-                .secret_cipher
-                .encrypt_secret(&request.secret)?,
-        };
-        self.harness
-            .inner
-            .storage
-            .put_json(self.secrets_dir().join(format!("{id}.json")), &record)
-            .await?;
-        Ok(id)
-    }
-
-    async fn get_secret(&self, id: &SecretId) -> Result<Option<Secret>> {
-        let path = self.secrets_dir().join(format!("{id}.json"));
-        let Some(record) = self
-            .harness
-            .inner
-            .storage
-            .get_json_if_exists::<StoredSecret>(&path)
-            .await?
-        else {
-            return self.harness.get_secret(id).await;
-        };
-        Ok(Some(
-            self.harness
-                .inner
-                .secret_cipher
-                .decrypt_secret(&record.secret)?,
-        ))
-    }
-
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion> {
+        self.harness
+            .check(ResourceScope::Agent {
+                agent_id: self.record.id,
+            })
+            .await?;
         let _guard = self.harness.inner.write_lock.lock().await;
         write_artifact_version(&self.harness.inner, &self.artifacts_dir(), request).await
     }
 
     async fn read_artifact(&self, request: ReadArtifactRequest) -> Result<Option<Artifact>> {
+        self.harness
+            .check(ResourceScope::Agent {
+                agent_id: self.record.id,
+            })
+            .await?;
         let versions =
             load_artifact_versions(&self.harness.inner.storage, &self.artifacts_dir()).await?;
         let selected = versions
@@ -1602,6 +2029,11 @@ impl AgentHandle for BasicAgentHandle {
     }
 
     async fn list_artifacts(&self) -> Result<Vec<ArtifactVersion>> {
+        self.harness
+            .check(ResourceScope::Agent {
+                agent_id: self.record.id,
+            })
+            .await?;
         load_artifact_versions(&self.harness.inner.storage, &self.artifacts_dir()).await
     }
 }
@@ -1623,14 +2055,6 @@ impl BasicAgentHandle {
         self.agent_dir().join("conversations")
     }
 
-    fn bindings_dir(&self) -> PathBuf {
-        self.agent_dir().join("bindings")
-    }
-
-    fn secrets_dir(&self) -> PathBuf {
-        self.agent_dir().join("secrets")
-    }
-
     fn artifacts_dir(&self) -> PathBuf {
         self.agent_dir().join("artifacts")
     }
@@ -1639,25 +2063,53 @@ impl BasicAgentHandle {
         &self,
         request: ListConversationsRequest,
     ) -> Result<ListConversationsResult<ConversationRecord>> {
-        let mut conversations = Vec::new();
-        for key in self
-            .harness
-            .inner
-            .storage
-            .list_keys(self.conversations_dir())
-            .await?
-        {
-            if !key.ends_with("/record.json") || Path::new(&key).components().count() != 5 {
-                continue;
+        let storage = &self.harness.inner.storage;
+        let paths = if request.unfinished_only {
+            let prefix = Path::new(UNFINISHED_TURNS_DIR).join(self.record.id.to_string());
+            let mut thread_ids = HashSet::new();
+            for key in storage.list_keys(&prefix).await? {
+                let Ok(relative) = Path::new(&key).strip_prefix(&prefix) else {
+                    continue;
+                };
+                if relative.components().count() != 2 || !key.ends_with(".json") {
+                    continue;
+                }
+                let Some(thread_id) = relative.components().next() else {
+                    continue;
+                };
+                thread_ids.insert(thread_id.as_os_str().to_string_lossy().into_owned());
             }
-            conversations.push(
-                self.harness
-                    .inner
-                    .storage
-                    .get_json::<ConversationRecord>(Path::new(&key))
-                    .await?,
-            );
-        }
+            thread_ids
+                .into_iter()
+                .map(|id| self.conversations_dir().join(id).join("record.json"))
+                .collect::<Vec<_>>()
+        } else {
+            storage
+                .list_directories(self.conversations_dir())
+                .await?
+                .into_iter()
+                .map(|directory| directory.join("record.json"))
+                .collect::<Vec<_>>()
+        };
+        let mut conversations = stream::iter(paths)
+            .map(|path| async move {
+                let Some(mut record) = storage
+                    .get_json_if_exists::<ConversationRecord>(&path)
+                    .await?
+                else {
+                    return Ok::<_, anyhow::Error>(None);
+                };
+                record.latest_event_id =
+                    latest_committed_event_id(storage, path.parent().expect("record has a parent"))
+                        .await?;
+                Ok(Some(record))
+            })
+            .buffer_unordered(16)
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         conversations.sort_by_key(conversation_recency_key);
         conversations.reverse();
         paginate_conversation_records(conversations, request)
@@ -1698,12 +2150,6 @@ fn paginate_conversation_records(
         conversations: page,
         next_cursor,
     })
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SandboxOwner {
-    Agent(AgentId),
-    Conversation(ConversationId),
 }
 
 // Deletion helpers shared by delete_agent and delete_conversation: an owner's
@@ -1789,7 +2235,7 @@ async fn agent_conversation_ids(
 struct BasicScopedSandboxHandle<'a> {
     harness: &'a BasicExoHarness,
     owner_dir: PathBuf,
-    owner: SandboxOwner,
+    owner: ResourceScope,
     event_sink: BasicSandboxEventSink<'a>,
 }
 
@@ -1810,27 +2256,32 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     fn agent(harness: &'a BasicExoHarness, agent_id: AgentId) -> Self {
         Self {
             harness,
-            owner_dir: harness.agents_dir().join(agent_id.to_string()),
-            owner: SandboxOwner::Agent(agent_id),
+            owner_dir: harness.owner_dir(ResourceScope::Agent { agent_id }),
+            owner: ResourceScope::Agent { agent_id },
             event_sink: BasicSandboxEventSink::None,
         }
     }
 
     fn conversation(
         harness: &'a BasicExoHarness,
+        agent_id: AgentId,
         conversation_id: ConversationId,
-        conversation_dir: PathBuf,
     ) -> Self {
+        let owner = ResourceScope::Thread {
+            agent_id,
+            thread_id: conversation_id,
+        };
         Self {
             harness,
-            owner_dir: conversation_dir,
-            owner: SandboxOwner::Conversation(conversation_id),
+            owner_dir: harness.owner_dir(owner),
+            owner,
             event_sink: BasicSandboxEventSink::Conversation { conversation_id },
         }
     }
 
     fn turn(
         harness: &'a BasicExoHarness,
+        agent_id: AgentId,
         conversation_id: ConversationId,
         conversation_dir: PathBuf,
         session_id: SessionId,
@@ -1840,7 +2291,10 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         Self {
             harness,
             owner_dir: conversation_dir,
-            owner: SandboxOwner::Conversation(conversation_id),
+            owner: ResourceScope::Thread {
+                agent_id,
+                thread_id: conversation_id,
+            },
             event_sink: BasicSandboxEventSink::Turn {
                 conversation_id,
                 session_id,
@@ -1855,6 +2309,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn list_sandboxes(&self) -> Result<Vec<SandboxRecord>> {
+        self.harness.check(self.owner).await?;
         let mut sandboxes = self
             .harness
             .inner
@@ -1862,6 +2317,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .list_json_matching_suffix::<StoredSandbox>(self.sandboxes_dir(), ".json")
             .await?
             .into_iter()
+            .filter(|sandbox| self.harness.check_sandbox(sandbox).is_ok())
             .map(SandboxRecord::from)
             .collect::<Vec<_>>();
         sandboxes.sort_unstable_by(|left, right| right.id.cmp(&left.id));
@@ -1869,11 +2325,12 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn create_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("create_sandbox")?;
         if request.name.is_none() {
             return self.create_new_sandbox(request).await;
         }
-        let prepared = prepare_sandbox_request(self.harness, request).await?;
+        let prepared = prepare_sandbox_request(self.harness, self.owner, request).await?;
         let _guard = self.harness.inner.write_lock.lock().await;
         if let Some((sandbox_id, sandbox)) = self.find_matching_sandbox(&prepared).await? {
             let (_handle, provider_state_event) = active_sandbox_handle_locked(
@@ -1893,6 +2350,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn fork_sandbox(&self, request: ForkSandboxRequest) -> Result<SandboxId> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("fork_sandbox")?;
         let source = self.load_sandbox(&request.source_id).await?;
         if source.attachment.is_some() {
@@ -1901,7 +2359,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         if !source.running {
             bail!("source sandbox is not running: {}", request.source_id);
         }
-        let prepared = prepare_sandbox_request(self.harness, request.sandbox).await?;
+        let prepared = prepare_sandbox_request(self.harness, self.owner, request.sandbox).await?;
         if prepared.provider != source.provider {
             bail!(
                 "source provider {} does not match target provider {}",
@@ -1932,10 +2390,11 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn restore_sandbox(&self, request: RestoreSandboxRequest) -> Result<SandboxId> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("restore_sandbox")?;
         let payload =
             load_snapshot_payload(self.harness, &self.owner_dir, request.snapshot_id).await?;
-        let prepared = prepare_sandbox_request(self.harness, request.sandbox).await?;
+        let prepared = prepare_sandbox_request(self.harness, self.owner, request.sandbox).await?;
         let sandbox_id = format!("sandbox-{}", Uuid7::now());
         let mut sandbox = prepared.stored_sandbox(sandbox_id.clone());
         sandbox.latest_snapshot_id = Some(request.snapshot_id);
@@ -1970,8 +2429,14 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn terminate_sandbox(&self, id: SandboxId) -> Result<()> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("terminate_sandbox")?;
         let _guard = self.harness.inner.write_lock.lock().await;
+        self.terminate_sandbox_locked(id).await
+    }
+
+    async fn terminate_sandbox_locked(&self, id: SandboxId) -> Result<()> {
+        self.harness.check(self.owner).await?;
         let sandbox = self.load_sandbox(&id).await?;
         if sandbox.attachment.is_some() {
             bail!("attached sandboxes cannot be terminated");
@@ -2015,10 +2480,14 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn attach_sandbox(&self, request: AttachSandboxRequest) -> Result<SandboxId> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("attach_sandbox")?;
         let sandbox_id = format!("sandbox-{}", Uuid7::now());
         let provider = request.attachment.provider();
         let sandbox = StoredSandbox {
+            tcp_ports: vec![],
+            principal: None,
+            credentials: BTreeMap::new(),
             id: sandbox_id.clone(),
             name: None,
             provider,
@@ -2028,7 +2497,14 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             default_workdir: Some(request.default_workdir.unwrap_or_default()),
             file_system_mounts: Vec::new(),
             durable_file_systems: Vec::new(),
-            enable_networking: true,
+            network: StoredSandboxPolicy::Policy {
+                policy: self
+                    .harness
+                    .inner
+                    .sandbox_policy
+                    .clone()
+                    .unwrap_or_else(|| SandboxNetworkPolicy::Unrestricted.into()),
+            },
             idle_seconds: 0,
             running: true,
             latest_snapshot_id: None,
@@ -2048,6 +2524,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn detach_sandbox(&self, sandbox_id: SandboxId) -> Result<SandboxAttachment> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("detach_sandbox")?;
         let sandbox = self.load_sandbox(&sandbox_id).await?;
         if !sandbox.running {
@@ -2102,6 +2579,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn snapshot_sandbox(&self, id: SandboxId) -> Result<SnapshotId> {
+        self.harness.check(self.owner).await?;
         let (snapshot_id, event) =
             snapshot_sandbox_side_effect(self.harness, &self.owner_dir, id).await?;
         self.append_events(vec![event]).await?;
@@ -2109,6 +2587,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn start_sandbox(&self, request: StartSandboxRequest) -> Result<()> {
+        self.harness.check(self.owner).await?;
         let event =
             start_sandbox_side_effect(self.harness, &self.owner_dir, self.owner, request).await?;
         self.append_events(vec![event]).await?;
@@ -2116,6 +2595,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn stop_sandbox(&self, id: SandboxId) -> Result<()> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("stop_sandbox")?;
         let _guard = self.harness.inner.write_lock.lock().await;
         let mut sandbox = self.load_sandbox(&id).await?;
@@ -2158,6 +2638,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         id: SandboxId,
         port: u16,
     ) -> Result<Option<BoxSandboxTcpStream>> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("connect_sandbox_tcp")?;
         let sandbox = self.load_sandbox(&id).await?;
         if !sandbox.running {
@@ -2168,6 +2649,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn sandbox_supports_tcp(&self, id: SandboxId) -> Result<bool> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("sandbox_supports_tcp")?;
         let sandbox = self.load_sandbox(&id).await?;
         if !sandbox.running {
@@ -2181,6 +2663,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         &self,
         request: StartSandboxProcessRequest,
     ) -> Result<SandboxProcessRecord> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("start_sandbox_process")?;
         let pending = prepare_sandbox_process(
             self.harness,
@@ -2203,6 +2686,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         &self,
         request: WriteSandboxProcessInputRequest,
     ) -> Result<()> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("write_sandbox_process_input")?;
         let process = self
             .require_sandbox_process(&request.sandbox_id, &request.process_id)
@@ -2223,6 +2707,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         &self,
         request: CloseSandboxProcessInputRequest,
     ) -> Result<()> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("close_sandbox_process_input")?;
         let process = self
             .require_sandbox_process(&request.sandbox_id, &request.process_id)
@@ -2235,6 +2720,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         &self,
         query: SandboxProcessEventQuery,
     ) -> Result<GetSandboxProcessEventsResult> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("get_sandbox_process_events")?;
         let process = self
             .require_sandbox_process(&query.sandbox_id, &query.process_id)
@@ -2265,6 +2751,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         &self,
         request: WaitSandboxProcessRequest,
     ) -> Result<SandboxProcessStatus> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("wait_sandbox_process")?;
         let process = self
             .require_sandbox_process(&request.sandbox_id, &request.process_id)
@@ -2276,6 +2763,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         &self,
         request: CancelSandboxProcessRequest,
     ) -> Result<SandboxProcessStatus> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("cancel_sandbox_process")?;
         let process = self
             .require_sandbox_process(&request.sandbox_id, &request.process_id)
@@ -2295,6 +2783,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         &self,
         request: RunInSandboxRequest,
     ) -> Result<Box<dyn SandboxProcess>> {
+        self.harness.check(self.owner).await?;
         self.ensure_full_sandbox_scope("run_in_sandbox")?;
         let sandbox = self.load_sandbox(&request.id).await?;
         if !sandbox.running {
@@ -2317,7 +2806,11 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         let parts = sandbox_handle
             .start_process(&SandboxCommand {
                 argv: request.command.clone(),
-                env: request.env.clone(),
+                env: self.harness.inner.resources.command_env(
+                    self.owner,
+                    &sandbox.file_system_mounts,
+                    request.env,
+                )?,
                 display_argv: Some(request.command),
                 cwd: None,
                 timeout: None,
@@ -2335,7 +2828,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn create_new_sandbox(&self, request: CreateSandboxRequest) -> Result<SandboxId> {
-        let prepared = prepare_sandbox_request(self.harness, request).await?;
+        self.harness.check(self.owner).await?;
+        let prepared = prepare_sandbox_request(self.harness, self.owner, request).await?;
         let sandbox_id = format!("sandbox-{}", Uuid7::now());
         let sandbox = prepared.stored_sandbox(sandbox_id.clone());
         let (sandbox_handle, provider_state_event) = create_sandbox_handle(
@@ -2355,6 +2849,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         &self,
         request: PreparedSandboxRequest,
     ) -> Result<SandboxId> {
+        self.harness.check(self.owner).await?;
         let sandbox_id = format!("sandbox-{}", Uuid7::now());
         let sandbox = request.stored_sandbox(sandbox_id.clone());
         let (sandbox_handle, provider_state_event) = create_sandbox_handle(
@@ -2375,6 +2870,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     // prefix and leave a live VM whose record no listing or reaper would ever
     // see again.
     async fn owner_exists_locked(&self) -> Result<bool> {
+        self.harness.check(self.owner).await?;
         Ok(self
             .harness
             .inner
@@ -2386,10 +2882,12 @@ impl<'a> BasicScopedSandboxHandle<'a> {
 
     async fn persist_created_sandbox_locked(
         &self,
-        sandbox: StoredSandbox,
+        mut sandbox: StoredSandbox,
         sandbox_handle: Arc<dyn ManagedSandboxHandle>,
         provider_state_event: Option<EventData>,
     ) -> Result<SandboxId> {
+        sandbox.principal = self.harness.caller.as_ref().map(|c| c.principal.clone());
+        self.harness.check(self.owner).await?;
         let sandbox_id = sandbox.id.clone();
         let latest_snapshot_id = sandbox.latest_snapshot_id;
         if !self.owner_exists_locked().await? {
@@ -2414,6 +2912,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             .lock()
             .await
             .insert(sandbox_id.clone(), sandbox_handle);
+        let policy = sandbox.policy();
+        let enable_networking = policy.networking_enabled();
         let mut events = vec![
             EventData::SandboxCreated {
                 sandbox_id: sandbox_id.clone(),
@@ -2423,7 +2923,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 default_workdir: sandbox.default_workdir.unwrap_or_default(),
                 file_system_mounts: sandbox.file_system_mounts,
                 durable_file_systems: sandbox.durable_file_systems,
-                enable_networking: sandbox.enable_networking,
+                policy: Some(policy),
+                enable_networking,
                 idle_seconds: sandbox.idle_seconds,
             },
             EventData::SandboxStarted {
@@ -2440,10 +2941,12 @@ impl<'a> BasicScopedSandboxHandle<'a> {
 
     async fn persist_attached_sandbox_locked(
         &self,
-        sandbox: StoredSandbox,
+        mut sandbox: StoredSandbox,
         sandbox_handle: Arc<dyn ManagedSandboxHandle>,
         provider_state_event: Option<EventData>,
     ) -> Result<SandboxId> {
+        sandbox.principal = self.harness.caller.as_ref().map(|c| c.principal.clone());
+        self.harness.check(self.owner).await?;
         let sandbox_id = sandbox.id.clone();
         if !self.owner_exists_locked().await? {
             // An attached sandbox belongs to its external owner and keeps
@@ -2485,12 +2988,14 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         &self,
         request: &PreparedSandboxRequest,
     ) -> Result<Option<(SandboxId, StoredSandbox)>> {
+        self.harness.check(self.owner).await?;
         match self.event_sink {
             BasicSandboxEventSink::None => {
                 find_matching_stored_sandbox(
                     &self.harness.inner.storage,
                     &self.sandboxes_dir(),
                     request,
+                    self.harness.caller.as_ref().map(|c| c.principal.as_str()),
                 )
                 .await
             }
@@ -2507,10 +3012,11 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         &self,
         request: &PreparedSandboxRequest,
     ) -> Result<Option<(SandboxId, StoredSandbox)>> {
+        self.harness.check(self.owner).await?;
         let Some(name) = &request.name else {
             return Ok(None);
         };
-        let mut events = load_events(&self.harness.inner.storage, &self.owner_dir.join("events"))
+        let mut events = load_events(&self.harness.inner.storage, &self.owner_dir)
             .await?
             .into_iter()
             .filter(|event| event.data.kind() == EventKind::SANDBOX_CREATED)
@@ -2526,7 +3032,6 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 default_workdir,
                 file_system_mounts,
                 durable_file_systems,
-                enable_networking,
                 idle_seconds,
                 ..
             } = event.data
@@ -2536,7 +3041,20 @@ impl<'a> BasicScopedSandboxHandle<'a> {
             if event_name.as_ref() != Some(name) {
                 continue;
             }
-            let sandbox = self.load_sandbox(&sandbox_id).await?;
+            let Some(sandbox) = self
+                .harness
+                .inner
+                .storage
+                .get_json_if_exists::<StoredSandbox>(
+                    self.sandboxes_dir().join(format!("{sandbox_id}.json")),
+                )
+                .await?
+            else {
+                continue;
+            };
+            if self.harness.check_sandbox(&sandbox).is_err() {
+                continue;
+            }
             if !sandbox.running {
                 continue;
             }
@@ -2545,7 +3063,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 || default_workdir != request.default_workdir.clone().unwrap_or_default()
                 || file_system_mounts != request.file_system_mounts
                 || durable_file_systems != request.durable_file_systems
-                || enable_networking != request.enable_networking
+                || sandbox.policy() != request.policy
+                || sandbox.credentials != request.credentials
                 || idle_seconds != request.idle_seconds
             {
                 bail!("sandbox name {name:?} already exists with a different configuration");
@@ -2556,7 +3075,10 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn load_sandbox(&self, id: &str) -> Result<StoredSandbox> {
-        load_stored_sandbox(self.harness, &self.owner_dir, id).await
+        self.harness.check(self.owner).await?;
+        let sandbox = load_stored_sandbox(self.harness, &self.owner_dir, id).await?;
+        self.harness.check_sandbox(&sandbox)?;
+        Ok(sandbox)
     }
 
     async fn active_sandbox_handle(
@@ -2564,6 +3086,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         id: &SandboxId,
         sandbox: &StoredSandbox,
     ) -> Result<Arc<dyn ManagedSandboxHandle>> {
+        self.harness.check(self.owner).await?;
         let (handle, provider_state_event) =
             active_sandbox_handle(self.harness, &self.owner_dir, self.owner, id, sandbox).await?;
         if let Some(event) = provider_state_event {
@@ -2577,6 +3100,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
         sandbox_id: &str,
         process_id: &str,
     ) -> Result<Arc<RunningSandboxProcess>> {
+        self.harness.check(self.owner).await?;
         require_running_sandbox_process(self.harness, sandbox_id, process_id).await
     }
 
@@ -2594,6 +3118,7 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn append_events(&self, data: Vec<EventData>) -> Result<()> {
+        self.harness.check(self.owner).await?;
         if matches!(self.event_sink, BasicSandboxEventSink::None) {
             return Ok(());
         }
@@ -2602,15 +3127,12 @@ impl<'a> BasicScopedSandboxHandle<'a> {
     }
 
     async fn append_events_locked(&self, data: Vec<EventData>) -> Result<()> {
+        self.harness.check(self.owner).await?;
         match self.event_sink {
             BasicSandboxEventSink::None => Ok(()),
             BasicSandboxEventSink::Conversation { conversation_id } => {
-                let mut record = self
-                    .harness
-                    .inner
-                    .storage
-                    .get_json::<ConversationRecord>(self.owner_dir.join("record.json"))
-                    .await?;
+                let mut record =
+                    load_conversation_record(&self.harness.inner.storage, &self.owner_dir).await?;
                 append_events_to_conversation(
                     &self.harness.inner,
                     &self.owner_dir,
@@ -2622,11 +3144,6 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                     &mut record,
                 )
                 .await?;
-                self.harness
-                    .inner
-                    .storage
-                    .put_json(self.owner_dir.join("record.json"), &record)
-                    .await?;
                 Ok(())
             }
             BasicSandboxEventSink::Turn {
@@ -2636,12 +3153,8 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                 state,
             } => {
                 let expected_head = state.lock().expect("turn state poisoned").latest_event_id;
-                let mut record = self
-                    .harness
-                    .inner
-                    .storage
-                    .get_json::<ConversationRecord>(self.owner_dir.join("record.json"))
-                    .await?;
+                let mut record =
+                    load_conversation_record(&self.harness.inner.storage, &self.owner_dir).await?;
                 let add_result = append_events_to_conversation(
                     &self.harness.inner,
                     &self.owner_dir,
@@ -2653,11 +3166,6 @@ impl<'a> BasicScopedSandboxHandle<'a> {
                     &mut record,
                 )
                 .await?;
-                self.harness
-                    .inner
-                    .storage
-                    .put_json(self.owner_dir.join("record.json"), &record)
-                    .await?;
                 state.lock().expect("turn state poisoned").latest_event_id =
                     Some(add_result.latest_event_id);
                 Ok(())
@@ -2670,15 +3178,265 @@ struct BasicConversationHandle {
     harness: BasicExoHarness,
     agent_id: AgentId,
     record: ConversationRecord,
+    event_batch_index: Arc<Mutex<Option<EventBatchIndex>>>,
 }
 
 #[async_trait]
 impl ConversationHandle for BasicConversationHandle {
+    async fn activate_caller(&self) -> Result<bool> {
+        let Some(caller) = &self.harness.caller else {
+            return Ok(false);
+        };
+        caller
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
+        let path = self.conversation_dir().join("caller.json");
+        let active: Option<String> = self.harness.inner.storage.get_json_if_exists(&path).await?;
+        if active.as_deref() == Some(&caller.principal) {
+            return Ok(false);
+        }
+        let operator = BasicExoHarness {
+            inner: self.harness.inner.clone(),
+            caller: None,
+        };
+        let scope =
+            BasicScopedSandboxHandle::conversation(&operator, self.agent_id, self.record.id);
+        let reset = active.is_some() || !scope.list_sandboxes().await?.is_empty();
+        terminate_running_sandboxes(&scope).await?;
+        self.harness
+            .inner
+            .storage
+            .put_json(path, &caller.principal)
+            .await?;
+        Ok(reset)
+    }
+
+    async fn update_environment(
+        &self,
+        environment: crate::EnvironmentDefinition,
+    ) -> Result<Arc<dyn ConversationHandle>> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
+        environment.validate()?;
+        self.harness.check_environment(&environment).await?;
+        let _resources = self
+            .harness
+            .inner
+            .lock_thread_resources(self.agent_id, self.record.id)
+            .await;
+        let _guard = self.harness.inner.write_lock.lock().await;
+        let mut record = self.load_record().await?;
+        if record.environment.as_ref() != Some(&environment) {
+            if self
+                .harness
+                .inner
+                .resources
+                .has_thread(self.agent_id, record.id)
+            {
+                anyhow::ensure!(
+                    self.harness
+                        .inner
+                        .resources
+                        .external_provider(self.agent_id, record.id)?
+                        .is_some()
+                        == (environment.config.provider == SandboxProvider::Firecracker),
+                    "cannot move a thread's existing resources between local and Firecracker storage"
+                );
+            }
+            let scope = self.sandbox_handle();
+            for sandbox in scope.list_sandboxes().await? {
+                scope.terminate_sandbox_locked(sandbox.id).await?;
+            }
+            record = self.load_record().await?;
+            record.environment = Some(environment);
+            self.harness
+                .inner
+                .storage
+                .put_json(self.conversation_dir().join("record.json"), &record)
+                .await?;
+        }
+        Ok(Arc::new(Self {
+            harness: self.harness.clone(),
+            agent_id: self.agent_id,
+            record,
+            event_batch_index: Arc::clone(&self.event_batch_index),
+        }))
+    }
+
+    async fn attach_vaults(&self, vaults: Vec<VaultId>) -> Result<Arc<dyn ConversationHandle>> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
+        let _guard = self.harness.inner.write_lock.lock().await;
+        let mut record = self.load_record().await?;
+        require_vaults(&self.harness, &vaults).await?;
+        for vault in vaults {
+            if !record.vaults.contains(&vault) {
+                record.vaults.push(vault);
+            }
+        }
+        self.harness
+            .inner
+            .storage
+            .put_json(self.conversation_dir().join("record.json"), &record)
+            .await?;
+        Ok(Arc::new(Self {
+            harness: self.harness.clone(),
+            agent_id: self.agent_id,
+            record,
+            event_batch_index: Arc::clone(&self.event_batch_index),
+        }))
+    }
+
+    async fn materialize_resources(
+        &self,
+        resources: Vec<crate::resources::PreparedResource>,
+        provider: SandboxProvider,
+    ) -> Result<Vec<FileSystemMount>> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
+        if resources.is_empty() {
+            return Ok(Vec::new());
+        }
+        let store = self.harness.inner.resources.clone();
+        let agent = self.agent_id;
+        let thread = self.record.id;
+        let resources_guard = self
+            .harness
+            .inner
+            .lock_thread_resources(agent, thread)
+            .await;
+        let resume = store.has_thread(agent, thread);
+        let external = provider == SandboxProvider::Firecracker;
+        if resume {
+            anyhow::ensure!(
+                store.external_provider(agent, thread)?.is_some() == external,
+                "cannot move thread resources between Firecracker and directory-based sandboxes"
+            );
+        }
+        let backend = if external {
+            Some(
+                self.harness
+                    .inner
+                    .sandbox_backend_for_provider(provider)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let credentials = stream::iter(resources.iter().cloned().map(|resource| async move {
+            let credential = if !resume
+                && let crate::resources::ResourceSource::GitRepository {
+                    url: Some(url),
+                    credential,
+                    ..
+                } = &resource.definition.source
+            {
+                if let Some(name) = credential {
+                    tracing::info!(target: "exoharness::progress", "Loading Git credentials");
+                    let reference =
+                        crate::vault::find_secret(self, name)
+                            .await?
+                            .with_context(|| {
+                                format!(
+                                    "Git resource credential {name} is not in the selected vaults"
+                                )
+                            })?;
+                    let target = crate::vault::CredentialDestination::origin(
+                        &url::Url::parse(url)?.origin().ascii_serialization(),
+                    )?;
+                    let vault = crate::vault::require_vault(self, &reference.vault_id).await?;
+                    let resolved = vault.resolve_secret(&reference.secret_id, &target).await?;
+                    let value = resolved.secret.bearer_value().to_owned();
+                    Some(crate::resources::GitCredential {
+                        identity: format!("{}:{}", reference.vault_id, reference.secret_id),
+                        username: "x-access-token".into(),
+                        token: value,
+                    })
+                } else if external && cfg!(target_os = "macos") {
+                    let url = url.clone();
+                    tokio::task::spawn_blocking(move || crate::resources::host_git_credential(&url))
+                        .await??
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Ok::<_, anyhow::Error>(credential)
+        }))
+        .buffered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
+        let harness = self.harness.clone();
+        let record = self.conversation_dir().join("record.json");
+        tokio::spawn(async move {
+            // Keep the resource guards in the detached task: a cancelled caller
+            // must not let deletion race a still-running blocking materializer.
+            let _resources = resources_guard;
+            {
+                let _guard = harness.inner.write_lock.lock().await;
+                harness
+                    .inner
+                    .storage
+                    .get_json::<ConversationRecord>(record)
+                    .await?;
+            }
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                let Some(backend) = backend else {
+                    return store.materialize(agent, thread, resources, credentials);
+                };
+                store.remember_external(agent, thread, None)?;
+                let materialize = |sources| {
+                    runtime.block_on(backend.materialize_resources(
+                        crate::resources::MaterializeResourcesRequest {
+                            agent,
+                            thread,
+                            resources: resources.clone(),
+                            archives: sources,
+                            credentials,
+                            resume,
+                        },
+                    ))
+                };
+                let mounts = if resume {
+                    materialize(Default::default())?
+                } else {
+                    store.with_image_sources(&resources, materialize)?
+                };
+                store.remember_external(agent, thread, Some(&resources))?;
+                Ok(mounts)
+            })
+            .await?
+        })
+        .await?
+    }
+
     fn record(&self) -> &ConversationRecord {
         &self.record
     }
-
     async fn start_session(&self) -> Result<SessionId> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
         let session_id = Uuid7::now();
         self.append_events_internal(
             Some(session_id),
@@ -2691,12 +3449,24 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn end_session(&self, id: SessionId) -> Result<()> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
         self.append_events_internal(Some(id), None, None, vec![EventData::SessionEnded])
             .await?;
         Ok(())
     }
 
     async fn begin_turn(&self, request: BeginTurnRequest) -> Result<Arc<dyn TurnHandle>> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
         let _guard = self.harness.inner.write_lock.lock().await;
         let mut record = self.load_record().await?;
         let conversation_dir = self.conversation_dir();
@@ -2706,12 +3476,25 @@ impl ConversationHandle for BasicConversationHandle {
             id: Uuid7::now(),
             session_id,
         };
+        // Write the marker first: a crash may leave an extra candidate to scan,
+        // but cannot leave an admitted turn absent from the recovery index.
+        self.harness
+            .inner
+            .storage
+            .put_bytes(
+                unfinished_turn_marker_path(self.agent_id, self.record.id, turn_record.id),
+                Vec::new(),
+            )
+            .await?;
         let mut events_to_append = Vec::new();
 
         if request.session_id.is_none() {
             events_to_append.push(EventData::SessionStarted);
         }
-        events_to_append.push(EventData::TurnStarted);
+        events_to_append.push(EventData::TurnStarted {
+            user_id: self.harness.caller.as_ref().map(|c| c.principal.clone()),
+        });
+        events_to_append.extend(request.initial_events);
         if !request.input.is_empty() {
             events_to_append.push(EventData::Messages {
                 messages: request.input,
@@ -2731,17 +3514,15 @@ impl ConversationHandle for BasicConversationHandle {
             &mut record,
         )
         .await?;
-        self.harness
-            .inner
-            .storage
-            .put_json(conversation_dir.join("record.json"), &record)
-            .await?;
+        remember_appended_batch(&self.event_batch_index, &conversation_dir, &add_result);
 
         Ok(Arc::new(BasicTurnHandle {
             harness: self.harness.clone(),
+            agent_id: self.agent_id,
             conversation_dir,
             conversation_id: self.record.id,
             record: turn_record,
+            event_batch_index: Arc::clone(&self.event_batch_index),
             state: Mutex::new(BasicTurnState {
                 latest_event_id: Some(add_result.latest_event_id),
                 finished: false,
@@ -2750,7 +3531,13 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn turn_handle(&self, record: TurnRecord) -> Result<Arc<dyn TurnHandle>> {
-        let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
+        let events = load_events(&self.harness.inner.storage, &self.conversation_dir()).await?;
         let mut latest_event_id = None;
         let mut finished = false;
         for event in events
@@ -2770,9 +3557,11 @@ impl ConversationHandle for BasicConversationHandle {
         }
         Ok(Arc::new(BasicTurnHandle {
             harness: self.harness.clone(),
+            agent_id: self.agent_id,
             conversation_dir: self.conversation_dir(),
             conversation_id: self.record.id,
             record,
+            event_batch_index: Arc::clone(&self.event_batch_index),
             state: Mutex::new(BasicTurnState {
                 latest_event_id,
                 finished,
@@ -2781,7 +3570,13 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn get_events(&self, query: Option<EventQuery>) -> Result<GetEventsResult> {
-        let mut events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
+        let mut events = load_events(&self.harness.inner.storage, &self.conversation_dir()).await?;
         if let Some(query) = query {
             if let Some(session_id) = query.session_id {
                 events.retain(|event| event.session_id == Some(session_id));
@@ -2812,16 +3607,26 @@ impl ConversationHandle for BasicConversationHandle {
                 events.truncate(limit as usize);
             }
         }
+        // The cursor is a resume position, even on the final page; Basic's history
+        // cache needs it to avoid replaying events. Callers that scan until an empty
+        // page pay another full log read here, which is acceptable for Basic.
         let cursor = events.last().map(|event| event.id);
         Ok(GetEventsResult { events, cursor })
     }
 
     async fn watch_events(&self, after_exclusive: Bound<EventId>) -> Result<EventStream> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
         let _guard = self.harness.inner.write_lock.lock().await;
         let existing = match after_exclusive {
             Bound::Unbounded => Vec::new(),
             _ => {
-                let events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+                let events =
+                    load_events(&self.harness.inner.storage, &self.conversation_dir()).await?;
                 events
                     .into_iter()
                     .filter(|event| matches_bound(event.id, &after_exclusive))
@@ -2844,17 +3649,86 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn get_event(&self, id: EventId) -> Result<Option<Event>> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
+        let cached_keys = self
+            .event_batch_index
+            .lock()
+            .expect("event batch index poisoned")
+            .as_ref()
+            .map(|index| index.keys_containing(id));
+        if let Some(keys) = &cached_keys
+            && let Some(event) =
+                read_event_from_batches(&self.harness.inner.storage, keys.clone(), id).await?
+        {
+            return Ok(Some(event));
+        }
+
         let path = self.events_dir().join(format!("{id}.json"));
-        self.harness.inner.storage.get_json_if_exists(&path).await
+        if let Some(event) = self.harness.inner.storage.get_json_if_exists(&path).await? {
+            return Ok(Some(event));
+        }
+
+        // A miss may be a batch appended by another handle or process.
+        let event_keys = self
+            .harness
+            .inner
+            .storage
+            .list_keys(self.events_dir())
+            .await?;
+        let index = EventBatchIndex::from_keys(&event_keys);
+        let checked = cached_keys
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let new_keys = index
+            .keys_containing(id)
+            .into_iter()
+            .filter(|key| !checked.contains(key))
+            .collect();
+        *self
+            .event_batch_index
+            .lock()
+            .expect("event batch index poisoned") = Some(index);
+        read_event_from_batches(&self.harness.inner.storage, new_keys, id).await
     }
 
     async fn add_events(&self, request: AddEventsRequest) -> Result<AddEventsResult> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
         self.append_events_internal(request.session_id, request.turn_id, None, request.data)
             .await
     }
 
     async fn fork(&self, request: ForkConversationRequest) -> Result<Arc<dyn ConversationHandle>> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
+        let _resources = self
+            .harness
+            .inner
+            .lock_thread_resources(self.agent_id, self.record.id)
+            .await;
         let _guard = self.harness.inner.write_lock.lock().await;
+        anyhow::ensure!(
+            !self
+                .harness
+                .inner
+                .resources
+                .has_thread(self.agent_id, self.record.id),
+            "forking a thread with filesystem resources is not supported yet; create a new thread"
+        );
         let agent = BasicAgentHandle {
             harness: self.harness.clone(),
             record: self
@@ -2880,26 +3754,29 @@ impl ConversationHandle for BasicConversationHandle {
             }
             None => derive_unique_slug("fork", &existing),
         };
-        let mut events = load_events(&self.harness.inner.storage, &self.events_dir()).await?;
+        let mut events = load_events(&self.harness.inner.storage, &self.conversation_dir()).await?;
         if let Some(limit) = request.up_to_inclusive {
             events.retain(|event| event.id <= limit);
         }
         let record = ConversationRecord {
+            environment: self.record.environment.clone(),
+            vaults: self.record.vaults.clone(),
             id: Uuid7::now(),
             slug: slug.clone(),
             name: request.name.unwrap_or_else(|| slug_to_name(&slug)),
             latest_event_id: None,
         };
+        self.harness
+            .claim(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: record.id,
+            })
+            .await?;
         let conversation_dir = agent.conversations_dir().join(record.id.to_string());
         self.harness
             .inner
             .storage
             .copy_prefix(self.bindings_dir(), conversation_dir.join("bindings"))
-            .await?;
-        self.harness
-            .inner
-            .storage
-            .copy_prefix(self.secrets_dir(), conversation_dir.join("secrets"))
             .await?;
         self.harness
             .inner
@@ -2956,10 +3833,17 @@ impl ConversationHandle for BasicConversationHandle {
             harness: self.harness.clone(),
             agent_id: self.agent_id,
             record: fork_record,
+            event_batch_index: Arc::new(Mutex::new(Some(EventBatchIndex::default()))),
         }))
     }
 
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
         let _guard = self.harness.inner.write_lock.lock().await;
         let artifact_version =
             write_artifact_version(&self.harness.inner, &self.artifacts_dir(), request).await?;
@@ -2980,15 +3864,16 @@ impl ConversationHandle for BasicConversationHandle {
             &mut record,
         )
         .await?;
-        self.harness
-            .inner
-            .storage
-            .put_json(conversation_dir.join("record.json"), &record)
-            .await?;
         Ok(artifact_version)
     }
 
     async fn read_artifact(&self, request: ReadArtifactRequest) -> Result<Option<Artifact>> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
         let versions =
             load_artifact_versions(&self.harness.inner.storage, &self.artifacts_dir()).await?;
         let selected = versions
@@ -3014,136 +3899,19 @@ impl ConversationHandle for BasicConversationHandle {
     }
 
     async fn list_artifacts(&self) -> Result<Vec<ArtifactVersion>> {
+        self.harness
+            .check(ResourceScope::Thread {
+                agent_id: self.agent_id,
+                thread_id: self.record.id,
+            })
+            .await?;
         load_artifact_versions(&self.harness.inner.storage, &self.artifacts_dir()).await
-    }
-
-    async fn list_bindings(&self) -> Result<Vec<BindingRecord>> {
-        Ok(merge_binding_records(vec![
-            list_binding_records(&self.harness.inner.storage, &self.harness.bindings_dir()).await?,
-            list_binding_records(
-                &self.harness.inner.storage,
-                &agent_bindings_dir(&self.harness, self.agent_id),
-            )
-            .await?,
-            list_binding_records(&self.harness.inner.storage, &self.bindings_dir()).await?,
-        ]))
-    }
-
-    async fn put_binding(&self, binding: Binding) -> Result<BindingId> {
-        let _guard = self.harness.inner.write_lock.lock().await;
-        let id = Uuid7::now();
-        let record = stored_binding(id, binding);
-        self.harness
-            .inner
-            .storage
-            .put_json(self.bindings_dir().join(format!("{id}.json")), &record)
-            .await?;
-        Ok(id)
-    }
-
-    async fn get_binding(&self, id: &BindingId) -> Result<Option<Binding>> {
-        let local_path = self.bindings_dir().join(format!("{id}.json"));
-        if let Some(record) = self
-            .harness
-            .inner
-            .storage
-            .get_json_if_exists::<StoredBinding>(&local_path)
-            .await?
-        {
-            return Ok(Some(record.record.binding));
-        }
-        let agent_path =
-            agent_bindings_dir(&self.harness, self.agent_id).join(format!("{id}.json"));
-        if let Some(record) = self
-            .harness
-            .inner
-            .storage
-            .get_json_if_exists::<StoredBinding>(&agent_path)
-            .await?
-        {
-            return Ok(Some(record.record.binding));
-        }
-        self.harness.get_binding(id).await
-    }
-
-    async fn list_secrets(&self) -> Result<Vec<SecretMetadata>> {
-        Ok(merge_secret_metadata(vec![
-            list_secret_metadata(&self.harness.inner.storage, &self.harness.secrets_dir()).await?,
-            list_secret_metadata(
-                &self.harness.inner.storage,
-                &agent_secrets_dir(&self.harness, self.agent_id),
-            )
-            .await?,
-            list_secret_metadata(&self.harness.inner.storage, &self.secrets_dir()).await?,
-        ]))
-    }
-
-    async fn put_secret(&self, request: PutSecretRequest) -> Result<SecretId> {
-        let _guard = self.harness.inner.write_lock.lock().await;
-        let id = Uuid7::now();
-        let record = StoredSecret {
-            metadata: SecretMetadata {
-                id,
-                r#type: secret_type(&request.secret),
-                name: request.name,
-                created_at: id.timestamp().expect("uuid7 timestamp"),
-            },
-            secret: self
-                .harness
-                .inner
-                .secret_cipher
-                .encrypt_secret(&request.secret)?,
-        };
-        self.harness
-            .inner
-            .storage
-            .put_json(self.secrets_dir().join(format!("{id}.json")), &record)
-            .await?;
-        Ok(id)
-    }
-
-    async fn get_secret(&self, id: &SecretId) -> Result<Option<Secret>> {
-        let local_path = self.secrets_dir().join(format!("{id}.json"));
-        if let Some(record) = self
-            .harness
-            .inner
-            .storage
-            .get_json_if_exists::<StoredSecret>(&local_path)
-            .await?
-        {
-            return Ok(Some(
-                self.harness
-                    .inner
-                    .secret_cipher
-                    .decrypt_secret(&record.secret)?,
-            ));
-        }
-        let agent_path = agent_secrets_dir(&self.harness, self.agent_id).join(format!("{id}.json"));
-        let Some(record) = self
-            .harness
-            .inner
-            .storage
-            .get_json_if_exists::<StoredSecret>(&agent_path)
-            .await?
-        else {
-            return self.harness.get_secret(id).await;
-        };
-        Ok(Some(
-            self.harness
-                .inner
-                .secret_cipher
-                .decrypt_secret(&record.secret)?,
-        ))
     }
 }
 
 impl BasicSandboxScope for BasicConversationHandle {
     fn sandbox_handle(&self) -> BasicScopedSandboxHandle<'_> {
-        BasicScopedSandboxHandle::conversation(
-            &self.harness,
-            self.record.id,
-            self.conversation_dir(),
-        )
+        BasicScopedSandboxHandle::conversation(&self.harness, self.agent_id, self.record.id)
     }
 }
 
@@ -3155,9 +3923,10 @@ impl BasicConversationHandle {
     }
 
     fn conversation_dir(&self) -> PathBuf {
-        self.agent_dir()
-            .join("conversations")
-            .join(self.record.id.to_string())
+        self.harness.owner_dir(ResourceScope::Thread {
+            agent_id: self.agent_id,
+            thread_id: self.record.id,
+        })
     }
 
     fn events_dir(&self) -> PathBuf {
@@ -3166,10 +3935,6 @@ impl BasicConversationHandle {
 
     fn bindings_dir(&self) -> PathBuf {
         self.conversation_dir().join("bindings")
-    }
-
-    fn secrets_dir(&self) -> PathBuf {
-        self.conversation_dir().join("secrets")
     }
 
     fn artifacts_dir(&self) -> PathBuf {
@@ -3181,11 +3946,7 @@ impl BasicConversationHandle {
     }
 
     async fn load_record(&self) -> Result<ConversationRecord> {
-        self.harness
-            .inner
-            .storage
-            .get_json(self.conversation_dir().join("record.json"))
-            .await
+        load_conversation_record(&self.harness.inner.storage, &self.conversation_dir()).await
     }
 
     async fn append_events_internal(
@@ -3209,11 +3970,7 @@ impl BasicConversationHandle {
             &mut record,
         )
         .await?;
-        self.harness
-            .inner
-            .storage
-            .put_json(conversation_dir.join("record.json"), &record)
-            .await?;
+        remember_appended_batch(&self.event_batch_index, &conversation_dir, &add_result);
         Ok(add_result)
     }
 }
@@ -3278,7 +4035,7 @@ async fn snapshot_sandbox_side_effect(
 async fn start_sandbox_side_effect(
     harness: &BasicExoHarness,
     owner_dir: &Path,
-    owner: SandboxOwner,
+    owner: ResourceScope,
     request: StartSandboxRequest,
 ) -> Result<EventData> {
     let payload = load_snapshot_payload(harness, owner_dir, request.snapshot_id).await?;
@@ -3320,7 +4077,7 @@ async fn start_sandbox_side_effect(
     //   - Same provider: stop-then-boot. The backend replaces the warm
     //     container for this key itself during restore, and stopping the old
     //     handle after the new one exists would tear down the new container's
-    //     warm-cache entry (both handles share the same SandboxKey).
+    //     warm-cache entry (both handles share the same sandbox ID).
     let sandbox_handle = if cross_provider {
         let sandbox_handle = backend
             .acquire_from_snapshot(sandbox_request(owner, &request.id, &sandbox, None), payload)
@@ -3462,6 +4219,7 @@ async fn load_stored_sandbox(
 
 async fn prepare_sandbox_request(
     harness: &BasicExoHarness,
+    scope: ResourceScope,
     request: CreateSandboxRequest,
 ) -> Result<PreparedSandboxRequest> {
     let image = if !request.image.trim().is_empty() {
@@ -3476,7 +4234,31 @@ async fn prepare_sandbox_request(
         request.image.clone()
     };
 
+    let policy = request
+        .policy
+        .or_else(|| harness.inner.sandbox_policy.clone())
+        .unwrap_or_else(|| {
+            if request.enable_networking.unwrap_or(true) {
+                SandboxNetworkPolicy::Unrestricted.into()
+            } else {
+                SandboxNetworkPolicy::Disabled.into()
+            }
+        });
+    let context = ScopedVaultContext { harness, scope };
+    let credentials = futures::future::try_join_all(policy.credentials.iter().map(|binding| {
+        let context = &context;
+        async move {
+            let reference = crate::vault::find_secret(context, &binding.name)
+                .await?
+                .with_context(|| format!("egress credential not found: {}", binding.name))?;
+            Ok::<_, anyhow::Error>((binding.name.clone(), reference))
+        }
+    }))
+    .await?
+    .into_iter()
+    .collect();
     Ok(PreparedSandboxRequest {
+        credentials,
         name: request.name,
         provider: request.provider,
         image,
@@ -3484,8 +4266,9 @@ async fn prepare_sandbox_request(
         default_workdir: request.default_workdir,
         file_system_mounts: request.file_system_mounts.unwrap_or_default(),
         durable_file_systems: request.durable_file_systems.unwrap_or_default(),
-        enable_networking: request.enable_networking.unwrap_or(true),
+        policy,
         idle_seconds: request.idle_seconds.unwrap_or(60),
+        tcp_ports: request.tcp_ports,
     })
 }
 
@@ -3493,6 +4276,7 @@ async fn find_matching_stored_sandbox(
     storage: &BasicObjectStore,
     sandboxes_dir: &Path,
     request: &PreparedSandboxRequest,
+    principal: Option<&str>,
 ) -> Result<Option<(SandboxId, StoredSandbox)>> {
     let Some(name) = &request.name else {
         return Ok(None);
@@ -3502,6 +4286,9 @@ async fn find_matching_stored_sandbox(
         .await?;
     sandboxes.sort_by_key(|sandbox| sandbox.id.clone());
     for sandbox in sandboxes.into_iter().rev() {
+        if principal.is_some_and(|p| sandbox.principal.as_deref() != Some(p)) {
+            continue;
+        }
         if sandbox.name.as_ref() != Some(name) {
             continue;
         }
@@ -3518,8 +4305,10 @@ async fn find_matching_stored_sandbox(
             || sandbox.default_workdir != request.default_workdir
             || sandbox.file_system_mounts != request.file_system_mounts
             || sandbox.durable_file_systems != request.durable_file_systems
-            || sandbox.enable_networking != request.enable_networking
+            || sandbox.policy() != request.policy
+            || sandbox.credentials != request.credentials
             || sandbox.idle_seconds != request.idle_seconds
+            || sandbox.tcp_ports != request.tcp_ports
         {
             bail!("sandbox name {name:?} already exists with a different configuration");
         }
@@ -3531,7 +4320,7 @@ async fn find_matching_stored_sandbox(
 async fn active_sandbox_handle(
     harness: &BasicExoHarness,
     owner_dir: &Path,
-    owner: SandboxOwner,
+    owner: ResourceScope,
     sandbox_id: &SandboxId,
     sandbox: &StoredSandbox,
 ) -> Result<(Arc<dyn ManagedSandboxHandle>, Option<EventData>)> {
@@ -3577,7 +4366,7 @@ async fn active_sandbox_handle(
 async fn active_sandbox_handle_locked(
     harness: &BasicExoHarness,
     owner_dir: &Path,
-    owner: SandboxOwner,
+    owner: ResourceScope,
     sandbox_id: &SandboxId,
     sandbox: &StoredSandbox,
 ) -> Result<(Arc<dyn ManagedSandboxHandle>, Option<EventData>)> {
@@ -3606,7 +4395,7 @@ async fn active_sandbox_handle_locked(
 async fn create_sandbox_handle(
     harness: &BasicExoHarness,
     owner_dir: &Path,
-    owner: SandboxOwner,
+    owner: ResourceScope,
     sandbox_id: &SandboxId,
     sandbox: &StoredSandbox,
 ) -> Result<(Arc<dyn ManagedSandboxHandle>, Option<EventData>)> {
@@ -3640,26 +4429,34 @@ async fn create_sandbox_handle(
 }
 
 fn sandbox_provider_state_key(
-    owner: SandboxOwner,
+    owner: ResourceScope,
     sandbox_id: &SandboxId,
     sandbox: &StoredSandbox,
 ) -> String {
     let request = sandbox_request(owner, sandbox_id, sandbox, None);
-    format!("{}\n{}", request.key, sandbox_spec_hash(&request.spec))
+    let owner_key = match owner {
+        ResourceScope::Global => "global".to_owned(),
+        ResourceScope::Agent { agent_id } => format!("agent:{agent_id}"),
+        ResourceScope::Thread { thread_id, .. } => format!("thread:{thread_id}"),
+    };
+    format!(
+        "{owner_key}:{sandbox_id}\n{}",
+        sandbox_spec_hash(&request.spec)
+    )
 }
 
 async fn load_sandbox_provider_state(
     harness: &BasicExoHarness,
     owner_dir: &Path,
-    owner: SandboxOwner,
+    owner: ResourceScope,
     sandbox_id: &SandboxId,
     provider: SandboxProvider,
     state_key: &str,
 ) -> Result<Option<Value>> {
-    let SandboxOwner::Conversation(_) = owner else {
+    let ResourceScope::Thread { .. } = owner else {
         return Ok(None);
     };
-    let mut events = load_events(&harness.inner.storage, &owner_dir.join("events"))
+    let mut events = load_events(&harness.inner.storage, owner_dir)
         .await?
         .into_iter()
         .filter(|event| event.data.kind() == EventKind::custom(SANDBOX_PROVIDER_STATE_EVENT))
@@ -3734,9 +4531,11 @@ async fn require_running_sandbox_process(
 
 struct BasicTurnHandle {
     harness: BasicExoHarness,
+    agent_id: AgentId,
     conversation_dir: PathBuf,
     conversation_id: ConversationId,
     record: TurnRecord,
+    event_batch_index: Arc<Mutex<Option<EventBatchIndex>>>,
     state: Mutex<BasicTurnState>,
 }
 
@@ -3749,6 +4548,7 @@ impl BasicSandboxScope for BasicTurnHandle {
     fn sandbox_handle(&self) -> BasicScopedSandboxHandle<'_> {
         BasicScopedSandboxHandle::turn(
             &self.harness,
+            self.agent_id,
             self.conversation_id,
             self.conversation_dir.clone(),
             self.record.session_id,
@@ -3766,12 +4566,8 @@ impl TurnHandle for BasicTurnHandle {
 
     async fn add_events(&self, data: Vec<EventData>) -> Result<AddEventsResult> {
         let _guard = self.harness.inner.write_lock.lock().await;
-        let mut record = self
-            .harness
-            .inner
-            .storage
-            .get_json::<ConversationRecord>(self.conversation_dir.join("record.json"))
-            .await?;
+        let mut record =
+            load_conversation_record(&self.harness.inner.storage, &self.conversation_dir).await?;
         let expected_head = record.latest_event_id;
         let add_result = append_events_to_conversation(
             &self.harness.inner,
@@ -3784,11 +4580,7 @@ impl TurnHandle for BasicTurnHandle {
             &mut record,
         )
         .await?;
-        self.harness
-            .inner
-            .storage
-            .put_json(self.conversation_dir.join("record.json"), &record)
-            .await?;
+        remember_appended_batch(&self.event_batch_index, &self.conversation_dir, &add_result);
         self.state
             .lock()
             .expect("turn state poisoned")
@@ -3798,12 +4590,8 @@ impl TurnHandle for BasicTurnHandle {
 
     async fn write_artifact(&self, request: WriteArtifactRequest) -> Result<ArtifactVersion> {
         let _guard = self.harness.inner.write_lock.lock().await;
-        let mut record = self
-            .harness
-            .inner
-            .storage
-            .get_json::<ConversationRecord>(self.conversation_dir.join("record.json"))
-            .await?;
+        let mut record =
+            load_conversation_record(&self.harness.inner.storage, &self.conversation_dir).await?;
         let expected_head = record.latest_event_id;
         let artifact_version = write_artifact_version(
             &self.harness.inner,
@@ -3826,11 +4614,6 @@ impl TurnHandle for BasicTurnHandle {
             &mut record,
         )
         .await?;
-        self.harness
-            .inner
-            .storage
-            .put_json(self.conversation_dir.join("record.json"), &record)
-            .await?;
         self.state
             .lock()
             .expect("turn state poisoned")
@@ -3840,20 +4623,32 @@ impl TurnHandle for BasicTurnHandle {
 
     async fn finish(&self) -> Result<EventId> {
         let _guard = self.harness.inner.write_lock.lock().await;
-        {
+        let finished_event_id = {
             let state = self.state.lock().expect("turn state poisoned");
             if state.finished {
-                return state
-                    .latest_event_id
-                    .ok_or_else(|| anyhow!("turn has no latest event id"));
+                Some(
+                    state
+                        .latest_event_id
+                        .ok_or_else(|| anyhow!("turn has no latest event id"))?,
+                )
+            } else {
+                None
             }
+        };
+        if let Some(event_id) = finished_event_id {
+            self.harness
+                .inner
+                .storage
+                .delete_key_if_exists(unfinished_turn_marker_path(
+                    self.agent_id,
+                    self.conversation_id,
+                    self.record.id,
+                ))
+                .await?;
+            return Ok(event_id);
         }
-        let mut record = self
-            .harness
-            .inner
-            .storage
-            .get_json::<ConversationRecord>(self.conversation_dir.join("record.json"))
-            .await?;
+        let mut record =
+            load_conversation_record(&self.harness.inner.storage, &self.conversation_dir).await?;
         let expected_head = record.latest_event_id;
         let add_result = append_events_to_conversation(
             &self.harness.inner,
@@ -3866,15 +4661,21 @@ impl TurnHandle for BasicTurnHandle {
             &mut record,
         )
         .await?;
+        let latest = add_result.latest_event_id;
+        {
+            let mut state = self.state.lock().expect("turn state poisoned");
+            state.latest_event_id = Some(latest);
+            state.finished = true;
+        }
         self.harness
             .inner
             .storage
-            .put_json(self.conversation_dir.join("record.json"), &record)
+            .delete_key_if_exists(unfinished_turn_marker_path(
+                self.agent_id,
+                self.conversation_id,
+                self.record.id,
+            ))
             .await?;
-        let latest = add_result.latest_event_id;
-        let mut state = self.state.lock().expect("turn state poisoned");
-        state.latest_event_id = Some(latest);
-        state.finished = true;
         Ok(latest)
     }
 }
@@ -3882,6 +4683,12 @@ impl TurnHandle for BasicTurnHandle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredBinding {
     record: BindingRecord,
+}
+
+impl StoredBinding {
+    fn into_active_record(self) -> Option<BindingRecord> {
+        (!matches!(self.record.binding, Binding::Llm { .. })).then_some(self.record)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3898,13 +4705,15 @@ struct StoredArtifactMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredSandbox {
+    #[serde(default)]
+    principal: Option<String>,
     id: SandboxId,
     #[serde(default)]
     name: Option<String>,
     provider: SandboxProvider,
     image: String,
-    #[serde(default)]
-    resources: crate::SandboxResourceShape,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resources: Option<crate::SandboxResourceShape>,
     /// The image originally requested at creation, kept when a snapshot
     /// restore rewrites `image` to the restored tag. Named-sandbox matching
     /// compares against this so config-derived requests still resolve to the
@@ -3915,12 +4724,38 @@ struct StoredSandbox {
     file_system_mounts: Vec<FileSystemMount>,
     #[serde(default)]
     durable_file_systems: Vec<DurableFileSystem>,
-    enable_networking: bool,
+    #[serde(flatten)]
+    network: StoredSandboxPolicy,
+    #[serde(default)]
+    credentials: BTreeMap<String, SecretReference>,
     idle_seconds: u64,
+    #[serde(default)]
+    tcp_ports: Vec<u16>,
     running: bool,
     latest_snapshot_id: Option<SnapshotId>,
     #[serde(default)]
     attachment: Option<SandboxAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum StoredSandboxPolicy {
+    Policy { policy: crate::EgressPolicy },
+    Legacy { enable_networking: bool },
+}
+
+impl StoredSandbox {
+    fn policy(&self) -> crate::EgressPolicy {
+        match &self.network {
+            StoredSandboxPolicy::Policy { policy } => policy.clone(),
+            StoredSandboxPolicy::Legacy {
+                enable_networking: true,
+            } => SandboxNetworkPolicy::Unrestricted.into(),
+            StoredSandboxPolicy::Legacy {
+                enable_networking: false,
+            } => SandboxNetworkPolicy::Disabled.into(),
+        }
+    }
 }
 
 impl From<StoredSandbox> for SandboxRecord {
@@ -3940,17 +4775,20 @@ struct PreparedSandboxRequest {
     name: Option<String>,
     provider: SandboxProvider,
     image: String,
-    resources: crate::SandboxResourceShape,
+    resources: Option<crate::SandboxResourceShape>,
     default_workdir: Option<String>,
     file_system_mounts: Vec<FileSystemMount>,
     durable_file_systems: Vec<DurableFileSystem>,
-    enable_networking: bool,
+    policy: crate::EgressPolicy,
+    credentials: BTreeMap<String, SecretReference>,
     idle_seconds: u64,
+    tcp_ports: Vec<u16>,
 }
 
 impl PreparedSandboxRequest {
     fn stored_sandbox(&self, id: SandboxId) -> StoredSandbox {
         StoredSandbox {
+            principal: None,
             id,
             name: self.name.clone(),
             provider: self.provider.clone(),
@@ -3960,8 +4798,12 @@ impl PreparedSandboxRequest {
             default_workdir: self.default_workdir.clone(),
             file_system_mounts: self.file_system_mounts.clone(),
             durable_file_systems: self.durable_file_systems.clone(),
-            enable_networking: self.enable_networking,
+            network: StoredSandboxPolicy::Policy {
+                policy: self.policy.clone(),
+            },
+            credentials: self.credentials.clone(),
             idle_seconds: self.idle_seconds,
+            tcp_ports: self.tcp_ports.clone(),
             running: true,
             latest_snapshot_id: None,
             attachment: None,
@@ -3982,7 +4824,7 @@ struct PendingSandboxProcess {
 async fn prepare_sandbox_process(
     harness: &BasicExoHarness,
     owner_dir: &Path,
-    owner: SandboxOwner,
+    owner: ResourceScope,
     event_log: Option<SandboxProcessEventLog>,
     request: StartSandboxProcessRequest,
 ) -> Result<PendingSandboxProcess> {
@@ -4010,7 +4852,11 @@ async fn prepare_sandbox_process(
     let parts = sandbox_handle
         .start_process(&SandboxCommand {
             argv: command.clone(),
-            env: request.env,
+            env: harness.inner.resources.command_env(
+                owner,
+                &sandbox.file_system_mounts,
+                request.env,
+            )?,
             display_argv: Some(command.clone()),
             cwd: cwd.clone(),
             timeout: None,
@@ -4331,11 +5177,8 @@ async fn append_sandbox_process_data(
         return Ok(());
     };
     let _guard = event_log.inner.write_lock.lock().await;
-    let mut record = event_log
-        .inner
-        .storage
-        .get_json::<ConversationRecord>(event_log.conversation_dir.join("record.json"))
-        .await?;
+    let mut record =
+        load_conversation_record(&event_log.inner.storage, &event_log.conversation_dir).await?;
     append_events_to_conversation(
         &event_log.inner,
         &event_log.conversation_dir,
@@ -4347,11 +5190,6 @@ async fn append_sandbox_process_data(
         &mut record,
     )
     .await?;
-    event_log
-        .inner
-        .storage
-        .put_json(event_log.conversation_dir.join("record.json"), &record)
-        .await?;
     Ok(())
 }
 
@@ -4409,22 +5247,14 @@ impl SandboxProcess for LiveSandboxProcess {
 }
 
 fn sandbox_request(
-    owner: SandboxOwner,
+    owner: ResourceScope,
     sandbox_id: &str,
     sandbox: &StoredSandbox,
     provider_state: Option<Value>,
 ) -> SandboxRequest {
     SandboxRequest {
-        key: match owner {
-            SandboxOwner::Agent(agent_id) => SandboxKey::AgentSandbox {
-                agent_id: agent_id.to_string(),
-                sandbox_id: sandbox_id.to_string(),
-            },
-            SandboxOwner::Conversation(thread_id) => SandboxKey::ConversationSandbox {
-                thread_id: thread_id.to_string(),
-                sandbox_id: sandbox_id.to_string(),
-            },
-        },
+        sandbox_id: sandbox_id.to_string(),
+        scope: owner,
         spec: SandboxSpec {
             image: sandbox.image.clone(),
             resources: sandbox.resources,
@@ -4442,15 +5272,12 @@ fn sandbox_request(
                 })
                 .collect(),
             durable_file_systems: sandbox.durable_file_systems.clone(),
-            network: if sandbox.enable_networking {
-                SandboxNetworkPolicy::Enabled
-            } else {
-                SandboxNetworkPolicy::Disabled
-            },
+            policy: sandbox.policy(),
             default_workdir: sandbox
                 .default_workdir
                 .clone()
                 .unwrap_or_else(|| SANDBOX_MAIN_MOUNT_DIR.to_string()),
+            tcp_ports: sandbox.tcp_ports.clone(),
         },
         lifecycle: SandboxLifecycleConfig {
             idle_ttl: Some(std::time::Duration::from_secs(sandbox.idle_seconds)),
@@ -4480,8 +5307,7 @@ async fn append_events_to_conversation(
             turn_id,
         )?;
     }
-    let mut event_ids = Vec::new();
-    let mut latest_event_id = None;
+    let mut events = Vec::with_capacity(data.len());
     for data in data {
         let id = Uuid7::now();
         let event = Event {
@@ -4492,20 +5318,37 @@ async fn append_events_to_conversation(
             created_at: id.timestamp().expect("uuid7 timestamp"),
             data,
         };
+        events.push(event);
+    }
+    let first_event_id = events.first().expect("at least one event").id;
+    let latest_event_id = events.last().expect("at least one event").id;
+    if events.len() == 1 {
         inner
             .storage
             .put_json(
                 conversation_dir
                     .join("events")
-                    .join(format!("{}.json", event.id)),
-                &event,
+                    .join(format!("{latest_event_id}.json")),
+                &events[0],
             )
             .await?;
-        notify_subscribers(inner, conversation_id, event.clone());
-        latest_event_id = Some(event.id);
-        event_ids.push(event.id);
+    } else {
+        // One object put commits the whole batch. The filename bounds let
+        // get_event skip unrelated batches without a separate index write.
+        let batch = StoredEventBatch { events };
+        inner
+            .storage
+            .put_json(
+                event_batch_path(conversation_dir, first_event_id, latest_event_id),
+                &batch,
+            )
+            .await?;
+        events = batch.events;
     }
-    let latest_event_id = latest_event_id.expect("at least one event");
+    let event_ids = events.iter().map(|event| event.id).collect();
+    for event in events {
+        notify_subscribers(inner, conversation_id, event);
+    }
     record.latest_event_id = Some(latest_event_id);
     Ok(AddEventsResult {
         event_ids,
@@ -4589,12 +5432,99 @@ fn matches_bound(event_id: EventId, bound: &Bound<EventId>) -> bool {
     }
 }
 
-async fn load_events(storage: &BasicObjectStore, events_dir: &Path) -> Result<Vec<Event>> {
-    let mut events = storage
-        .list_json_matching_suffix::<Event>(events_dir, ".json")
-        .await?;
+async fn read_event_from_batches(
+    storage: &BasicObjectStore,
+    keys: Vec<String>,
+    id: EventId,
+) -> Result<Option<Event>> {
+    let matching_events = stream::iter(keys)
+        .map(|key| async move {
+            storage
+                .get_json_if_exists::<StoredEventBatch>(Path::new(&key))
+                .await
+        })
+        .buffered(16)
+        .try_filter_map(|batch| async move {
+            Ok(batch.and_then(|batch| batch.events.into_iter().find(|event| event.id == id)))
+        });
+    futures::pin_mut!(matching_events);
+    matching_events.try_next().await
+}
+
+async fn load_events(storage: &BasicObjectStore, conversation_dir: &Path) -> Result<Vec<Event>> {
+    let keys = storage
+        .list_keys(conversation_dir.join("events"))
+        .await?
+        .into_iter()
+        .filter(|key| event_id_from_key(key).is_some());
+    let mut events = stream::iter(keys)
+        .map(|key| async move {
+            if is_event_batch_key(&key) {
+                Ok::<_, anyhow::Error>(
+                    storage
+                        .get_json_if_exists::<StoredEventBatch>(Path::new(&key))
+                        .await?
+                        .map(|batch| batch.events)
+                        .unwrap_or_default(),
+                )
+            } else {
+                Ok(storage
+                    .get_json_if_exists::<Event>(Path::new(&key))
+                    .await?
+                    .into_iter()
+                    .collect())
+            }
+        })
+        .buffered(16)
+        .try_collect::<Vec<Vec<Event>>>()
+        .await?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
     events.sort_by_key(|event| event.id);
     Ok(events)
+}
+
+async fn load_conversation_record(
+    storage: &BasicObjectStore,
+    conversation_dir: &Path,
+) -> Result<ConversationRecord> {
+    let mut record = storage
+        .get_json::<ConversationRecord>(conversation_dir.join("record.json"))
+        .await?;
+    // Event objects are authoritative. record.json also stores mutable thread
+    // metadata, but its cached head need not be rewritten after every append.
+    record.latest_event_id = latest_committed_event_id(storage, conversation_dir).await?;
+    Ok(record)
+}
+
+async fn latest_committed_event_id(
+    storage: &BasicObjectStore,
+    conversation_dir: &Path,
+) -> Result<Option<EventId>> {
+    let keys = storage.list_keys(conversation_dir.join("events")).await?;
+    Ok(latest_event_id_from_keys(&keys))
+}
+
+fn latest_event_id_from_keys(keys: &[String]) -> Option<EventId> {
+    keys.iter().filter_map(|key| event_id_from_key(key)).max()
+}
+
+fn event_id_from_key(key: &str) -> Option<EventId> {
+    if let Some((_, last)) = event_batch_range_from_key(key) {
+        return Some(last);
+    }
+    key.rsplit('/').next()?.strip_suffix(".json")?.parse().ok()
+}
+
+fn event_batch_range_from_key(key: &str) -> Option<(EventId, EventId)> {
+    let range = key.rsplit('/').next()?.strip_suffix(".batch.json")?;
+    let (first, last) = range.split_once('_')?;
+    Some((first.parse().ok()?, last.parse().ok()?))
+}
+
+fn is_event_batch_key(key: &str) -> bool {
+    key.ends_with(".batch.json")
 }
 
 async fn load_artifact_versions(
@@ -4681,7 +5611,7 @@ async fn list_binding_records(
         .list_json_matching_suffix::<StoredBinding>(bindings_dir, ".json")
         .await?
         .into_iter()
-        .map(|stored| stored.record)
+        .filter_map(StoredBinding::into_active_record)
         .collect::<Vec<_>>();
     bindings.sort_by_key(|metadata| metadata.id);
     Ok(bindings)
@@ -4699,44 +5629,6 @@ fn stored_binding(id: BindingId, binding: Binding) -> StoredBinding {
     }
 }
 
-async fn list_secret_metadata(
-    storage: &BasicObjectStore,
-    secrets_dir: &Path,
-) -> Result<Vec<SecretMetadata>> {
-    let mut secrets = storage
-        .list_json_matching_suffix::<StoredSecret>(secrets_dir, ".json")
-        .await?
-        .into_iter()
-        .map(|secret| secret.metadata)
-        .collect::<Vec<_>>();
-    secrets.sort_by_key(|metadata| metadata.id);
-    Ok(secrets)
-}
-
-fn merge_binding_records(scopes: Vec<Vec<BindingRecord>>) -> Vec<BindingRecord> {
-    let mut effective = HashMap::<String, BindingRecord>::new();
-    for bindings in scopes {
-        for binding in bindings {
-            effective.insert(binding.name.clone(), binding);
-        }
-    }
-    let mut bindings = effective.into_values().collect::<Vec<_>>();
-    bindings.sort_by_key(|metadata| metadata.id);
-    bindings
-}
-
-fn merge_secret_metadata(scopes: Vec<Vec<SecretMetadata>>) -> Vec<SecretMetadata> {
-    let mut effective = HashMap::<String, SecretMetadata>::new();
-    for secrets in scopes {
-        for secret in secrets {
-            effective.insert(secret.name.clone(), secret);
-        }
-    }
-    let mut secrets = effective.into_values().collect::<Vec<_>>();
-    secrets.sort_by_key(|metadata| metadata.id);
-    secrets
-}
-
 fn binding_type(binding: &Binding) -> BindingType {
     match binding {
         Binding::Env { .. } => BindingType::Env,
@@ -4752,13 +5644,6 @@ fn binding_name(binding: &Binding) -> &str {
         | Binding::Mcp { name, .. }
         | Binding::Llm { name, .. }
         | Binding::Sandbox { name, .. } => name,
-    }
-}
-
-fn secret_type(secret: &Secret) -> SecretType {
-    match secret {
-        Secret::Key { .. } => SecretType::Key,
-        Secret::Oauth { .. } => SecretType::Oauth,
     }
 }
 
@@ -4780,21 +5665,7 @@ fn slug_to_name(slug: &str) -> String {
     slug.replace('-', " ")
 }
 
-fn agent_bindings_dir(harness: &BasicExoHarness, agent_id: AgentId) -> PathBuf {
-    harness
-        .agents_dir()
-        .join(agent_id.to_string())
-        .join("bindings")
-}
-
-fn agent_secrets_dir(harness: &BasicExoHarness, agent_id: AgentId) -> PathBuf {
-    harness
-        .agents_dir()
-        .join(agent_id.to_string())
-        .join("secrets")
-}
-
-fn build_secret_cipher(
+pub(crate) fn build_secret_cipher(
     choice: SecretBackendChoice,
     keychain_account: String,
 ) -> Result<SecretCipher> {
@@ -4819,12 +5690,114 @@ fn build_secret_cipher(
 }
 
 #[cfg(test)]
+mod atomicity_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn failed_event_batch_is_invisible_and_can_be_retried_after_restart() -> Result<()> {
+        let temp = tempfile::TempDir::new()?;
+        let harness =
+            BasicExoHarness::new(crate::test_support::local_test_config(temp.path())).await?;
+        let agent = harness
+            .new_agent(NewAgentRequest {
+                slug: "atomicity-test".to_string(),
+                name: "Atomicity test".to_string(),
+                vaults: vec![],
+            })
+            .await?;
+        let thread = agent
+            .new_conversation(NewConversationRequest::default())
+            .await?;
+        let agent_id = agent.record().id;
+        let thread_id = thread.record().id;
+        let committed_head = thread.record().latest_event_id;
+
+        let batch = AddEventsRequest {
+            session_id: None,
+            turn_id: None,
+            data: vec![
+                EventData::Error {
+                    message: "first".to_string(),
+                    metadata: None,
+                },
+                EventData::Error {
+                    message: "second".to_string(),
+                    metadata: None,
+                },
+            ],
+        };
+
+        // The entire batch is one object write, so a failed write publishes no events.
+        harness.inner.storage.fail_json_put_after(0);
+        let error = thread
+            .add_events(batch.clone())
+            .await
+            .expect_err("the batch object write should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("injected JSON object write failure")
+        );
+
+        drop(thread);
+        drop(agent);
+        drop(harness);
+
+        let reopened =
+            BasicExoHarness::new(crate::test_support::local_test_config(temp.path())).await?;
+        let agent = reopened
+            .get_agent(&agent_id)
+            .await?
+            .expect("agent survives restart");
+        let thread = agent
+            .get_thread(&thread_id)
+            .await?
+            .expect("thread survives restart");
+        let events = thread.get_events(None).await?.events;
+        let error_messages = events
+            .iter()
+            .filter_map(|event| match &event.data {
+                EventData::Error { message, .. } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(error_messages.is_empty());
+        assert_eq!(thread.record().latest_event_id, committed_head);
+        assert_eq!(events.last().map(|event| event.id), committed_head);
+
+        // Retrying publishes each event exactly once.
+        let retry = thread.add_events(batch).await?;
+        let thread = agent
+            .get_thread(&thread_id)
+            .await?
+            .expect("thread survives retry");
+        let error_messages = thread
+            .get_events(None)
+            .await?
+            .events
+            .into_iter()
+            .filter_map(|event| match event.data {
+                EventData::Error { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(error_messages, ["first", "second"]);
+        assert_eq!(thread.record().latest_event_id, Some(retry.latest_event_id));
+        for id in retry.event_ids {
+            assert!(thread.get_event(id).await?.is_some());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod snapshot_manifest_tests {
     use super::*;
 
     #[test]
     fn snapshot_format_validation_uses_backend_capabilities() {
-        let docker = CliContainerSandboxBackend::docker();
+        let docker = crate::CliContainerSandboxBackend::docker();
         ensure_snapshot_format_supported(
             &docker,
             &SandboxProvider::Docker,
@@ -4858,4 +5831,185 @@ mod snapshot_manifest_tests {
         assert_eq!(rewritten.get("format").unwrap(), "docker-image-tar");
         assert!(rewritten.get("kind").is_none());
     }
+}
+
+impl BasicExoHarnessConfig {
+    pub fn validate_secret_mount(&self, host_path: &Path) -> Result<()> {
+        let host_path = host_path.canonicalize()?;
+        let mut protected = vec![self.root.join("vaults")];
+        if let SecretBackendChoice::File { path } = &self.secret_backend {
+            protected.push(
+                path.clone()
+                    .map(Ok)
+                    .unwrap_or_else(crate::secrets::default_master_key_path)?,
+            );
+        }
+        for path in protected {
+            let path = std::path::absolute(path)?;
+            let mut ancestor = path.as_path();
+            let mut canonical = loop {
+                match ancestor.canonicalize() {
+                    Ok(canonical) => break canonical,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        ancestor = ancestor
+                            .parent()
+                            .context("protected path has no existing ancestor")?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            };
+            for component in path.strip_prefix(ancestor)?.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        canonical.pop();
+                    }
+                    component => canonical.push(component),
+                }
+            }
+            if canonical.starts_with(&host_path) || host_path.starts_with(&canonical) {
+                bail!(
+                    "sandbox mount {} exposes vault storage or its master key",
+                    host_path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod stored_policy_tests {
+    use super::*;
+
+    #[test]
+    fn ignores_retired_fields_in_stored_sandbox_credential_bindings() {
+        let stored: StoredSandbox = serde_json::from_str(
+            r#"{
+                "id": "existing-native-sandbox", "provider": "docker", "image": "test",
+                "file_system_mounts": [], "idle_seconds": 300, "running": true,
+                "policy": {
+                    "networking": {"type": "unrestricted"},
+                    "credentials": [{
+                        "name": "model:01900000-0000-7000-8000-000000000001",
+                        "model": "01900000-0000-7000-8000-000000000001",
+                        "environment_variable": "OPENAI_API_KEY",
+                        "networking": {"type": "limited", "allowed_hosts": ["api.openai.com"]},
+                        "injection_location": {"header": true}
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        let policy = stored.policy();
+        assert_eq!(policy.credentials.len(), 1);
+        assert_eq!(policy.credentials[0].environment_variable, "OPENAI_API_KEY");
+        let serialized = serde_json::to_string(&stored).unwrap();
+        assert!(!serialized.contains("\"model\":"));
+        let current: StoredSandbox = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(current.policy().credentials, policy.credentials);
+        assert!(
+            serde_json::from_str::<StoredSandbox>(
+                &serialized.replace("\"environment_variable\":", "\"misspelled_variable\":")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reads_legacy_networking_and_writes_only_the_policy() {
+        let mut legacy: StoredSandbox = serde_json::from_value(serde_json::json!({
+            "id": "legacy", "provider": "local_process", "image": "",
+            "default_workdir": null, "file_system_mounts": [],
+            "enable_networking": false, "idle_seconds": 60,
+            "running": true, "latest_snapshot_id": null
+        }))
+        .unwrap();
+        assert!(!legacy.policy().networking_enabled());
+        legacy.network = StoredSandboxPolicy::Policy {
+            policy: legacy.policy(),
+        };
+        let serialized = serde_json::to_string(&legacy).unwrap();
+        assert!(!serialized.contains("enable_networking"));
+        let current: StoredSandbox = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(current.policy(), legacy.policy());
+        assert!(
+            serde_json::from_value::<StoredSandbox>(serde_json::json!({
+                "id": "invalid-policy", "provider": "local_process", "image": "",
+                "default_workdir": null, "file_system_mounts": [],
+                "enable_networking": true, "idle_seconds": 60,
+                "running": true, "latest_snapshot_id": null,
+                "policy": {"networking": {"type": "unsupported"}}
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[cfg(all(test, feature = "firecracker"))]
+mod egress_resolution_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn policy_overrides_the_legacy_networking_flag() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut config = crate::test_support::local_test_config(directory.path());
+        let limited: crate::EgressPolicy = SandboxNetworkPolicy::Limited {
+            allowed_hosts: vec!["api.test".into()],
+        }
+        .into();
+        config.sandbox_policy = Some(limited.clone());
+        let harness = BasicExoHarness::new(config).await?;
+        let request = CreateSandboxRequest {
+            tcp_ports: vec![],
+            name: None,
+            provider: SandboxProvider::LocalProcess,
+            image: "".into(),
+            resources: Default::default(),
+            default_workdir: None,
+            file_system_mounts: None,
+            durable_file_systems: None,
+            policy: None,
+            enable_networking: Some(false),
+            idle_seconds: None,
+        };
+        assert_eq!(
+            prepare_sandbox_request(&harness, ResourceScope::Global, request.clone())
+                .await?
+                .policy,
+            limited
+        );
+        assert_eq!(
+            prepare_sandbox_request(
+                &harness,
+                ResourceScope::Global,
+                CreateSandboxRequest {
+                    policy: Some(SandboxNetworkPolicy::Disabled.into()),
+                    enable_networking: Some(true),
+                    ..request
+                }
+            )
+            .await?
+            .policy
+            .networking,
+            SandboxNetworkPolicy::Disabled
+        );
+        Ok(())
+    }
+}
+
+async fn remove_thread_resources(
+    harness: &BasicExoHarness,
+    agent: AgentId,
+    thread: ConversationId,
+) -> Result<()> {
+    let store = harness.inner.resources.clone();
+    if let Some(provider) = store.external_provider(agent, thread)? {
+        harness
+            .inner
+            .sandbox_backend_for_provider(provider)
+            .await?
+            .remove_thread_resources(agent, thread)
+            .await?;
+    }
+    tokio::task::spawn_blocking(move || store.remove_thread(agent, thread)).await?
 }

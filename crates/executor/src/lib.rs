@@ -11,18 +11,33 @@ mod conversation_sandbox;
 mod conversation_wakeup;
 mod execution_tracing;
 mod executor_types;
-mod harness_basic;
+pub use exoharness::harness;
+mod harness_adapter;
 #[cfg(test)]
 mod harness_basic_tests;
 mod harness_config;
+mod harness_events;
 mod harness_executor;
-mod harness_facade;
 mod harness_helpers;
 mod harness_js_repl;
 mod harness_runtime;
+#[cfg(test)]
+mod harness_test;
 mod harness_tool;
 mod harness_types;
+mod http_provider;
+pub mod http_service;
+#[cfg(test)]
+mod http_tests;
 mod local_sandbox;
+pub mod managed_agents;
+mod mcp;
+mod message_history;
+mod model_events;
+mod model_execution;
+pub mod permissions;
+mod provider;
+pub mod remote;
 mod rlm;
 #[cfg(test)]
 mod rlm_tests;
@@ -63,10 +78,10 @@ pub use exoharness::{
     PutSecretRequest, RunInSandboxRequest, SANDBOX_MAIN_MOUNT_DIR, SandboxAttachment,
     SandboxBackendRegistration, SandboxId, SandboxProcess, SandboxProvider, SandboxProviderConfig,
     SandboxRecord, SandboxResourceShape, Secret, SecretBackendChoice, SecretMetadata, SessionId,
-    SnapshotId, SpritesBackendSpec, StartSandboxRequest, ToolRequest, Uuid7, VercelBackendSpec,
-    default_aws_agentcore_image, default_daytona_image, default_docker_image, default_e2b_template,
-    default_firecracker_image, default_vercel_image, serve_exoharness_http_listener,
-    serve_exoharness_http_listener_with_options,
+    SnapshotId, SpritesBackendSpec, StartSandboxRequest, ToolRequest, TurnId, UsageRecord, Uuid7,
+    VercelBackendSpec, default_aws_agentcore_image, default_daytona_image, default_docker_image,
+    default_e2b_template, default_firecracker_image, default_vercel_image,
+    serve_exoharness_http_listener, serve_exoharness_http_listener_with_options,
 };
 #[cfg(feature = "firecracker")]
 pub use exoharness::{
@@ -76,14 +91,19 @@ pub use exoharness::{
     DEFAULT_VCPU_COUNT, DEFAULT_WORKSPACE_SIZE_GIB, FirecrackerConfig, FirecrackerLimaConfig,
     run_firecracker_bridge,
 };
-pub use harness_basic::BasicHarness;
-pub use harness_config::load_agent_config;
-pub use harness_tool::{BasicToolRuntime, ExoToolRuntime};
-pub use harness_types::{
-    CreateAgentRequest, CreateConversationRequest, Harness, HarnessAgent, HarnessConversation,
+pub use harness_config::{find_agent_config, load_agent_config, load_conversation_config};
+pub use harness_executor::Runtime;
+pub use harness_helpers::{
+    get_conversation_model_override, materialize_conversation_messages,
+    put_conversation_model_override,
 };
+pub use harness_runtime::RouterModelClient;
+pub use harness_tool::{BasicToolRuntime, ExoToolRuntime};
+pub use harness_types::{CreateAgentRequest, CreateConversationRequest};
+pub use http_provider::HttpProvider;
 pub use local_sandbox::LocalSandboxExoHarness;
-pub use rlm::RlmHarness;
+pub use mcp::{McpToolRuntime, NativeMcpServer, NativeMcpTool};
+pub use provider::{LocalProvider, Provider, ProviderTurn};
 pub use scheduler_runtime::{
     SchedulerRunOptions, redeliver_pending_wakes, run_due_tasks, run_task,
 };
@@ -93,6 +113,7 @@ pub use scheduler_types::{
     MissedPolicy, NewScheduledTask, ScheduledFireRecord, ScheduledTaskRecord,
     ScheduledTaskRunRecord, now_ms,
 };
-pub use typescript::TypeScriptHarness;
 
 pub(crate) use basic::BasicExecutor;
+
+pub use exoharness::EgressPolicy;
